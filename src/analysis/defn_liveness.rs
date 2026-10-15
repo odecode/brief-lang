@@ -119,6 +119,12 @@ impl DefnLiveness {
 /// The fix direction is diagnosis, not semantics: a plain `txn` is the
 /// CALLABLE form (only `node` is reactive), so the message tells the author
 /// how to fire it. To undo: delete this fn and its call in the build path.
+///
+/// 2026-10-14 (typed-variadic plan): a variadic original is called THROUGH
+/// its per-arity instantiations — every call site retargets to `name__N`,
+/// so the original itself is never directly live. Skip the warning when a
+/// live emitted instantiation exists (naming convention via
+/// `variadic_specialize::is_instantiation_name`, the single source of truth).
 pub fn unfired_txn_warnings(
     items: &[TopLevel],
     user_txns: &HashSet<String>,
@@ -131,6 +137,7 @@ pub fn unfired_txn_warnings(
             _ => None,
         })
         .filter(|name| user_txns.contains(*name) && !liveness.is_live(name))
+        .filter(|name| !live_instantiation_exists(items, name, liveness))
         .collect();
     names.sort_unstable();
     names
@@ -143,6 +150,24 @@ pub fn unfired_txn_warnings(
             )
         })
         .collect()
+}
+
+/// True when `name` has an emitted `name__N` instantiation in `items` that
+/// liveness keeps (the variadic original served its purpose through it).
+fn live_instantiation_exists(
+    items: &[TopLevel],
+    name: &str,
+    liveness: &DefnLiveness,
+) -> bool {
+    let mut declared = HashMap::new();
+    declared.insert(name.to_string(), (0usize, false));
+    items.iter().any(|it| match it {
+        TopLevel::Transaction(t) => {
+            crate::analysis::variadic_specialize::is_instantiation_name(&t.name, &declared)
+                && liveness.is_live(&t.name)
+        }
+        _ => false,
+    })
 }
 
 /// Temporary diagnostic (2026-09-13): BRIEV_DEBUG_LIVENESS=1 dumps roots.
@@ -692,6 +717,14 @@ impl<'a> Builder<'a> {
                 // Vector range gather lowers to briev_slice_range64/_f32.
                 self.mark("briev_slice_range64", queue);
                 self.mark("briev_slice_range_f32", queue);
+                // 2026-10-12 (daily-driver quick wins): a String slice
+                // (`s[a:b]`) lowers to a briev_str_substr call (emit_expr
+                // dynamic-slice arm) — previously only the Slice# INTRINSIC
+                // row rooted it, so a source-level slice in a reachable
+                // defn (cli.bv's walkers over cast_lanes formatting) tripped
+                // the IR-scan net. Coarse-sound over-approx, same shape as
+                // the range64 marks above (no-op when the defn is absent).
+                self.mark("briev_str_substr", queue);
                 self.walk_expr(array, queue);
                 if let Some(s) = start {
                     self.walk_expr(s, queue);
@@ -778,6 +811,17 @@ impl<'a> Builder<'a> {
                         self.mark(h, queue);
                     }
                 }
+                // 2026-10-12 (daily-driver quick wins): a CONSUMING lane mark
+                // here (`s as Int` → str_to_int etc.) was tried and REVERTED
+                // the same day: cast_lanes is prelude-injected into every
+                // unit, so the coarse "any Cast may be a String source"
+                // over-approx rooted the whole parse family (str_to_int →
+                // parse_int_ws → byte_at) in EVERY unit with ANY cast, which
+                // (a) bloated every binary and (b) exposed byte_at's latently
+                // broken WASM emission (i64 length load vs i32 param —
+                // BUGS.md). It is also unnecessary since cli.bv's arg_int/
+                // arg_float call str_to_int/str_to_float EXPLICITLY — the
+                // normal call walk roots them when they are actually used.
                 self.walk_expr(inner, queue);
             }
             Expr::IsType(inner, _) => self.walk_expr(inner, queue),
@@ -866,7 +910,21 @@ fn intrinsic_helpers(intrinsic: &str) -> &'static [&'static str] {
         // threading the compiler-owned @__briev_environ via `Environ#()`.
         // The deleted C __getenv_int must NOT come back. Root the impls so
         // a runtime get_env!() keeps them emitted.
-        "Environ#" => &["briev_getenv_briev_impl", "briev_getenv_int_impl"],
+        // 2026-10-12 (daily-driver quick wins): the walker ROOTS also need
+        // the Print# cast-lane set — env.bv's String param contract
+        // (`key >= 0`) elaborates through the String↔Int cast lanes
+        // (str_to_int/int_to_str) and the String-returning sibling routes
+        // Slice#→briev_str_substr + the auto-free lane (same provenance
+        // as the Print# row above); without them the liveness net panics
+        // on `get_env_int!("BOUND")`.
+        "Environ#" => &[
+            "briev_getenv_briev_impl",
+            "briev_getenv_int_impl",
+            "str_to_int",
+            "int_to_str",
+            "briev_str_substr",
+            "__briev_free",
+        ],
         // Lifetime + time (the backend's free/now emissions prefer the
         // pure-Briev defns when present).
         "Free#" => &["__briev_free"],
@@ -1079,6 +1137,7 @@ mod tests {
         contract: Contract,
     ) -> TopLevel {
         TopLevel::Transaction(crate::ast::Transaction {
+            variadic_param: None,
             name: name.to_string(),
             is_reactive,
             is_async: false,

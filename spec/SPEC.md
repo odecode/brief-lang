@@ -1317,6 +1317,97 @@ Static trait-constrained generics are monomorphized by default.
 
 Trait node templates never activate through inferred conformance. A type or object must import them explicitly.
 
+#### 8.6.1 Dispatch is a derived shape, not a fixed mechanism
+
+A `dyn <Trait>` value declares a **capability** — "this value carries a concrete
+that implements `<Trait>`" — not a **representation**. It is a protocol with a
+dispatch requirement, in the same sense that `String` is a protocol with an
+encoding requirement. The compiler owns the representation; the user owns the
+observable input→output contract; strategy keywords are the only lever between
+them.
+
+Consequently, **the compiler does not emit a vtable for a `dyn` value by
+default.** A vtable (a per-trait table of function pointers, loaded and
+indirect-called at runtime) is the *most expensive* way to dispatch, and the
+compiler emits it only when a cheaper provable form is impossible. The
+dispatch **form is chosen per use-site by a cost model**, in ascending order of
+expense:
+
+1. **Inline** (cheapest). When the concrete type is provable at the use-site —
+   the `dyn` value's concrete is known from the coercion that created it and the
+   value has not since been aliased to a different concrete — the compiler
+   **inlines the impl directly** and erases the `dyn` at that site. No tag, no
+   payload move, no table. This is the default. `let g: dyn Greeter = Dog{..};
+   g.greet(3)` lowers to the body of `Dog::greet` with `g`'s payload as the
+   Self argument.
+2. **Switch.** When a small *closed* set of concretes can reach a use-site
+   (e.g. a function that may return `Dog` or `Cat`, and the caller dispatches),
+   the compiler emits a **tag switch** (jump table or if-chain) over the known
+   set. The tag rides in the value (a derived shape — see below); the switch is
+   compile-time-known. No table indirection.
+3. **Vtable** (fallback). When the concrete set is open, or the value crosses a
+   FFI/GLUE boundary whose other side requires a native vtable, the compiler
+   emits the **per-trait vtable**: the value carries a tag (an index into the
+   trait's conformance set) and a payload pointer, and the dispatch loads
+   `table[tag][slot]` and indirect-calls. This is the last resort.
+4. **Omit.** When a `dyn` value is never method-dispatched — stored but never
+   called, or its method is an observable identity — the compiler **omits the
+   payload** (and may eliminate the value entirely, per § the observability-as-
+   liveness rule). A `dyn` that needs no data movement carries none.
+
+The form is a **frontend decision**, computed once (the value's reachable
+concrete set at each use-site) and read by the backend — the same
+frontend-driven-dispatch pillar that chooses loop shapes and GPU tiles. The
+backend consumes the decision; it does not make it.
+
+**The value's shape is derived, not fixed.** A `dyn` value is *tag + payload*,
+where:
+
+- the **tag** (the concrete's index in the trait's conformance set) is present
+  **only** when the dispatch form is Switch or Vtable (i.e. when the concrete is
+  not provable inline). An inline-dispatched `dyn` carries no tag.
+- the **payload** is the concrete value, in whatever shape that concrete already
+  uses (a heap object, a pool row, a boxed primitive). The payload is present
+  **only** when the value is live (dispatched or otherwise observably consumed).
+
+The compiler therefore never hardcodes a `dyn` representation. Its LLVM type is
+resolved through the casting graph from `(protocol, metadata)`, exactly as every
+other type is; the tag/payload decomposition is a property of the dispatch
+form the cost model chose, not a constant.
+
+**Strategy keywords opt out of the default.** As with all of the language's
+dataflow, the default is the most efficient provable form; a strategy keyword
+(`seq`, `vol`, `atomic`, …) on a `dyn` value or its call **demands the
+predictable form** (e.g. the vtable/indirect dispatch) and pays its cost. A
+keyword is for correctness and intent, never for speed — here it means "I need
+the indirect dispatch shape" (e.g. to preserve a stable call address across a
+boundary), not "make it faster."
+
+**Boundaries adapt.** When a `dyn` value crosses an FFI/GLUE edge, the shape on
+each side is whatever that edge's ABI requires (a native vtable for C, an
+inlined identity for an LTO bridge, a clear diagnostic for a GPU kernel that has
+no heap). The transform is emitted by the boundary-marshal machinery, the same
+way any protocol value adapts at a boundary — the `dyn` does not carry a fixed
+shape into the edge.
+
+**Collection elements coerce at the literal.** A `Collection<dyn Trait>`
+annotation coerces each element of a list literal at the construction site, the
+same as a scalar `dyn Trait` annotation coerces its initializer. Each element's
+concrete type name is resolved from its *syntax* — the element must be a
+constructor (the struct literal names its type) or another `dyn` binding (the
+binding's provenance carries the concrete name). A list literal initializer
+under a `Collection<dyn Trait>` annotation that is not a literal is refused
+with a fix hint: the elements' provenance is unknowable after the fact, so
+coercion happens only at the literal. This is the reference (interpreter)
+behavior; the backend must reproduce it.
+
+> **Doctrine (2026-10-09, dispatch derivation):** a `dyn <Trait>` is a
+> capability, not a representation. The compiler derives its dispatch form
+> (inline → switch → vtable → omit) and its value shape (tag only when needed,
+> payload only when live) per use-site, from the value's provable concrete
+> set. The vtable is a fallback, never the default. Data that does not need to
+> flow does not; the observable contract is the only thing that must hold.
+
 ### 8.7 `proto`
 
 A protocol is a compiler-visible semantic category and cast-coherence domain. Protocols do not prescribe one layout.
@@ -1560,6 +1651,53 @@ binds its type param from the enclosing binding's annotation when the
 arguments do not constrain it. An argument that cannot unify with the
 generic parameter shape is a type error.
 
+**2026-10-13 (typed variadic `defn`/`txn`).** A runtime `defn` or `txn`
+may declare a final TYPED rest parameter:
+
+```briev
+defn sum(...xs: Int[<=8]) -> Int [true][term >= 0] {
+    term fold the rest elements;
+};
+// sum(1, 2, 3) and sum(7) are both valid; sum() is not (min defaults 0 —
+// adjust with [>=1] when an empty call is a mistake).
+```
+
+The rest is a STATIC-arity specialization: each distinct call-site arity
+instantiates one monomorphized copy of the callable before typecheck.
+There is no allocation and no per-call cost — the emitted body is a
+fixed-arity function taking the rest elements as ordinary parameters.
+
+In the body and contracts, the rest name is the compile-time list of the
+received elements: `xs[0]`, `xs[1]`, …, `xs.Count#()` — all static per
+instantiation. Element access uses the ordinary index/length operations.
+
+Rules:
+- `...` must be the FINAL parameter and carries the ELEMENT TYPE — a value
+  type (`Int`, `Float`, `String`, …), not `Expr`. A `...name: Expr` rest
+  remains the §18.2 compile-time composite channel; the two are
+  distinguished by the element type.
+- Bound suffix (delimiter contract, §5.1 — `[]` is containment/bound):
+  `[<=N]` maximum count, `[>=M]` minimum count, `[>=M, <=N]` both. No
+  suffix → default cap 16 with a warning; the hard ceiling is 64 (beyond
+  it the diagnostic directs to a `List<T>` parameter).
+- Call-site count below the minimum or above the bound is a compile error
+  naming the callable, the declared bound, and the received count.
+- Runtime-determined arity is a `List<T>` parameter — that is the tool for
+  dynamic counts. There is no runtime splice (`f(a, ...list)`); a rest
+  binds only statically-counted trailing arguments.
+- Instantiations are internal (like generic instantiation): the original
+  declaration remains the author's source for diagnostics; errors inside a
+  specialized body carry provenance back to the call site. Each
+  instantiation is emitted as an ordinary fixed-arity callable named
+  `name__arity` in generated IR (e.g. `sum__3` for `sum(1, 2, 3)`); the
+  author's source name is unchanged.
+- `txn` takes the same rest rule; reactor analysis runs per
+  specialization. First retired surface (2026-10-14): the `syscall0..6`
+  wrapper families collapsed into one variadic
+  `syscall(nr, ...args: Int[<=6])` (std/posix/syscall.bv) — the body
+  dispatches on `args.Count#()`, folded to the live arm per instantiation.
+
+
 ### 9.2 Callable types and closures
 
 Callable types use signature shape directly:
@@ -1595,6 +1733,10 @@ when invalid_input {
 ```
 
 `rollback` is invalid outside rollback-capable transaction/reactive contexts.
+
+A `txn` may declare a final typed rest parameter with the same rule as
+`defn` (§9.1, 2026-10-13); the reactor analyzes each specialization as an
+ordinary transaction.
 
 ### 9.4 Nodes
 
@@ -2228,6 +2370,17 @@ runs applicable `defer` cleanup and terminates the process. Unlike `term`,
 which only ends the current transaction, `endprogram` exits the process even
 when a node's precondition remains satisfiable. Abrupt termination is not
 currently a source-language feature.
+
+**The exit code is the expression's value.** `endprogram code;` evaluates
+`code` — its side effects run (a print, an FFI call) — and the process exits
+with the value the expression yields. A side-effect intrinsic like `Print#`
+returns the neutral `0` (defns cannot be void, so a side-effect-only call
+claims the success value, not a payload); `endprogram Print#(x)` therefore
+prints `x` as the swan song and exits `0`. `endprogram greet(1)` exits with
+`greet`'s return — a genuine value carries to the exit code. The same
+consumption rule as `term`: the value flows to whatever consumes it (the
+term postcondition, the process exit code), and a side-effect expression's
+neutral value satisfies both without distortion.
 
 There is no `main` declaration in Briev. The program entry is either an
 explicit `beginprogram` node (§11.5.1) or, absent one, whichever reactive
@@ -2985,7 +3138,11 @@ $defn execute_many(...calls: Expr) {
 
 Rules:
 - `...` must be the FINAL parameter.
-- Compile-time-only: a runtime `defn` declaring `...` is an error.
+- A composite rest declares `...name: Expr` — a compile-time list. A
+  runtime `defn`/`txn` rest declares a VALUE type element
+  (`...name: Int`, `...name: Int[<=N]`) and is handled by static-arity
+  specialization instead (§9.1, 2026-10-13). The element type distinguishes
+  the two; both remain the `...` syntax.
 - Each call-site argument is emitted in order (sequential calls, order
   guaranteed).
 - Zero trailing arguments is a mistake, not a no-op — the expansion errors

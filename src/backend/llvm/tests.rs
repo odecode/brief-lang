@@ -31,6 +31,7 @@ fn accel_kernel_program() -> Vec<TopLevel> {
         span: None,
     });
     let force = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "force".to_string(),
         is_reactive: true,
         is_async: false,
@@ -122,6 +123,7 @@ fn test_no_accel_no_kernel_blob() {
 
 fn make_txn(name: &str, modifiers: Vec<Annotation>) -> TopLevel {
     TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: name.to_string(),
         is_reactive: true,
         is_async: false,
@@ -190,6 +192,7 @@ fn test_init_emits_global_seeding_and_read() {
     });
     // A node that reads the init, so a load of the global is emitted.
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "go".to_string(),
         is_reactive: true,
         is_async: false,
@@ -248,6 +251,7 @@ fn test_init_bound_loop_folds_against_seeded_global() {
         span: None,
     });
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "work".to_string(),
         is_reactive: true,
         is_async: false,
@@ -307,6 +311,7 @@ fn mask_index_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -370,6 +375,7 @@ fn mask_index_typed_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -455,6 +461,7 @@ fn mask_index_f32_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -505,6 +512,7 @@ fn test_mask_index_f32_emits_float_gather() {
 /// counted-iteration loop lowering (2026-08-07, Phase 7).
 fn foreach_range_program() -> Vec<TopLevel> {
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -599,6 +607,7 @@ fn test_foreach_assigned_inside_mutex_gets_alloca() {
         Statement::Term(None),
     ];
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -651,6 +660,7 @@ fn test_foreach_assigned_inside_mutex_gets_alloca() {
 /// exercises the `break` early-exit lowering (2026-08-17).
 fn foreach_break_program() -> Vec<TopLevel> {
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1175,6 +1185,7 @@ fn multidim_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1258,6 +1269,7 @@ fn unpacked_instance_program() -> Vec<TopLevel> {
             op_bindings: vec![],
             constraints: vec![],
             members: vec![TopLevel::Transaction(Transaction {
+                variadic_param: None,
                 name: "init".to_string(),
                 is_reactive: true,
                 is_async: false,
@@ -1300,6 +1312,7 @@ fn unpacked_instance_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1373,6 +1386,7 @@ fn spawn_countdown_program() -> Vec<TopLevel> {
             op_bindings: vec![],
             constraints: vec![],
             members: vec![TopLevel::Transaction(Transaction {
+                variadic_param: None,
                 name: "inc".to_string(),
                 is_reactive: true,
                 is_async: false,
@@ -1424,6 +1438,7 @@ fn spawn_countdown_program() -> Vec<TopLevel> {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "work".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1573,6 +1588,7 @@ fn spawn_pool_countdown_program_storage(
             op_bindings: vec![],
             constraints: vec![],
             members: vec![TopLevel::Transaction(Transaction {
+                variadic_param: None,
                 name: "inc".to_string(),
                 is_reactive: true,
                 is_async: false,
@@ -1625,6 +1641,7 @@ fn spawn_pool_countdown_program_storage(
     }));
     // `let N: Int = get_env_int!("BOUND")` — a runtime-bound field value.
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "work".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1808,6 +1825,7 @@ fn counter_type_def() -> TopLevel {
             op_bindings: vec![],
             constraints: vec![],
             members: vec![TopLevel::Transaction(Transaction {
+                variadic_param: None,
                 name: "inc".to_string(),
                 is_reactive: true,
                 is_async: false,
@@ -1857,6 +1875,7 @@ fn spawn_work_state_and_node() -> [TopLevel; 2] {
         modifiers: vec![],
     }));
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "work".to_string(),
         is_reactive: true,
         is_async: false,
@@ -1957,6 +1976,7 @@ fn match_range_program() -> Vec<TopLevel> {
         span: None,
     });
     let node = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "s".to_string(),
         is_reactive: true,
         is_async: false,
@@ -2131,6 +2151,7 @@ fn test_llvm_generates_transaction() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2170,6 +2191,7 @@ fn test_llvm_emits_sync_block_body() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2216,6 +2238,7 @@ fn test_llvm_has_noalias() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2649,6 +2672,7 @@ fn test_endprogram_emits_process_exit() {
     let program = vec![
         state_count(),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "report".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2684,6 +2708,7 @@ fn test_beginprogram_entry_loop_emits_flag_and_goal_clear() {
         span: None,
     });
     let init = TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "init".to_string(),
         is_reactive: true,
         is_async: false,
@@ -2757,6 +2782,7 @@ fn test_no_range_lower_bound_defaults_to_i64_min() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2800,6 +2826,7 @@ fn test_binop_no_nuw_nsw() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2849,6 +2876,7 @@ fn test_range_metadata_suppressed_for_written_field() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2900,6 +2928,7 @@ fn test_range_metadata_kept_for_read_only_field() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -2939,6 +2968,7 @@ fn test_float_binary_add() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3200,6 +3230,7 @@ fn make_point_program(body: Vec<Statement>) -> Vec<TopLevel> {
             ty: Type::int(), span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3228,6 +3259,7 @@ fn test_string_state_init_not_null() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3267,6 +3299,7 @@ fn test_const_trg_write_emits_error() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3301,6 +3334,7 @@ fn test_local_float_binding() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3358,6 +3392,7 @@ fn make_wake_program_no_triggers() -> Vec<TopLevel> {
             section: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "work".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3439,6 +3474,7 @@ fn make_exit_program(exit_expr: Option<Expr>, is_wake: bool) -> Vec<TopLevel> {
         Box::new(Expr::BinaryOp(BinaryOpKind::Lt,
             Box::new(Expr::Identifier("ops".to_string())), Box::new(Expr::Identifier("N".to_string())))));
     let txn = Transaction {
+        variadic_param: None,
         name: "work".to_string(),
         is_reactive: true,
         is_async: false,
@@ -3583,6 +3619,7 @@ fn test_natural_death_skipped_for_persistent_txn() {
 fn make_two_counter_program() -> Vec<TopLevel> {
     let counter_txn = |name: &str, var: &str| {
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: name.to_string(),
             is_reactive: true,
             is_async: false,
@@ -3674,6 +3711,7 @@ fn make_dead_txn_program(with_reactive_node: bool) -> Vec<TopLevel> {
     ];
     if with_reactive_node {
         items.push(TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "run".to_string(),
             is_reactive: true,
             is_async: false,
@@ -3711,6 +3749,7 @@ fn make_dead_txn_program(with_reactive_node: bool) -> Vec<TopLevel> {
     }
     // A plain top-level txn: zero-param, no-output, called by nothing.
     items.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "unused_helper".to_string(),
         is_reactive: false,
         is_async: false,
@@ -3781,6 +3820,7 @@ fn make_slp_float_program(n_floats: usize, cross_body: Vec<Statement>, precondit
         span: None,
     }));
     items.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "tick".to_string(),
         is_reactive: true,
         is_async: false,
@@ -3986,6 +4026,7 @@ fn test_imported_alias_is_mmio() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             type_params: vec![],
             parameters: vec![],
@@ -4029,6 +4070,7 @@ fn test_unimported_alias_not_mmio() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "t".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4065,6 +4107,7 @@ fn test_unimported_alias_not_mmio() {
 fn make_intrinsic_program(intrinsic: Expr) -> Vec<TopLevel> {
     vec![
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4094,6 +4137,7 @@ fn make_intrinsic_program(intrinsic: Expr) -> Vec<TopLevel> {
 fn make_float_intrinsic_program(intrinsic: Expr) -> Vec<TopLevel> {
     vec![
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4127,6 +4171,7 @@ fn test_emit_cast_int_to_string() {
     let mut backend = LlvmBackend::new().with_type_universe(crate::type_universe::TypeUniverse::new());
     let program = vec![
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4166,6 +4211,7 @@ fn test_emit_cast_string_to_int() {
     let mut backend = LlvmBackend::new();
     let program = vec![
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4211,6 +4257,7 @@ fn test_tuple_emits_2slot_header() {
             name: "t".to_string(), ty: Type::int(), span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "mktup".to_string(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![],
             output_type: None, outputs: vec![],
@@ -4254,6 +4301,7 @@ fn make_chain_program(
         let pre = Expr::BinaryOp(BinaryOpKind::Lt,
             Box::new(Expr::Identifier("count".to_string())), Box::new(Expr::Identifier("total".to_string())));
         items.push(TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: txn_name.to_string(),
             is_reactive: true,
             is_async: false,
@@ -4455,6 +4503,7 @@ fn make_async_pair_program() -> Vec<TopLevel> {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "inc_a".to_string(),
             is_reactive: true,
             is_async: true,
@@ -4474,6 +4523,7 @@ fn make_async_pair_program() -> Vec<TopLevel> {
             doc: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "inc_b".to_string(),
             is_reactive: true,
             is_async: true,
@@ -4755,6 +4805,7 @@ fn test_event_model_trigger_handling() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "pump".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4788,6 +4839,7 @@ fn make_fn_ptr_program() -> Vec<TopLevel> {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "apply".to_string(),
             is_reactive: true,
             is_async: false,
@@ -4822,6 +4874,7 @@ fn test_emit_address_of() {
     // AddressOf#("uart") should emit inttoptr with uart's address (0xFFE01000)
     let program = vec![
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "main".to_string(),
             is_reactive: true,
             is_async: false,
@@ -5183,6 +5236,7 @@ fn test_trg_deref_error_flag() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "pump".to_string(),
             is_reactive: true,
             is_async: false,
@@ -5227,6 +5281,7 @@ fn test_trg_deref_warn_default_no_null_check() {
             span: None,
         }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "pump".to_string(),
             is_reactive: true,
             is_async: false,
@@ -5562,6 +5617,7 @@ fn test_modulo_partition_drives_rotated_loop() {
                 Box::new(Expr::Decimal(i as i64)))),
         );
         program.push(TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: name.clone(),
             is_reactive: true,
             is_async: false,
@@ -5688,6 +5744,7 @@ fn density_consumer_body() -> Vec<Statement> {
 fn density_consumer_program() -> Vec<TopLevel> {
     let mut program = density_consumer_declarations();
     program.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "propagate".to_string(),
         is_reactive: true,
         is_async: false,
@@ -5770,6 +5827,7 @@ fn test_batch_loop_dispatch_post_increment() {
         vec![Statement::Expression(Expr::Call("__print_float".into(), vec![Expr::Identifier("f0".into())], None))]));
     body.push(Statement::Term(None));
     program.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "tick".into(),
         is_reactive: true,
         is_async: false,
@@ -5837,6 +5895,7 @@ fn test_countdown_field_backedge_copies_are_fast() {
         Statement::Term(None),
     ];
     program.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "tick".into(),
         is_reactive: true,
         is_async: false,
@@ -5877,6 +5936,7 @@ fn test_batch_loop_rejects_pre_increment() {
         TopLevel::StateDecl(StateDecl { name: "total".into(), ty: Type::int(), span: None }),
         TopLevel::StateDecl(StateDecl { name: "acc".into(), ty: Type::int(), span: None }),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "tick".into(),
             is_reactive: true,
             is_async: false,
@@ -8297,6 +8357,7 @@ fn test_counter_loop_guard_read_uses_phi_not_state() {
 
 fn txn_with_body(body: Vec<Statement>) -> TopLevel {
     TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "c".to_string(),
         is_reactive: true,
         is_async: false,
@@ -8721,6 +8782,7 @@ fn test_webstack_flush_batch_covers_written_fields() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8761,6 +8823,7 @@ fn test_webstack_flush_empty_write_set_is_noop() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "tick".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8788,6 +8851,7 @@ fn test_webstack_layout_header_describes_real_buffer() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8826,6 +8890,7 @@ fn test_web_state_layout_carries_field_names() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8872,6 +8937,7 @@ fn test_webstack_ssa_precondition_emits_valid_bool_branch() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8906,6 +8972,7 @@ fn test_webstack_int_literal_emits_target_width() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8942,6 +9009,7 @@ fn test_webstack_state_int_slots_are_target_width() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -8978,6 +9046,7 @@ fn test_webstack_folded_loop_is_width_consistent() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "increment".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract {
@@ -9024,6 +9093,7 @@ fn test_webstack_array_field_store_gep_widens_index() {
             modifiers: vec![], names: vec![],
         })),
         TopLevel::Transaction(Transaction {
+            variadic_param: None,
             name: "fill".into(), is_reactive: true, is_async: false,
             type_params: vec![], parameters: vec![], output_type: None, outputs: vec![],
             contract: Contract { pre_condition: Expr::Bool(true), post_condition: Expr::Bool(true), watchdog: None, explicit: false, span: None, post_authority: false},
@@ -9596,6 +9666,7 @@ node go [done == 0][done == 1] {
 /// to the catch-all and vanished, leaving an empty convergent loop.
 fn stmt_match_program() -> Vec<TopLevel> {
     vec![TopLevel::Transaction(Transaction {
+        variadic_param: None,
         name: "dispatch".to_string(),
         is_reactive: false,
         is_async: false,
@@ -10203,4 +10274,476 @@ fn test_node_at_vector_dissolves_isr_keyword() {
         "wired node emits the service scaffold:\n{ir}");
     assert!(ir.contains("call __isr_body_tick"), "typed body called:\n{ir}");
     assert!(ir.contains("mret"), "returns via mret:\n{ir}");
+}
+
+// ── 2026-10-08 (stabilise-for-use T1, Phase 5c): dyn Trait thunk table ──
+
+/// A `dyn <Trait>` member call must emit the per-(trait, concrete) thunk table
+/// and an indirect call through it (the interpreter's Phase 5b dynamic
+/// dispatch has an LLVM counterpart). The repro is the Greeter/Dog fixture:
+/// `g.greet(3)` where `g: dyn Greeter = Dog { base: 7 }` must dispatch to
+/// `@__dyn_Greeter_Dog_greet`, threading the data half as the Self receiver,
+/// and produce `7*100+3 = 703`.
+#[test]
+fn test_dyn_trait_emits_thunk_table_and_indirect_call() {
+    let src = r#"
+trait Greeter {
+    defn greet(me: Self, times: Int) -> Int;
+};
+type Dog: Greeter { base: Int; };
+impl Dog {
+    defn greet(me: Dog, times: Int) -> Int { term me.base * 100 + times; }
+};
+let total: Int = 0;
+let i: Int = 0;
+node run [i < 1][i == 1] {
+  when i == 0 {
+    let g: dyn Greeter = Dog { base: 7 };
+    total = g.greet(3);
+    endprogram Print#(total);
+  };
+  i = i + 1;
+  term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let ir = backend.generate(&items, None);
+    // The thunk fn for (Greeter, Dog, greet) is emitted with the impl body
+    // inlined (Self-first, i64 %self, i64 %targ0).
+    assert!(
+        ir.contains("define i64 @__dyn_Greeter_Dog_greet("),
+        "thunk fn missing:\n{ir}"
+    );
+    // The thunk table holds the fn pointer (declaration order = 1 slot).
+    assert!(
+        ir.contains("@__dyn_Greeter_Dog = private constant [1 x ptr] [ptr @__dyn_Greeter_Dog_greet]"),
+        "thunk table missing:\n{ir}"
+    );
+    // 2026-10-09 (dyn derive-don't-fix, Phase B): the single-concrete case is
+    // INLINED — the impl body (`me.base * 100 + times`) is inlined at the call
+    // site, the `dyn` is erased, and there is NO indirect call through a thunk
+    // table. The dispatch form is Inline (cheapest provable), not Vtable.
+    //
+    // The call site loads the fat pointer's DATA half (slot 0, the Dog heap
+    // handle) and threads it as the Self receiver into the inlined impl body.
+    // The result is `7*100 + 3 = 703`.
+    //
+    // Verify the inline form: the impl body's math (`mul nsw i64 <base>, <100>`
+    // then `add nsw i64 <mul>, <times>`) appears in the node body, and there is
+    // NO `load ptr, ptr` (no thunk-table fn-pointer load) at the call site.
+    assert!(
+        ir.contains("mul nsw i64") && ir.contains("add nsw i64"),
+        "inline form must emit the impl body's math (me.base*100 + times):\n{ir}"
+    );
+    assert!(
+        !ir.contains("load ptr, ptr"),
+        "inline form must NOT indirect-call through the thunk table (no `load ptr, ptr`):\n{ir}"
+    );
+    // The fat pointer's data half is loaded to thread as the Self receiver.
+    // (2026-10-09 identity-in-value: the fat pointer is { data, tag, table },
+    // a [3 x i64] block.)
+    assert!(
+        ir.contains("getelementptr inbounds [3 x i64]"),
+        "inline form must load the fat pointer's data half (the Self receiver):\n{ir}"
+    );
+}
+
+/// 2026-10-09 (T2a, slice): a STRIDED slice `data[a:b:c]` over a 1-D vector
+/// state column unblocks the old `panic!` — it lowers to a strided GATHER
+/// (`briev_slice_strided64`) that builds a contiguous `[len][elems]` block with
+/// the stride baked in, so downstream `Index`/foreach consumers are unchanged.
+///
+/// The test is IR-focused (no stdlib loaded, so the result is not consumed) —
+/// it asserts the strided gather is emitted and the old `panic!` is gone.
+#[test]
+fn test_strided_slice_emits_strided_gather() {
+    let src = r#"
+let data: Int[8] = [1, 2, 3, 4, 5, 6, 7, 8];
+let sub: List<Int> = data[0:6:2];
+let i: Int = 0;
+node run [i < 1][i == 1] {
+  when i == 0 {
+    let _u: Int = data[2:6:2];
+    endprogram Print#(0);
+  };
+  i = i + 1;
+  term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    // This MUST NOT panic (the strided slice previously panicked at
+    // emit_expr.rs:1863). The strided slice lowers to the strided gather.
+    let ir = backend.generate(&items, None);
+    assert!(
+        ir.contains("@briev_slice_strided64"),
+        "a strided slice must call the strided gather helper:\n{ir}"
+    );
+    // NOT the contiguous gather (that would ignore the stride).
+    assert!(
+        !ir.contains("call ptr @briev_slice_range64"),
+        "a strided slice must NOT use the contiguous range gather (the stride must be honored):\n{ir}"
+    );
+}
+
+/// 2026-10-09 (T2b, slice/view): a CONTIGUOUS slice `data[a:b]` over a 1-D
+/// vector state column is a ZERO-COPY VIEW — a `{ base, len, len }` header
+/// whose `base` points into the source column at element `a` (no `Alloc# +
+/// Copy#`). This test pins the IR: the view's base-pointer GEP into the state
+/// column and the header `malloc` are present, and there is NO per-slice
+/// `briev_slice_range64` gather call (the copy path is retired for contiguous
+/// slices). The benchmark (`benchmarks/slice_reduce.bv`) measures the A/B:
+/// view ≈ 0.001s vs copy ≈ 0.37s at BOUND=5M (both correct).
+#[test]
+fn test_contiguous_slice_emits_zero_copy_view() {
+    // `data` is a plain state column (mutated each fire so the slice is a
+    // runtime value, not precomputable — the observability trap). The slice is
+    // taken in a REACTIVE node body (matching the benchmark, which loads the
+    // stdlib so `List.At#` resolves). The contiguous slice lowers to the
+    // zero-copy VIEW (a { base, len, len } header whose base GEPs the state
+    // column at element `lo`), NOT the copy gather.
+    let src = r#"
+import { List } from "std/collections.bv";
+let data: Int[8];
+let i: Int = 0;
+let done: Bool = false;
+node run [done == false][done == true] {
+  data[0] = i;
+  let sub: List<Int> = data[1:5];
+  endprogram Print#(sub.At#(0));
+  done = true;
+  term;
+};
+"#;
+    // parse_and_check resolves the import (so List.At# is available) and
+    // type-checks — the same path the benchmark takes.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let items = crate::library::parse_and_check("benchmarks/slice_reduce.bv", &src)
+        .expect("parse_and_check failed");
+    let (items, universe) = items;
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    // The view builds a 24-byte header block ({ base, len, len }).
+    assert!(
+        ir.contains("call ptr @malloc(i64 24)"),
+        "the contiguous slice view must allocate the header block:\n{ir}"
+    );
+    // The view's base pointer GEPs the state column (no copy).
+    assert!(
+        ir.contains("getelementptr [8 x i64]") || ir.contains("getelementptr [8 x"),
+        "the contiguous slice view must GEP the state column (zero-copy):\n{ir}"
+    );
+    // The contiguous COPY gather is retired (not called for a contiguous slice).
+    assert!(
+        !ir.contains("call ptr @briev_slice_range64")
+            && !ir.contains("call i64 @briev_slice_range64"),
+        "a contiguous slice must NOT call the copy gather (it is a zero-copy view):\n{ir}"
+    );
+}
+
+/// 2026-10-09 (dyn identity-in-value): when TWO concretes conform to a trait,
+/// the dispatch is the SWITCH form — a `switch` on the tag (the identity that
+/// rides in the value), each arm inlining its impl body. Cheaper
+/// than the Vtable fallback (no thunk-table load, no indirect call) for a
+/// closed small set.
+#[test]
+fn test_dyn_trait_switch_form_for_two_concretes() {
+    let src = r#"
+trait Greeter {
+    defn greet(me: Self, times: Int) -> Int;
+};
+type Dog: Greeter { base: Int; };
+type Cat: Greeter { base: Int; };
+impl Dog {
+    defn greet(me: Dog, times: Int) -> Int { term me.base * 100 + times; }
+};
+impl Cat {
+    defn greet(me: Cat, times: Int) -> Int { term me.base * 10 + times; }
+};
+let total: Int = 0;
+let i: Int = 0;
+node run [i < 1][i == 1] {
+  when i == 0 {
+    let a: dyn Greeter = Dog { base: 7 };
+    let b: dyn Greeter = Cat { base: 9 };
+    total = a.greet(1) + b.greet(2);
+    endprogram Print#(total);
+  };
+  i = i + 1;
+  term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let ir = backend.generate(&items, None);
+    // Both concretes conform (each provides `greet`), so two thunk tables are
+    // emitted (the Vtable fallback is available).
+    assert!(
+        ir.contains("@__dyn_Greeter_Dog = private constant [1 x ptr]")
+            && ir.contains("@__dyn_Greeter_Cat = private constant [1 x ptr]"),
+        "both (Greeter, Dog) and (Greeter, Cat) thunk tables must be emitted:\n{ir}"
+    );
+    // The SWITCH form: a `switch` on the tag, with arms for tag 0 (Dog) and
+    // tag 1 (Cat). The tag is loaded from the fat pointer's tag slot (slot 1).
+    // 2026-10-11: the multi-line LLVM form — default label FIRST, `%`-prefixed
+    // labels, newline-separated cases (the old single-line/`label dynsw`
+    // spellings were rejected by clang; see emit_dyn_switch).
+    assert!(
+        ir.contains("switch i64") && ir.contains("label %dynsw"),
+        "two-concrete dispatch must be the Switch form (a `switch` on the tag):\n{ir}"
+    );
+    // The tag is loaded from the fat pointer's TAG slot (slot 1 of [3 x i64]).
+    assert!(
+        ir.contains("getelementptr inbounds [3 x i64], ptr %")
+            && ir.contains("i32 1"),
+        "the Switch form must load the tag from the fat pointer's tag slot:\n{ir}"
+    );
+    // Both impl bodies are inlined (Dog's `*100`, Cat's `*10`) — no indirect
+    // call through a thunk table.
+    assert!(
+        ir.contains("mul nsw i64") ,
+        "the Switch form must inline both impl bodies (the math is present):\n{ir}"
+    );
+    // NOT the Vtable fallback: no thunk-table fn-pointer load.
+    assert!(
+        !ir.contains("load ptr, ptr"),
+        "the Switch form must NOT indirect-call through the thunk table:\n{ir}"
+    );
+}
+
+/// 2026-10-12 (SPEC §8.6.1 Option B, plan 2026-10-11-coll-element-size.md):
+/// heterogeneous `List<dyn Trait>` dispatch — the crash repro, now a compiled
+/// behavioral gate. A `List<dyn Greeter>` of DIFFERING-FIELD concretes
+/// (`Dog{base}`, `Cat{lives}`) constructs each element as a 16-byte tagged box
+/// `[tag, payload]` (the frontend's per-collection concrete set says Switch);
+/// the element read reconstructs the fat pointer and the switch dispatches on
+/// the box's tag. Before this fix the elements stored raw boxed-concrete
+/// handles while the read path GEP'd them as `[3 x i64]` fat pointers —
+/// garbage tag → trap (exit 232). Behavioral, not string-pinned: the contract
+/// is the printed 701/91 (Dog 7*100+1, Cat 9*10+1 — differing layouts prove
+/// the payload reaches the right impl).
+#[test]
+fn test_dyn_list_differing_field_elements_dispatch_compiled() {
+    if !Command::new("clang").arg("--version").output().is_ok() {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let src = r#"
+struct ListBuffer<T> { data: Ptr<T>; };
+coll obj List<T> { inner: ListBuffer<T>; };
+trait Greeter {
+    defn greet(me: Self, times: Int) -> Int;
+};
+type Dog: Greeter { base: Int; };
+type Cat: Greeter { lives: Int; };
+impl Dog {
+    defn greet(me: Dog, times: Int) -> Int { term me.base * 100 + times; }
+};
+impl Cat {
+    defn greet(me: Cat, times: Int) -> Int { term me.lives * 10 + times; }
+};
+let handlers: List<dyn Greeter> = [Dog { base: 7 }, Cat { lives: 9 }];
+let done: Bool = false;
+node go [done == false][done == true] {
+  when done == false {
+    println!(handlers[0].greet(1));
+    println!(handlers[1].greet(1));
+    done = true;
+  };
+  term;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.register(Box::new(crate::plugin::print_plugin::PrintPlugin));
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let mut ir = backend.generate(&items, None);
+    // The construction stores tagged boxes (16-byte mallocs) — the Switch-form
+    // element shape.
+    assert!(
+        ir.contains("call ptr @malloc(i64 16)"),
+        "the tagged-box construction must be present for a Switch-form List<dyn>:\n{ir}"
+    );
+    use std::process::Command;
+    let stub = "#include <stdio.h>\n#include <stdint.h>\nint64_t __print_int(int64_t n) { printf(\"%ld\", (long)n); return 0; }\nint64_t __print_char(int64_t c) { putchar((int)c); return 0; }\n";
+    let rt = std::env::temp_dir().join(format!("briev_dynlist_{}.c", std::process::id()));
+    std::fs::write(&rt, stub).expect("write stub");
+    let out = std::env::temp_dir().join(format!(
+        "briev_dynlist_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let ll = out.with_extension("ll");
+    let prelude = "declare i64 @__print_int(i64)\ndeclare i64 @__print_char(i64)\n";
+    if let Some(pos) = ir.find("target triple") {
+        let end = ir[pos..].find('\n').map(|e| pos + e + 1).unwrap_or(ir.len());
+        ir.insert_str(end, prelude);
+    } else {
+        ir.insert_str(0, prelude);
+    }
+    std::fs::write(&ll, &ir).expect("write .ll");
+    let compile = Command::new("clang").args(["-O3", "-flto"]).arg(&ll).arg(&rt).args(["-lm", "-o"]).arg(&out).output().unwrap();
+    assert!(
+        compile.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = (std::fs::remove_file(&ll), std::fs::remove_file(&out), std::fs::remove_file(&rt));
+    assert!(
+        run.status.success(),
+        "program crashed (the differing-field dispatch must not trap): {}\n---\n{ir}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "701\n91",
+        "handlers[0].greet(1) = 701 (Dog 7*100+1), handlers[1].greet(1) = 91 \
+         (Cat 9*10+1) — the element payload must reach the RIGHT impl via the \
+         box tag; got:\n{stdout}"
+    );
+}
+
+/// 2026-10-12 (SPEC §8.6.1 Option B): a node-BODY local `List<dyn Trait>` —
+/// the same tagged-box contract as the top-level construction, keyed
+/// per-function (`fun.dyn_boxed_bindings` — no cross-function name
+/// collisions). Also covers the >threshold dispatch: the global per-trait set
+/// here is exactly 2, so this pins the local box + reconstruct + switch chain
+/// end to end.
+#[test]
+fn test_dyn_list_local_binding_dispatch_compiled() {
+    if !Command::new("clang").arg("--version").output().is_ok() {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let src = r#"
+struct ListBuffer<T> { data: Ptr<T>; };
+coll obj List<T> { inner: ListBuffer<T>; };
+trait Greeter {
+    defn greet(me: Self, times: Int) -> Int;
+};
+type Dog: Greeter { base: Int; };
+type Cat: Greeter { lives: Int; };
+impl Dog {
+    defn greet(me: Dog, times: Int) -> Int { term me.base * 100 + times; }
+};
+impl Cat {
+    defn greet(me: Cat, times: Int) -> Int { term me.lives * 10 + times; }
+};
+let done: Bool = false;
+node go [done == false][done == true] {
+  when done == false {
+    let hs: List<dyn Greeter> = [Dog { base: 7 }, Cat { lives: 9 }];
+    println!(hs[0].greet(1));
+    println!(hs[1].greet(1));
+    done = true;
+  };
+  term;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.register(Box::new(crate::plugin::print_plugin::PrintPlugin));
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    use std::process::Command;
+    let stub = "#include <stdio.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\nint64_t __print_int(int64_t n) { printf(\"%ld\", (long)n); return 0; }\nint64_t __print_char(int64_t c) { putchar((int)c); return 0; }\nint64_t __briev_coll_resize(int64_t handle, int64_t new_cap) {\n    if (!handle || new_cap < 0) return 1;\n    int64_t* block = (int64_t*)handle;\n    int64_t old_data = block[0];\n    int64_t len = block[2];\n    if (new_cap == 0) { free((void*)old_data); block[0] = 0; block[1] = 0; return 0; }\n    int64_t* nd = (int64_t*)malloc((size_t)(new_cap * 8));\n    if (!nd) return 1;\n    int64_t copy_n = len < new_cap ? len : new_cap;\n    if (old_data && copy_n > 0) memcpy(nd, (void*)old_data, (size_t)(copy_n * 8));\n    if (old_data) free((void*)old_data);\n    block[0] = (int64_t)nd;\n    block[1] = new_cap;\n    return 0;\n}\n";
+    let rt = std::env::temp_dir().join(format!("briev_dynlocal_{}.c", std::process::id()));
+    std::fs::write(&rt, stub).expect("write stub");
+    let out = std::env::temp_dir().join(format!(
+        "briev_dynlocal_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let ll = out.with_extension("ll");
+    let prelude = "declare i64 @__print_int(i64)\ndeclare i64 @__print_char(i64)\n";
+    let mut ir_full = ir.clone();
+    if let Some(pos) = ir.find("target triple") {
+        let end = ir[pos..].find('\n').map(|e| pos + e + 1).unwrap_or(ir.len());
+        ir_full.insert_str(end, prelude);
+    } else {
+        ir_full.insert_str(0, prelude);
+    }
+    std::fs::write(&ll, &ir_full).expect("write .ll");
+    // The -O0 link is the IR-validity gate: an undefined table symbol
+    // (@__dyn_<Trait>_<Trait> — the trait-name fallback bug) passes -O3 -flto
+    // (dead store, LTO-materialized) but fails -O0 outright.
+    let compile = Command::new("clang").arg("-O0").arg(&ll).arg(&rt).arg("-lm").arg("-o").arg(&out).output().unwrap();
+    assert!(
+        compile.status.success(),
+        "link failed (the IR must be valid at -O0 — no undefined table symbols): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let _ = (std::fs::remove_file(&ll), std::fs::remove_file(&out), std::fs::remove_file(&rt));
+    assert!(
+        run.status.success(),
+        "local dyn list dispatch must not trap: {}\n---\n{ir}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "701\n91",
+        "local hs[0].greet(1) = 701, hs[1].greet(1) = 91 — got:\n{stdout}"
+    );
+}
+
+/// 2026-10-09 (dyn identity-in-value): a `dyn` that FLOWS through a `defn`
+/// return keeps its dispatch identity — the tag rides in the value (the name-
+/// keyed `dyn_concrete_of` does not survive the return). This is the case that
+/// used to panic ("cannot resolve the concrete type"). The single-concrete
+/// case is Inline; the flowed value's tag is irrelevant (cardinality == 1).
+#[test]
+fn test_dyn_trait_flows_through_defn_return() {
+    let src = r#"
+trait Greeter {
+    defn greet(me: Self, times: Int) -> Int;
+};
+type Dog: Greeter { base: Int; };
+impl Dog {
+    defn greet(me: Dog, times: Int) -> Int { term me.base * 100 + times; }
+};
+defn make(k: Int) -> dyn Greeter {
+    term Dog { base: k };
+};
+let total: Int = 0;
+let i: Int = 0;
+node run [i < 1][i == 1] {
+  when i == 0 {
+    let g: dyn Greeter = make(7);
+    total = g.greet(3);
+    endprogram Print#(total);
+  };
+  i = i + 1;
+  term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    // This MUST NOT panic (the flowed `dyn`'s concrete is resolvable via the
+    // single-concrete Inline form, independent of the name-keyed map).
+    let ir = backend.generate(&items, None);
+    // The Inline form fires (single concrete): the impl body's math is present
+    // and there is no indirect call.
+    assert!(
+        ir.contains("mul nsw i64"),
+        "the flowed dyn must dispatch (Inline form, the impl body's math present):\n{ir}"
+    );
+    assert!(
+        !ir.contains("load ptr, ptr"),
+        "the flowed single-concrete dyn must be Inline (no thunk-table indirect call):\n{ir}"
+    );
 }

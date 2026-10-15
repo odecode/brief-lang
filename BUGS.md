@@ -33,6 +33,74 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## Trait-constrained generics returned Int instead of the trait type — FIXED 2026-10-13
+
+**Symptom:** a trait method called on a bound type param inside a generic body
+returned `Int`, not the trait's declared result. `defn bump_twice<T: Counter>(…)
+-> T { term bump(bump(this, amount), amount); }` type-checked as returning Int,
+so `let t2: Tally = bump_twice(t, 5)` was rejected (Int ≠ Tally). SPEC §8.6
+specifies trait-constrained generics (monomorphized), so this was a missing
+feature, not a contract to weaken.
+
+**Root cause (two layers):**
+- Typecheck: `fn_type_params` stored only the NAMES of a defn's type params, not
+  their bounds, so inside the body the checker did not know `T: Counter`.
+  `infer_call`/`resolve_method_call` had no branch for a call whose receiver/arg
+  was a bound type param → the call fell through to the `Ok(Type::int())`
+  fallback.
+- Backend: a top-level generic defn was emitted ONCE type-erased (`T` → i64), so
+  inside the single body `this: T` and the trait call lowered to a dangling
+  `call @bump` (no top-level `bump`; the obj member is `Tally::bump`, and members
+  are inlined, not symbols).
+
+**Fix (branch feat/trait-system-implementation, S1–S6):**
+- Typecheck: carry each type param's bound into context
+  (`fn_type_param_bounds` + the transient `active_type_param_bounds`);
+  `resolve_bound_param_call` resolves a trait method on a bound param with
+  `Self→T`; `resolve_conforming_trait_call` + `type_conforms_to_trait` resolve a
+  trait DEFAULT on a structurally-conforming concrete type (method + free form);
+  `check_type_param_bounds` rejects a non-conforming concrete type at the call
+  site with a what/why/fix diagnostic.
+- Backend: monomorphize a trait-bounded generic defn per concrete instantiation
+  (`bump_twice` → `bump_twice$Tally`, params/return/body substituted), with a
+  free-call UFCS so the inlined body's trait call resolves to the concrete
+  member; trait defaults are registered as `Self`-generic defns so the same
+  machinery specializes them onto conforming types.
+
+**Verified:** probes P1–P4 (`.kiro/specs/fullstack-webapp/scratch/probe_trait_*`)
+and the tracked tests — typechecker `trait_*` unit tests + the
+`tests/tier1/trait_generics_smoke.bv` E2E fixture (builds, links, prints 30).
+A non-conforming type is rejected. Scope: static monomorphized generics; `dyn`
+runtime dispatch remains deferred. Known follow-up: structural conformance reads
+an obj's OWN members only, not `impl`-block functions (no test exercises it yet).
+
+## Conformance sweep fails on `adapters.dbvl` — PRE-EXISTING, OBSERVED 2026-10-13
+
+**Symptom:** `conformance::tests::conformance_sweep_every_active_source_parses_and_checks`
+fails with:
+`examples/data-briev/adapters.dbvl: schema validation failed … group 0 entry 0:
+too many positional fields (12, schema 'RegistryEntry' has 4 fields)`.
+
+**Root cause (data, not compiler):** `adapters.dbvl` holds three line entries of
+4 fields each (`rust; glue/adapters/rust.bv; rs; src;` …), and its schema
+`RegistryEntry` (imported from `registry.dbv`) declares 4 fields. The DataLine
+reader (`SourceKind::DataLine` → `check_data_source`) collapses all three lines
+into ONE group of 12 positional fields instead of three entries of 4 — a
+line-terminator/entry-splitting defect in the `.dbvl` reader. No `.bv`/`.rbv`
+source in the sweep is affected (all print `OK`).
+
+**Scope / provenance:** independent of the typechecker. `adapters.dbvl` was last
+touched by the unrelated "Massive rename" commit (`62ae145d`); it is NOT modified
+by the static trait-generics work (branch `feat/trait-system-implementation`,
+which changes only trait resolution in `src/typechecker/mod.rs`). The `.dbvl`
+validation path never flows through `infer_call`/`check_top_level`.
+
+**Undo/fix path:** fix in the DataLine entry splitter (treat each
+semicolon-terminated line as one `RegistryEntry`), OR correct the fixture to the
+reader's expected shape. Tracked here so the trait-generics branch is not blamed;
+the sweep's single failure is this fixture, the GPU/spirv/qemu failures are the
+known no-toolchain-in-WSL set.
+
 ## Split OOB partial writes poisoned the reference — FIXED 2026-10-01
 
 **Symptom:** the declared-`split<8>` softmax fixture failed
@@ -7448,7 +7516,7 @@ distinct body of work before "ERC-clean" can be claimed for them.
 **Undo:** revert the four emitter lines (uuid `{:012x}`→`{:012}`, the
 label justify, the `sheet_instances` block, the two `hide`→`hide yes`).
 
-## 2026-09-28 — `hardware_validator` is dead code (the .sbv synthesizability gate never runs) [LEDGER 2026-10-06: OPEN]
+## 2026-09-28 — `hardware_validator` is dead code (the .sbv synthesizability gate never runs) [RESOLVED 2026-10-14 — addendum below]
 
 **Found:** Wave 2 C1 (die-graft work), while checking whether imported die
 items pass any hardware gate.
@@ -7468,6 +7536,58 @@ then, treat `.sbv` synthesizability as UNENFORCED.
 **Class:** a validator with no caller is documentation, not a gate —
 the failure mode is silent contract erosion, the exact thing the
 validator was written to prevent.
+
+**RESOLVED 2026-10-14 (branch fix/sbv-hardware-validator-gate):** the
+synthesizability gate now runs on every `.sbv` (`SourceKind::Silicon`)
+root. Wiring:
+- `HardwareValidator::validate_silicon(items)` — a new public entry that
+  returns ONLY the synthesizability diagnostics (`check_hebv_restrictions`:
+  B5001–B5008). It deliberately does NOT run the reactive-liveness
+  heuristics (`check_orphan_variables`/`check_untriggerable_transactions`/
+  `check_unused_variables` via the full `validate(..., is_embedded=true,
+  ...)`): a `.sbv` file's file-scope bare `let`s are boundary pins
+  (examples/silicon/sensor_die.sbv) that are legitimately never written, so
+  `is_embedded=true` would flip "never written" to Error and falsely reject
+  every well-formed die (and break the conformance sweep). Those checks are
+  the `.ebv` reactive tier's concern and remain unwired (need a `TargetSpec`).
+- Called from BOTH frontends so `check` and `build` never diverge on
+  acceptance: `src/pipeline.rs` `parse_and_check` (the `brievc check` path)
+  and `src/compile.rs` `compile_source` (the `brievc build` path), each
+  right after `check_types`, aborting via `return Err` on any Error-severity
+  diagnostic.
+
+**Two representation facts the fix had to absorb** (both would have made the
+gate a silent no-op or a false-positive):
+1. A top-level `let x: T [= e];` parses to `TopLevel::Statement(Let)`, NOT
+   `TopLevel::StateDecl` (src/parser/definitions.rs — the parser emits
+   `Statement` for every top-level let; the `Let`→`StateDecl` lowering is a
+   later backend-normalizer pass that runs AFTER this gate). So
+   `check_hebv_restrictions` now also walks the declared type of a top-level
+   `Statement::Let`, or every `.sbv` state field escaped the type check.
+2. `UInt<8>`/`Int<8>` parse to `Type::Constrained(Custom("UInt"|"Int"),
+   BitRange::Single(w))` (src/parser/types.rs) — that IS the sized,
+   synthesizable form the B5006 message asks for. The `Constrained` arm of
+   `check_type_synthesizable` must treat a wrapped `Int`/`UInt` as OK, not
+   recurse into the bare `Custom("UInt")` (which the unsized rule flags).
+
+**Verified (debug brievc, WSL, ~/briev-target):**
+- 4 behavioral tests in `src/pipeline.rs` driving the real `check_source`
+  entry: `sbv_well_formed_die_passes_the_gate` (sized `UInt<8>` + total
+  contracts PASS), `sbv_float_state_is_rejected` (B5007 fires),
+  `sbv_true_precondition_is_rejected` (B5004 fires),
+  `non_sbv_float_state_is_not_gated` (a plain `.bv` is never gated). All green.
+- The validator's own `hebv` module tests: 6/6 still green.
+- Controlled A/B on the full `cargo test --lib`: baseline (changes stashed)
+  3021 passed / 38 failed; with the fix 3025 passed / 38 failed — SAME 38
+  failures (the known no-toolchain-in-WSL PTX/SPIR-V/cross-assembler set +
+  the pre-existing `adapters.dbvl` `.dbvl`-reader defect), +4 passing (the
+  new tests). Zero regressions.
+
+**How to undo:** remove the two call sites (grep `validate_silicon`) and
+`validate_silicon` itself; the module returns to dead code and `.sbv`
+synthesizability is unenforced again. The `Statement::Let` arm and the
+`Constrained` Int/UInt arm in `check_type_synthesizable` can stay (they are
+correct regardless) but become unreachable without a caller.
 
 ## 2026-09-30 — NVIDIA driver 615.71.09 regressed the workgroup-smem + barrier compute path ~2.5× (RTX 3060, Vulkan) [OPEN — vendor] [LEDGER 2026-10-06: OPEN-UNVERIFIED]
 
@@ -9055,3 +9175,333 @@ class of bug impossible. Deferred — the minimal fix unifies the spelling now.
 **Regression test:** test_memcpy_memset_intrinsics_declared in
 src/backend/llvm/tests.rs asserts the declares are present and that no legacy
 p0i8 / malformed p0p0 manglings are emitted.
+
+---
+
+## run_reactor: bootstrap dirty set cleared before first run (2026-10-12)
+
+**Status: OPEN — latent, no callers.**
+
+`run_reactor` (src/reactor.rs:427) calls `clear_dirty()` *before* the first
+`run()`. `build_from_program` marks every reactive txn dirty as the bootstrap
+wake, so the pre-clear wipes the only dirty set that exists. With
+`dependency_map` never populated (`mark_dirty` is a no-op map lookup), nothing
+can re-dirty any txn — `run_reactor` can never fire any node.
+
+`run_reactor_continuous` (src/reactor.rs:452) has no pre-clear and works. The
+bug is latent because `run_reactor` has zero callers in production code (only
+its own tests, which call `reactor.run` directly, bypassing the loop).
+
+**Fix (when the API is revived):** drop the leading `clear_dirty()`, or
+restructure so the bootstrap set is consumed before the first clear.
+
+## .gitignore ignores all of tests/ while 105 test files are tracked (2026-10-12)
+
+**Status: OPEN — policy hazard.**
+
+`.gitignore:14` lists `tests/`, ignoring the entire directory. The 105
+existing tracked test files are grandfathered (git does not untrack files
+already in the index), but any *new* test file under `tests/` is silently
+invisible to `git status` and `git add`. The contract-pin test for
+`List<dyn>` (tests/dyn_list_interpreter_parity.rs) was nearly lost to this.
+
+**Fix:** add a `!tests/*.rs` negation to un-ignore hand-written top-level
+integration tests while keeping generated `.bv` fixtures ignored.
+
+## __eprint_str returned the byte count (2026-10-12)
+
+**Status: FIXED.**
+
+`__eprint_str` (lib/std/cast_lanes.bv:667) was the one print-family member
+returning the byte count instead of the neutral 0 — the same convention
+violation the 2026-09-23 exit-code-parity fix resolved for the rest of the
+family. Aligned to `term 0`. No consumer of its return was found in any
+Briev source, so the change is behavior-neutral for existing programs.
+
+## LLVM gate rejected `Alloc#` despite a working arm — FIXED 2026-10-12
+
+**Symptom:** any program with a BARE `__print_str(...)`/`__print(...)` call
+(e.g. `tests/tier1/daily_use_smoke.bv`) failed at the LLVM normalizer with
+`intrinsic 'Alloc#' is not supported by this backend` — while `println!`
+programs built fine.
+
+**Root cause:** the prelude-injected cast_lanes.bv buffered-stdout lane
+routes `__print_str → write_all → __stdout_byte → Alloc#` (the 64 KiB
+buffer). `Alloc#` HAS a working lowering (`emit_alloc`,
+src/backend/llvm/intrinsics.rs) but was never admitted to the LLVM
+`build_supported_ops()` gate (normalizer.rs) when the buffered lane landed
+(2026-09-11). `println!` dodged the gate because the macro expands to the
+`Print#` intrinsic (harvester sees `Print#`, not the defn body); only a
+direct call to the cast_lanes defn walked into `Alloc#`.
+
+**Fix:** admit `"Alloc#"` to the LLVM supported set (with provenance —
+Malloc/Free already join via STANDARD_OPS; Alloc# is the pure-Briev heap
+sibling).
+
+**How to undo:** remove the entry — a bare `__print_str` program gate-fails
+again while every `println!` program stays green.
+
+## `get_env_int!` panicked the defn-liveness net — FIXED 2026-10-12
+
+**Symptom:** `get_env_int!("BOUND")` in a node body crashed the compiler
+(`defn liveness: emitted code calls unreached defn(s)
+["briev_str_substr", "str_to_int"]`, mod.rs:5484).
+
+**Root cause:** the `Environ#` intrinsic→helper row (defn_liveness.rs)
+rooted only the two walker impls. The emitted code ALSO calls the cast-lane
+helpers: env.bv's String-param contract (`key >= 0`) elaborates through the
+String↔Int cast lanes (str_to_int/int_to_str) and the String-returning
+sibling routes Slice#→briev_str_substr + the auto-free lane — the exact set
+the Print# row already documents.
+
+**Fix:** the Environ# row gains the four cast-lane names (same provenance
+as the Print# row).
+
+**How to undo:** drop the names — `get_env_int!` panics the net again at
+every build.
+
+## tier1 fixtures: two never parsed, two export-surface — FIXED 2026-10-12
+
+**Symptom:** the first run of the new E2E gate (tests/daily_use_smoke.rs)
+found `test_char.bv` and `test_stringbuilder.bv` failing at PARSE
+(pre-`when` `[cond] { ... }` block syntax, unmigrated since the when-keyword
+migration — nothing had ever compiled them; they were orphaned fixtures),
+and `strexp.bv`/`strexp2.bv` misclassified as run programs (they are
+export-only surfaces — `brievc lib` builds `libstrexp.a` cleanly).
+
+**Fix:** both fixtures migrated to `when`+node form (now run green:
+char-classify/convert/unicode-ok, stringbuilder-ok); the E2E gate
+classifies `export defn` with no node/txn as library surface and builds
+those via `brievc lib`. Same pass fixed the .gitignore hazard that had left
+`daily_use_smoke.bv` silently untracked (`tests/*` negation now re-includes
+`tests/tier1` and `tests/fixtures`).
+
+**How to undo:** revert the fixtures — the gate reports parse failures
+again (honest, but the corpus stops guarding the char/StringBuilder paths).
+
+## field-liveness: Guarded (when) CONDITION invisible — FIXED 2026-10-12
+
+**Symptom:** a state field referenced ONLY inside a `when` cond (e.g. the
+entry-plugin snapshot `arg_verbose`, rewritten from `when args!("--verbose")`)
+was marked FieldMode::Never by `apply_field_modes` and eliminated from
+%State; the identifier emit fell through to the global-load fallback and
+clang rejected the IR with `use of undefined value '@arg_verbose'`.
+
+**Root cause:** `scan_for_state_identifiers` (src/analysis/transition_graph.rs)
+had `Statement::Guarded(_, statements)` — it scanned the body but not the
+cond. The cond is a read. The same sweep closed the remaining statement
+holes (Check/Open read their exprs; statement-level Match reads the
+scrutinee and walks arm bodies; Defer/Mutex are transparent scopes;
+TrgBinding reads its `instance`) and the remaining Expr holes (Slice bounds,
+Spawn args, StructLiteral field/spec values, IsType/Await inner,
+DerivationBlock synthesized/pre/post, PluginIntercept receiver+args;
+Expr::Block now delegates to the statement scanner so nested Lets count).
+
+**How to undo:** revert the Guarded arm — the plugin probes (target/cli_probe)
+fail at link with `@arg_*` undefined again.
+
+## reactive-loop with local let: non-dominating alloca — OPEN 2026-10-12
+
+**Symptom:** `examples/cli-args.bv` first draft used a reactor-internal loop
+(`let i: Int = 0; when repeats > 0 { i = 1; }; when i < repeats { i = i + 1; }`)
+— clang rejected the IR: `Instruction does not dominate all uses!` for the
+`i` alloca (load/store in a loop body block that does not dominate).
+
+**Scope:** local-let inside a multi-when reactive loop shape. Worked around
+in the example (dropped the loop); the shape itself needs a codegen fix
+(alloca placement or phi for loop-carried locals). Repro: restore the loop
+in examples/cli-args.bv and link.
+
+**How to undo:** n/a — open bug, not a fix.
+
+## byte_at WASM emission: i64 length load vs i32 param — OPEN 2026-10-12
+
+**Symptom:** `brievc build <x>.rbv --split` (webstack → llc WASM) rejects IR
+when cast_lanes' `byte_at` is emitted: `%t14 = load i64` (the String
+`^.Length` lane) feeds `icmp sge i32 %arg1, %t14` — type mismatch. On x86
+the same function never emitted before (liveness killed it), so the latent
+width bug was invisible.
+
+**Exposure path:** the (same-day reverted) coarse Cast-family mark in
+defn_liveness rooted str_to_int → parse_int_ws → byte_at in every unit with
+any cast; the webstack path then hit the broken emission. With the mark
+reverted, byte_at only emits when explicitly called — still broken on WASM.
+
+**Repro:** root str_to_int on a .rbv target (e.g. a defn that calls
+`str_to_int` or cli.bv's `arg_int`) and run the rbv_gate build.
+
+**Fix direction:** the reflect `^.Length` on String must adapt to the
+operand/param width on the wasm ABI (trunc/zext at the comparison), or the
+webstack Int ABI must be i64-consistent with the length lane.
+
+**How to undo:** n/a — open bug, not a fix.
+
+## entry-plugin cli.bv import is the prelude anchor — LESSON 2026-10-12
+
+The entry plugin's UNCONDITIONAL `import "std/cli.bv"` injection looks like
+a bug (it drags a module into every unit) but is LOAD-BEARING: prelude-native
+branches on `Tag$("import")` matching, so a unit with no user import and no
+txn (bare `defn` files — most of lib/std) gets NO stdlib family without it.
+Making the inject conditional broke the defn-only conformance corpus
+(unknown names fell to the Int fallback: env.bv "found Int", glue-macro
+"no op Count"). The real conflict (string.bv exports colliding across
+stdlib) was fixed at the SOURCE: cli.bv is import-free (uses cast_lanes'
+str_to_int/str_to_float, which the prelude injects). Do not re-narrow the
+inject without replacing the anchor mechanism.
+
+## trait-generic monomorphizer: compound-T bare calls + body rebox — FIXED 2026-10-14
+
+**Found:** fs_smoke (roundtrip, trunc) broke after merging PR #15 (static
+trait-constrained generics, cb149de7). The pre-merge fs_smoke green predated
+the merge; `cargo test --lib` does not run integration targets — the stack
+verification missed it. LESSON: run the integration test targets on a PR
+stack, not just `--lib`.
+
+**Bug 1 (bare calls for compound concrete args):** `try_emit_monomorphized_generic_call`
+rejected every non-`Type::Custom` concrete binding
+(`!concrete.iter().all(|ty| matches!(ty, Type::Custom(_)))` → fall back to
+the plain-name call path), and post-#15 an uninstantiated generic emits
+nothing. `is_err(lres)` with `lres: Result<List<String>, Int>` emitted
+`call i8 @is_err` with no define — link failure
+(`use of undefined value '@is_err'`). The guard existed because
+`mangle_specialization` used `Display`, which produces `List<String>` —
+invalid in an LLVM identifier.
+
+**Fix 1:** recursive identifier-safe `mangle_type_suffix` (`List<String>` →
+`List$String`); guard deleted. `is_err$List$String$Int` now defined and
+called.
+
+**Bug 2 (body rebox):** `emit_specialized_definition` substituted the
+params and return type but NOT the body's inline type annotations. In
+`unwrap<T,E>`, the arm `Err(_) => 0 as T` kept the generic cast target `T`:
+the match arms were judged heterogeneous, every arm value was union-boxed
+(tag = arm index), and the Ok arm returned a fresh box handle where the
+signature says `T = Int` — `println!(unwrap(wres))` printed a heap pointer
+(94638504666256 ≈ 0x56…).
+
+**Fix 2:** `typechecker::substitute_stmt_types`/`substitute_expr_types` walk
+the body's inline type annotations (`let` annotations, `as`/`is` casts,
+typed match bindings); called from `emit_specialized_definition`.
+`unwrap$Int$Int` now loads the payload and returns it — zero mallocs.
+
+**Verified:** fs_smoke 2/2; IR shows no malloc in `unwrap$Int$Int` and the
+`$List$String$Int` specialization defined + called; full `cargo test --lib`
+3078/0.
+
+## fs.bv prelude injection grew every GPU state struct — FIXED 2026-10-14
+
+The committed prelude injected `std/os/fs.bv` into every unit. When fs.bv
+gained real state fields (Increment 3), every GPU target's SSBO state
+struct grew past the `ssbo_members <= 3` assertion
+(`image_plan_partitions_ssbo_and_writes_texel`), and fs.bv's own imports
+(result.bv `unwrap`, posix `syscall3`) collided with option.bv/syscall.bv
+decls inside every unit (conformance sweep: "import name 'unwrap'
+conflicts"). fs.bv is a CAPABILITY, not a universal: removed from
+`prelude.bv` + `prelude-native.bv`; programs import it explicitly
+(Rule 14). The A/B that isolated this from the PR-15 breakage above
+restored the injection and reproduced the failures — the prelude edit was
+exonerated and re-applied.
+
+## import resolver: Export unwrap + selective imports — FIXED 2026-10-14
+
+`src/import_resolver.rs`: a selective import's `Export` wrapper was
+unwrapped at the wrong layer, so selectively-imported names did not
+resolve (the `syscall3`/`unwrap` collision diagnostics recommended
+selective imports that then could not resolve). Fixed together with the
+fs.bv selective imports; fs_smoke exercises the path E2E.
+
+## syscall.bv [nr > 0] contract rejected SYS_READ — FIXED 2026-10-14
+
+`lib/std/syscall.bv` (deleted) carried `[nr > 0][nr < 512]` on every
+wrapper. `SYS_READ = 0` — a valid Linux syscall number — violated the
+precondition, so every read through that family was contract-invalid. The
+retired variadic surface takes `[nr >= 0 && nr < 512][true]`: the `nr > 0`
+clause was a bug, not a standard; the 512 upper bound is real (x86_64 max
+~447) and stays. The uncontracted `lib/std/posix/syscall.bv` family is
+subsumed by the same strengthened contract.
+
+## bare-let collection + first insert: uninitialized handle slot — FIXED 2026-10-14
+
+`let xs: List<Int>;` followed by `xs <- 5` in a node body segfaulted. The
+construction pre-pass fired on `~<-` extract and `= 0` init but NOT on a
+bare declaration + first insert: the binding got a naked `alloca i64`, the
+insert loaded the uninitialized slot and dereferenced stack garbage.
+
+Two stacked causes surfaced while fixing:
+1. **The construction itself** — the bare-let arm now constructs through
+   the SAME machinery as the initializer paths (op InitEmpty for the empty
+   literal; op Init(0) — the `= 0` idiom — when only the seeded Init
+   exists, e.g. hand-written HashMap).
+2. **A latent DOUBLE EMISSION**: under direct-SSA dispatch, `main` was
+   emitted TWICE — once by the txn loop (`emit_transaction`, a dead
+   `txn_main`) and once by `emit_ssa_main` (the live `main()`) — sharing
+   one FunctionContext. The dead copy was invisible while both emissions
+   happened to be self-consistent (linker-GC'd); the bare-let coll made
+   the second emission's binding stores clobber the first's, and the live
+   body dereferenced a handle from the other copy. The txn loop now skips
+   the entry when the SSA branch will fire (mirror of the dispatch
+   condition). Every SSA-dispatched program was double-emitting; the
+   "t193/t196" call sites seen in earlier IR reviews were this.
+
+**Verified:** tests/tier2_payload_abi.rs (all linked at -O0, the
+IR-validity gate); full suite 3080/0; rbv_gate OK.
+
+## dyn push-site: concrete into List<dyn Trait> stored raw — FIXED 2026-10-14
+
+`hs <- Dog { base: 7 }` into a `List<dyn Greeter>` was rejected at
+typecheck (no dyn coercion at the push boundary), and — once admitted —
+the backend stored the RAW concrete handle (dispatch read garbage;
+coll-element-size ADDENDUM 3 hole 1). Fixed at both layers:
+- **typechecker**: a dyn-element arrow push admits a concrete that
+  structurally PROVIDES the trait (`dyn_push_admitted` →
+  `type_conforms_to_trait`).
+- **impl-block conformance** (closes the PR-15 known limitation):
+  `type_conforms_to_trait` reads type_members, which held only
+  type-decl-body members — `impl Dog { defn greet ... }` (the natural
+  proof syntax) was invisible. Impl-block functions now merge into the
+  type's members (dedup by name).
+- **backend**: the push gate admits the dyn element, and the push site
+  boxes the concrete (tag + fat pointer) via `coerce_to_dyn` — the same
+  box the let-coercion emits. The concrete name comes from the RESOLVED
+  value type (a struct literal's register carries no type info).
+
+Dyn list across a defn-call boundary (ADDENDUM 3 hole 2) works through
+the same fixes. Verified: tier2_payload_abi dyn tests (701/92, 703).
+
+## Result payload shape-sensitivity: root causes — FIXED 2026-10-14
+
+`Result<T,E>` access needed different forms per payload shape:
+- Int payloads "worked" because the undefined-generic `Int` fallback was
+  accidentally right (missing `import "std/result.bv"` resolved `unwrap`
+  to the fallback silently);
+- String payloads needed `match` (pattern binding, no call);
+- List payloads mis-lowered through a let binding (the bare-let bug above).
+
+With the bare-let fix + the PR-15 generic-defn monomorphization fixes
+(same day, `ee21c3f4`), ONE form works for every payload: predicate +
+`unwrap`. fs_smoke's shape-sensitive comments are historical; the
+tier2 suite pins the unified surface.
+
+## SSA main: nested-block assign alloca non-dominating — FIXED 2026-10-14
+
+A node-body local assigned inside a `when` block and read in a sibling
+(`let i: Int = 0; when up > 0 { i = 1; }; when i < 5 { i = i + 1; }`) —
+the assign-site alloca demotion landed INSIDE the first block, which does
+not dominate the sibling read (clang: `Instruction does not dominate all
+uses!`). The 2026-08-28 fix covered DEFNS (`emit_definition` pre-declares
+reassigned lets); the SSA main path never ran the same pre-declaration.
+
+**Fix:** `emit_ssa_main` pre-declares entry allocas for every reassigned
+let across the inlined txn bodies (the emit_definition pattern) — the
+let's seed store and all later stores target a slot that dominates
+everything. Two interactions handled:
+- a BARE scalar let binds the pre-declared slot directly (falling through
+  created a second alloca and the reassigned branch stored the fresh
+  alloca pointer into the slot — `type 'ptr' but expected 'i64'`,
+  test_arrow_consume_selects);
+- a CONSTRUCTABLE collection bare-let must NOT bind the slot — it needs
+  the construction (phase 1); the direct bind starved it (tier2 suite
+  caught it).
+
+**Verified:** tests/tier2_loop_locals.rs (both-when + false-branch-seed,
+linked at -O0); full suite 3080/0; rbv_gate OK.

@@ -5,6 +5,7 @@
 
 mod compile;
 mod deps;
+mod test_runner;
 
 use std::collections::HashMap;
 use std::env;
@@ -61,6 +62,21 @@ fn main() {
         // change (dev loop). Thin orchestration over the per-file build (the
         // Part 1 seam) + the existing watch.rs debouncer — no new codegen.
         "watch" => run_watch(&args[2..]),
+        // 2026-10-14 (daily-driver plan Increment 4, docs/plans/
+        // 2026-10-12-daily-driver-quick-wins.md): the language server was
+        // fully implemented (src/lsp.rs — hover/definition/completion/
+        // documentSymbol/workspaceSymbol) but unreachable: the VS Code
+        // client launches `<briev> lsp` over stdio and main had no arm.
+        // The mode parameter is currently unused by the server loop
+        // (run_lsp_server's `_mode`), so the arm takes the default.
+        // 2026-10-14 (tier2 phase 3): the Briev-level test runner — each
+        // *.bv is a program whose exit code (and optional .golden stdout)
+        // is the assertion. See test_runner::run_test_mode.
+        "test" => test_runner::run_test_mode(&args[2..]),
+        "lsp" => {
+            briev_compiler::lsp::run_lsp_server(briev_compiler::errors::ErrorMode::Verbose);
+            Ok(())
+        }
         "vocab" => run_vocab(&args[2..]),
         "grammar" => run_grammar(&args[2..]),
         "fmt" => run_fmt(&args[2..]),
@@ -88,6 +104,8 @@ fn print_usage(program: &str) {
     eprintln!("Briev Compiler");
     eprintln!("Usage:");
     eprintln!("  {} build <file.bv>                 Compile a Briev source file", name);
+    eprintln!("  {} lsp                             Run the language server (stdio; VS Code extension)", name);
+    eprintln!("  {} test <file|dir>                 Run *.bv tests (exit 0 passes; <name>.golden pins stdout)", name);
     eprintln!("  {} build <file.bv> --llvm           Emit LLVM IR only, no binary", name);
     eprintln!("  {} build <file.bv> --config-dir <d>  Set config directory", name);
     eprintln!("  {} build <file.bv> --out <dir>      Set output directory", name);

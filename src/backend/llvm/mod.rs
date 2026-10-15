@@ -2659,6 +2659,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         self.ctx.density = analysis.density.clone();
         self.ctx.inline_decisions = analysis.inline_decisions.clone();
         self.ctx.modulo_partition = analysis.modulo_partition.clone();
+        // 2026-10-12 (SPEC §8.6.1 Option B): per-collection dyn concrete sets
+        // + dispatch forms — the frontend's decision the element read-sites
+        // consume (never re-derived).
+        self.ctx.dyn_collection_info = analysis.dyn_collection_info.clone();
 
         let cg = &analysis.call_graph;
         self.ctx.has_cycles = cg.has_cycle();
@@ -2716,6 +2720,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 self.ctx.inits.insert(i.name.clone(), i.clone());
             }
         }
+        // 2026-10-08 (stabilise-for-use T1, Phase 5c): register the dyn
+        // thunk-table inputs — trait requirement slot order + the concrete
+        // types that appear in a `dyn` coercion. The thunk tables themselves
+        // are emitted at module end (emit_dyn_thunk_tables) from this registry.
+        self.register_dyn_thunks(items);
+
         // 2026-08-07 (object instance pools): pre-register the struct/obj
         // member-field lists so build_field_index can unpack obj instances
         // into prefixed slots (`st.data`, `st.len`). The full registration
@@ -2969,6 +2979,18 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 TopLevel::Definition(d) => {
                     let tys: Vec<Type> = d.parameters.iter().map(|(_, t)| t.clone()).collect();
                     self.ctx.defn_params.insert(d.name.clone(), tys);
+                    // 2026-10-13 (static trait-constrained generics, SPEC §8.6,
+                    // S6): a GENERIC defn (type_params non-empty) is retained in
+                    // full so the backend can monomorphize it per concrete
+                    // instantiation at the call site (a trait-bounded param's
+                    // body needs the concrete type to resolve its trait calls).
+                    if !d.type_params.is_empty() {
+                        self.ctx.generic_defns.insert(d.name.clone(), d.clone());
+                        self.ctx.generic_defn_type_params.insert(
+                            d.name.clone(),
+                            d.type_params.iter().map(|p| p.name.clone()).collect(),
+                        );
+                    }
                     // 2026-07-18: Populate return types from output_type (-> Type) as
                     // well as legacy outputs. output_type is the primary metadata source.
                     let ret_tys = if !d.outputs.is_empty() {
@@ -2979,6 +3001,47 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                         vec![]
                     };
                     self.ctx.defn_return_types.insert(d.name.clone(), ret_tys);
+                }
+                // 2026-10-13 (static trait-constrained generics, SPEC §8.6,
+                // S6): a trait DEFAULT (a body-carrying trait function) is
+                // registered as a generic defn over `Self` — the SAME
+                // monomorphization machinery (M2) specializes it per conforming
+                // concrete type (`bump_twice` → `bump_twice$Tally`, Self→Tally),
+                // and inside the body a call to a sibling requirement resolves
+                // to the concrete member via the free-call UFCS (M1). Required
+                // (empty-body) functions are not registered — they ARE the
+                // concrete type's own members. A concrete type's own member of
+                // the same name still wins (its top-level/obj registration
+                // shadows the default at resolution).
+                TopLevel::Trait(t) => {
+                    for func in &t.functions {
+                        if func.body.is_empty() {
+                            continue;
+                        }
+                        if self.ctx.generic_defns.contains_key(&func.name) {
+                            continue; // a real top-level defn of this name wins
+                        }
+                        let mut as_generic = func.clone();
+                        // `Self` is the single type param the default is generic
+                        // over; it binds to the concrete receiver at the call.
+                        as_generic.type_params = vec![crate::ast::top::TypeParam {
+                            name: "Self".to_string(),
+                            bound: Some(Type::Custom(t.name.clone())),
+                        }];
+                        let tys: Vec<Type> =
+                            func.parameters.iter().map(|(_, ty)| ty.clone()).collect();
+                        self.ctx.defn_params.insert(func.name.clone(), tys);
+                        let ret_tys = func
+                            .output_type
+                            .as_ref()
+                            .map(|ot| ot.all_types())
+                            .unwrap_or_default();
+                        self.ctx.defn_return_types.insert(func.name.clone(), ret_tys);
+                        self.ctx.generic_defns.insert(func.name.clone(), as_generic);
+                        self.ctx
+                            .generic_defn_type_params
+                            .insert(func.name.clone(), vec!["Self".to_string()]);
+                    }
                 }
                 TopLevel::AsmFn(asm_fn) => {
                     let tys: Vec<Type> = asm_fn.params.iter().map(|(_, t)| t.clone()).collect();
@@ -3799,6 +3862,17 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         if !defined.contains("briev_slice_range_f32") {
             writeln!(out, "declare i64 @briev_slice_range_f32(ptr, i64, i64, i64) #1").ok();
         }
+        // 2026-10-09 (T2a): strided range slice over a state column —
+        // `data[lo:hi:step]`. Element i is source[lo + i*step]; builds a
+        // contiguous [len][elems] block (the same layout the contiguous
+        // gather produces), so downstream `Index`/foreach consumers are
+        // unchanged. Unblocks the old strided-slice `panic!`.
+        if !defined.contains("briev_slice_strided64") {
+            writeln!(out, "declare i64 @briev_slice_strided64(ptr, i64, i64, i64, i64) #1").ok();
+        }
+        if !defined.contains("briev_slice_strided_f32") {
+            writeln!(out, "declare i64 @briev_slice_strided_f32(ptr, i64, i64, i64, i64) #1").ok();
+        }
         // 2026-08-01 (Phase 3): CLI argv capture. The emitted main stores
         // its argc/argv into these globals; the runtime argv helpers
         // (briev_rt.c) read them as externs. The compiler OWNS the globals
@@ -4036,6 +4110,16 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     if !self.ctx.emit_all_defns && !self.ctx.live_defns.contains(&d.name) {
                         continue;
                     }
+                    // 2026-10-13 (static trait-constrained generics, SPEC §8.6,
+                    // S6): a GENERIC defn is NOT emitted type-erased — a
+                    // trait-bounded param's body would dangle (`@bump`
+                    // undefined). It is emitted per concrete instantiation as a
+                    // monomorphized specialization (drained after the reactor).
+                    // A generic defn with no instantiation emits nothing, which
+                    // is correct: an uninstantiated generic is dead code.
+                    if self.ctx.generic_defn_type_params.contains_key(&d.name) {
+                        continue;
+                    }
                     // 2026-09-23 (stateless-defn mechanism): a regular defn
                     // carries `%state` ONLY when it transitively needs it.
                     // Pure helpers (cstr doors over Load#/Alloc#, arithmetic
@@ -4094,6 +4178,15 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             self.emit_task_runtime(&mut out);
             writeln!(out).ok();
         }
+        // 2026-10-08 (stabilise-for-use T1, Phase 5c): per-(trait, concrete)
+        // thunk tables + thunk fns for every `dyn` coercion pair. Emitted after
+        // ordinary definitions so the thunk bodies reuse the same statement
+        // emitter against a fresh scope (the same reason emit_task_runtime is
+        // here).
+        if !self.ctx.dyn_concrete_pairs.is_empty() {
+            self.emit_dyn_thunk_tables(&mut out);
+            writeln!(out).ok();
+        }
         // Transactions
         // 2026-08-16 (multi-node internal fold, Direction 3): a counted-loop
         // node in a MULTI-node program is emitted as an internal PerFieldPhi
@@ -4111,12 +4204,27 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 self.ctx.internal_fold_txns.insert(name.clone());
             }
         }
+        // 2026-10-14 (tier2 phase 1, daily-driver-tier2 plan): under the
+        // direct-SSA dispatch, `emit_ssa_main` (below) inlines every txn body
+        // into main() — the txn loop's reactive `txn_main` copy is DEAD, and
+        // worse, both emissions share one FunctionContext: the second
+        // emission's binding stores clobber the first's, so a bare-let
+        // collection in main dereferenced the other copy's handle slot
+        // (segfault; the doubles were invisible while both copies happened
+        // to be self-consistent — dead code, linker-GC'd). Skip the entry in
+        // the loop exactly when the SSA branch will fire (mirror of the
+        // dispatch condition at ~4802). Callable txns are unaffected. To
+        // undo: delete this skip; the double emission returns.
+        let ssa_dispatch = self.async_txn_names.is_empty() && self.ctx.mmio_fields.is_empty();
         for (name, txn) in &txns {
             // 2026-09-13 (defn-liveness emission): reactive txns are roots
             // (always live); this skips only unreachable callable txns —
             // the same "'X' is never dispatched" population the dead-txn
             // warning already reports.
             if !self.ctx.emit_all_defns && !self.ctx.live_defns.contains(name) {
+                continue;
+            }
+            if ssa_dispatch && *name == "main" {
                 continue;
             }
             if self.ctx.internal_fold_txns.contains(name) {
@@ -4782,6 +4890,18 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 }
             }
             }
+        }
+
+        // 2026-10-13 (static trait-constrained generics, SPEC §8.6, S6): emit
+        // the monomorphized specializations enqueued during body/reactor
+        // emission. Drained in a loop — a specialization's own body may call
+        // another generic, enqueuing more. The emitted-set dedups, so this
+        // terminates (a finite set of (defn, concrete-args) instantiations).
+        while let Some((mangled, base, subst)) =
+            self.ctx.pending_defn_specializations.pop()
+        {
+            self.emit_specialized_definition(&mut out, &mangled, &base, &subst);
+            writeln!(out).ok();
         }
 
         // ── DEAD-FIELD INFO DIAGNOSTICS (A002/A003) ─────────
@@ -6158,6 +6278,338 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
     /// The V2 parser's FieldType handles all type compatibility at parse time.
     fn validate_schema_types(&mut self) {
         // No-op: alias validation is now name-only via schema_alias_names.
+    }
+
+    // ── Dyn Trait thunk tables (Phase 5c) ──────────────────────
+    /// 2026-10-08 (stabilise-for-use T1, Phase 5c): register the dyn
+    /// thunk-table inputs from the program AST — trait requirement slot order
+    /// (`dyn_trait_slots`) and the concrete types that appear in a `dyn`
+    /// coercion (`dyn_concrete_pairs`). The thunk tables are emitted at module
+    /// end from this registry (see the `emit_dyn_thunk_tables` call site).
+    fn register_dyn_thunks(&mut self, items: &[TopLevel]) {
+        self.ctx.dyn_trait_slots.clear();
+        self.ctx.dyn_concrete_pairs.clear();
+        self.ctx.dyn_impl_bodies.clear();
+        self.ctx.dyn_concrete_tag_of.clear();
+
+        // Pass 1: collect trait slot order (declaration order — the interpreter
+        // resolves the same order via the trait's `functions` list).
+        let traits = Self::collect_trait_slots(items);
+        self.ctx.dyn_trait_slots = traits.clone();
+
+        // Pass 2: collect per-concrete provided method names — the union of the
+        // type's own defns and its `impl` blocks.
+        let provided = Self::collect_provided_methods(items);
+
+        // Pass 3: register every (trait, concrete) pair whose conformance the
+        // provided methods prove (derived from behavior, not td.traits — see
+        // register_dyn_conformance).
+        let pairs = Self::register_dyn_conformance(&traits, &provided);
+        for (trait_name, concretes) in &pairs {
+            self.ctx
+                .dyn_concrete_pairs
+                .entry(trait_name.clone())
+                .or_default()
+                .extend(concretes.iter().cloned());
+        }
+
+        // Pass 3b (2026-10-09, dyn identity-in-value): assign each concrete a
+        // small per-trait TAG (its sorted position among that trait's
+        // conforming concretes). The tag is the identity that rides in the
+        // `dyn` value (a plain i64 that survives return/arg/field/phi). The
+        // use-site reads it to select the dispatch form (Inline / Switch /
+        // Vtable). Deterministic: sorted concrete order (Rule: no per-process
+        // variation in emitted IR).
+        for (trait_name, concretes) in &pairs {
+            let mut sorted: Vec<&String> = concretes.iter().collect();
+            sorted.sort();
+            for (tag, concrete) in sorted.iter().enumerate() {
+                self.ctx
+                    .dyn_concrete_tag_of
+                    .insert(format!("{trait_name}::{concrete}"), tag as i64);
+            }
+        }
+
+        // Pass 4: cache each impl member body keyed by "<concrete>::<slot>" so
+        // emit_dyn_thunk_fn can inline it without re-scanning the AST per thunk.
+        // Also store it as a TopLevel::Definition so emit_member_body (the A5
+        // self-bound member emission) can inline the body directly for the
+        // INLINE dispatch form (Phase B) — the concrete is provable at the
+        // use-site, so the `dyn` is erased and the body inlined (no vtable).
+        for item in items {
+            if let TopLevel::Impl(imp) = item {
+                for d in &imp.functions {
+                    let key = format!("{}::{}", imp.target, d.name);
+                    self.ctx.dyn_impl_bodies.insert(key.clone(), d.clone());
+                    self.ctx
+                        .dyn_impl_member
+                        .insert(key, TopLevel::Definition(d.clone()));
+                }
+            }
+        }
+    }
+
+    /// 2026-10-09 (dyn derive-don't-fix, Phase A): trait → required-slot order
+    /// (declaration order, matching the interpreter). Extracted to keep
+    /// register_dyn_thunks flat (Praetor cognitive ≤ 15).
+    fn collect_trait_slots(
+        items: &[TopLevel],
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut traits: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for item in items {
+            if let TopLevel::Trait(t) = item {
+                let slots: Vec<String> = t.functions.iter().map(|d| d.name.clone()).collect();
+                traits.insert(t.name.clone(), slots);
+            }
+        }
+        traits
+    }
+
+    /// 2026-10-09 (dyn derive-don't-fix, Phase A): the (trait, concrete) pairs
+    /// whose conformance is PROVED by behavior — a concrete's provided methods
+    /// (from collect_provided_methods) cover the trait's required slots. Conformance
+    /// is derived from the impl block, not from td.traits, because the parser
+    /// places a lone `type X: T` entry in the PARENT slot (the single
+    /// non-fundamental parent), leaving td.traits empty. Deterministic: traits
+    /// and concretes iterated in sorted order (HashMap → sorted keys, Rule:
+    /// no per-process variation in emitted IR).
+    fn register_dyn_conformance(
+        traits: &std::collections::HashMap<String, Vec<String>>,
+        provided: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut pairs: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut trait_names: Vec<String> = traits.keys().cloned().collect();
+        trait_names.sort();
+        for trait_name in &trait_names {
+            let slots = traits.get(trait_name).cloned().unwrap_or_default();
+            if slots.is_empty() {
+                continue;
+            }
+            let mut concrete_names: Vec<String> = provided.keys().cloned().collect();
+            concrete_names.sort();
+            for concrete in &concrete_names {
+                let have = provided.get(concrete).cloned().unwrap_or_default();
+                if slots.iter().all(|s| have.contains(s)) {
+                    pairs.entry(trait_name.clone()).or_default().push(concrete.clone());
+                }
+            }
+        }
+        pairs
+    }
+
+    /// 2026-10-09 (dyn derive-don't-fix, Phase A): per-concrete provided method
+    /// names — the union of a type's own defns and its `impl` blocks. The source
+    /// of truth for trait conformance (an impl block that provides a trait's
+    /// required slots proves the type implements the trait). Extracted from
+    /// register_dyn_thunks to keep that function flat (Praetor cognitive ≤ 15).
+    fn collect_provided_methods(items: &[TopLevel]) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+        let mut provided: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        for item in items {
+            match item {
+                TopLevel::TypeDef(td) => {
+                    provided.entry(td.name.clone()).or_default();
+                }
+                TopLevel::Impl(imp) => {
+                    for d in &imp.functions {
+                        provided.entry(imp.target.clone()).or_default().insert(d.name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        provided
+    }
+
+    /// 2026-10-08 (stabilise-for-use T1, Phase 5c): emit the per-(trait,
+    /// concrete) thunk tables + thunk fns for every registered `dyn` coercion
+    /// pair. For each (trait, concrete) pair, one thunk fn per required method
+    /// (`@__dyn_<Trait>_<Concrete>_<slot>`) with the impl body inlined, and a
+    /// fn-pointer table `@__dyn_<Trait>_<Concrete>` (one slot per required fn,
+    /// trait-declaration order — the order the requirement slots are indexed by
+    /// at the call site). The thunk fn signature mirrors the impl `defn`: the
+    /// Self receiver is the FIRST param (a `ptr` to the concrete heap image),
+    /// followed by the remaining params; it returns the impl's return type.
+    /// Deterministic: trait names, concrete names, and slot order are all
+    /// sorted/declaration-ordered (Rule: HashMap iteration must be sorted).
+    fn emit_dyn_thunk_tables(&mut self, out: &mut String) {
+        let mut trait_names: Vec<String> = self.ctx.dyn_concrete_pairs.keys().cloned().collect();
+        trait_names.sort();
+        for trait_name in &trait_names {
+            let slots = match self.ctx.dyn_trait_slots.get(trait_name) {
+                Some(s) => s.clone(),
+                None => continue, // trait with no required methods — nothing to thunk
+            };
+            if slots.is_empty() {
+                continue;
+            }
+            let mut concretes: Vec<String> = self.ctx
+                .dyn_concrete_pairs
+                .get(trait_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            concretes.sort();
+            for concrete in &concretes {
+                // Thunk fns first, then the table referencing them.
+                for slot in &slots {
+                    self.emit_dyn_thunk_fn(out, trait_name, concrete, slot);
+                    writeln!(out).ok();
+                }
+                let slot_ptrs: Vec<String> = slots
+                    .iter()
+                    .map(|s| format!("ptr @__dyn_{}_{concrete}_{s}", trait_name))
+                    .collect();
+                writeln!(
+                    out,
+                    "@__dyn_{}_{concrete} = private constant [{} x ptr] [{}]",
+                    trait_name,
+                    slots.len(),
+                    slot_ptrs.join(", ")
+                )
+                .ok();
+                writeln!(out).ok();
+            }
+        }
+    }
+
+    /// 2026-10-08 (T1): one thunk fn — `define {ret} @__dyn_<Trait>_<Concrete>_<slot>(ptr %self, {params...})`.
+    /// The body is the impl `defn`'s body, inlined against a fresh scope with
+    /// the Self receiver bound to the concrete heap image (`inttoptr` of the
+    /// first param). Reuses the statement emitter (the way emit_task_segment_fn
+    /// does), so no separate body emitter is needed.
+    fn emit_dyn_thunk_fn(&mut self, out: &mut String, trait_name: &str, concrete: &str, slot: &str) {
+        // Find the impl `defn` body: an ImplDef for `concrete` whose fn is `slot`.
+        let impl_body = self.find_impl_body(concrete, slot);
+        let impl_def = match impl_body {
+            Some(d) => d,
+            None => {
+                // The typechecker's coherence pass (check_trait_assertion) proves
+                // every asserted trait fn is provided, so this is unreachable for
+                // a well-typed program. A clear diagnostic beats a silent miscompile.
+                self.warnings.push(format!(
+                    "dyn thunk: no impl body for {}.{} — the typechecker should have rejected this",
+                    concrete, slot
+                ));
+                return;
+            }
+        };
+        // Self-first: the impl defn's first param is the Self receiver (the
+        // interpreter threads it by arity shape; the typechecker's static
+        // resolution confirms it via the `Self` type on the first param).
+        let self_is_first = impl_def
+            .parameters
+            .first()
+            .map(|(_, t)| matches!(t, Type::Custom(n) if n == "Self" || n == concrete))
+            .unwrap_or(false);
+        let ret_ty = impl_def
+            .output_type
+            .as_ref()
+            .and_then(|ot| match ot {
+                crate::ast::OutputType::Single(t) => Some(self.llvm_ret_abi_type(t)),
+                _ => None,
+            })
+            .unwrap_or_else(|| "i64".to_string());
+        let has_ret = impl_def.output_type.is_some() || !impl_def.outputs.is_empty();
+        self.fun.fn_ret_ty = ret_ty.clone();
+        self.fun.returns_i64 = has_ret;
+        self.fun.terminated = false;
+        self.fun.pending_cleanup.clear();
+        self.fun.clear_locals();
+        self.fun.reassigned_lets.clear();
+        self.fun.expr_dedup_cache.clear();
+        self.fun.is_static_bound = false;
+        self.fun.ssa_old_int_regs.clear();
+        self.fun.ssa_old_float_regs.clear();
+
+        let thunk_name = format!("__dyn_{}_{concrete}_{slot}", trait_name);
+        writeln!(out, "define {} @{thunk_name}(", ret_ty).ok();
+        // %self: the concrete heap handle (the fat pointer's data half, i64).
+        // Remaining params are named %targ0..%targN in declaration order — the
+        // binding loop below binds the impl defn's non-Self params to these
+        // same names (arg_idx advances only in the non-Self branch).
+        write!(out, "i64 %self").ok();
+        let mut pi = 0usize;
+        for (i, (_, t)) in impl_def.parameters.iter().enumerate() {
+            if i == 0 && self_is_first {
+                continue; // the Self receiver is %self
+            }
+            write!(out, ", {} %targ{pi}", self.llvm_type(t)).ok();
+            pi += 1;
+        }
+        writeln!(out, ") {{").ok();
+        writeln!(out, "  entry:").ok();
+        // Bind the Self receiver to the concrete heap image so field access in
+        // the body (`me.base`) resolves through the pointer (inttoptr + GEP).
+        let self_reg = self.fun.gen_reg();
+        writeln!(out, "  {self_reg} = add i64 %self, 0").ok();
+        // Bind the impl defn's parameters (skipping the Self one) to the thunk
+        // params in order.
+        let mut arg_idx = 0usize;
+        for (i, (pname, pty)) in impl_def.parameters.iter().enumerate() {
+            if i == 0 && self_is_first {
+                self.fun.let_bindings.insert(pname.clone(), self_reg.clone());
+                self.fun.let_binding_types.insert(pname.clone(), pty.clone());
+                continue;
+            }
+            let raw = format!("%targ{}", arg_idx);
+            let reg = if self.llvm_type(pty) == "ptr" {
+                let conv = self.fun.gen_reg();
+                writeln!(out, "  {conv} = ptrtoint ptr {raw} to i64").ok();
+                conv
+            } else {
+                raw
+            };
+            self.fun.let_bindings.insert(pname.clone(), reg.clone());
+            self.fun.let_binding_types.insert(pname.clone(), pty.clone());
+            arg_idx += 1;
+        }
+        // Run the impl body against the fresh scope; capture the term value.
+        let mut last_val: Option<String> = None;
+        for s in &impl_def.body {
+            if self.fun.terminated {
+                break;
+            }
+            match s {
+                crate::ast::Statement::Term(Some(e)) => {
+                    let reg = self.emit_expr(out, e, "  ");
+                    last_val = Some(self.adapt_to_i64(out, "  ", &reg));
+                    self.fun.terminated = true;
+                    break;
+                }
+                crate::ast::Statement::Term(None) => {
+                    self.fun.terminated = true;
+                    break;
+                }
+                other => {
+                    let reg = crate::backend::llvm::emit_stmt::emit_statement(self, out, other, "  ");
+                    if self.llvm_type(&reg.ty) == "i64" {
+                        last_val = Some(reg.name.clone());
+                    } else {
+                        last_val = Some(self.adapt_to_i64(out, "  ", &reg));
+                    }
+                }
+            }
+        }
+        if has_ret {
+            let v = last_val.unwrap_or_else(|| {
+                let z = self.fun.gen_reg();
+                writeln!(out, "  {z} = add i64 0, 0").ok();
+                z
+            });
+            writeln!(out, "  ret {} {}", ret_ty, v).ok();
+        } else {
+            writeln!(out, "  ret void").ok();
+        }
+        writeln!(out, "}}").ok();
+    }
+
+    /// 2026-10-08 (T1): find the impl `defn` body for `concrete::slot` — the
+    /// `Definition` from the `impl <concrete> { defn <slot> ... }` block.
+    /// Cached in ctx by register_dyn_thunks (no repeated AST scan per thunk).
+    fn find_impl_body(&self, concrete: &str, slot: &str) -> Option<crate::ast::Definition> {
+        let key = format!("{}::{}", concrete, slot);
+        self.ctx.dyn_impl_bodies.get(&key).cloned()
     }
 
     // ── Field index ───────────────────────────────────────────

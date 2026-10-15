@@ -205,6 +205,26 @@ pub fn emit_intrinsic_call(
             writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, ptr, env).ok();
             return BTypedRegister { name: ptr.to_string(), ty: Type::int() };
         }
+        // 2026-10-12 (daily-driver quick wins): `Argc#()` / `Args#()` —
+        // load the captured argc/argv globals the backend-owned main
+        // stores (@__briev_argc / @__briev_argv, mod.rs globals block).
+        // Same global-load shape as Environ# above; cli.bv's pure-Briev
+        // walkers (cstr_len + byte compare over the C-string pointer
+        // array) compose them into arg_count/arg/has_flag/entry_cmd.
+        "Argc#" => {
+            let n = backend.fun.gen_reg();
+            writeln!(out, "{}{} = load i32, ptr @__briev_argc", indent, n).ok();
+            let z = backend.fun.gen_reg();
+            writeln!(out, "{}{} = zext i32 {} to i64", indent, z, n).ok();
+            return BTypedRegister { name: z.to_string(), ty: Type::int() };
+        }
+        "Args#" => {
+            let argv = backend.fun.gen_reg();
+            writeln!(out, "{}{} = load ptr, ptr @__briev_argv", indent, argv).ok();
+            let ptr = backend.fun.gen_reg();
+            writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, ptr, argv).ok();
+            return BTypedRegister { name: ptr.to_string(), ty: Type::int() };
+        }
         // 2026-10-05 (Phase 0.6, gate-membership<->arm rule): the GPU
         // launch-dimension builtins are DE-LISTED from this lane.
         // GetGlobalSize#/GetLocalId# had NO lowering (the removed arms fell
@@ -1658,13 +1678,18 @@ fn emit_syscall(
     let num_reg = match &args[0] {
         Expr::Decimal(n) => format!("{}", n),
         Expr::Identifier(op) => {
-            let n = resolve_syscall_number(op, &backend.ctx.target_triple)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| {
-                    eprintln!("SysCall#: unknown abstract op '{}', using 0", op);
-                    "0".to_string()
-                });
-            n
+            // 2026-10-12 (daily-driver quick wins, os/fs): an Identifier
+            // first arg is EITHER an abstract syscall op name (resolved
+            // through the target table) OR a plain runtime value — a
+            // wrapper parameter (`syscall3(n, a1, a2, a3)` threading its
+            // number through). The old fallback hardcoded 0 for unknown
+            // names, silently turning every wrapper whose parameter wasn't
+            // a recognized op into syscall 0 (read) — the fs_open -EBADF
+            // probe lesson. Fall through to the ordinary argument emit.
+            match resolve_syscall_number(op, &backend.ctx.target_triple) {
+                Some(n) => n.to_string(),
+                None => emit_arg(backend, out, &args[0], indent),
+            }
         }
         _ => {
             let reg = emit_arg(backend, out, &args[0], indent);

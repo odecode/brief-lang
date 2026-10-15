@@ -81,6 +81,20 @@ pub struct TypecheckContext<'a> {
     /// params (e.g. `["T"]` for `defn first<T>`), so call sites can infer and
     /// substitute concrete args. Populated alongside fn_return_types.
     fn_type_params: HashMap<String, Vec<String>>,
+    /// 2026-10-13 (static trait-constrained generics, SPEC §8.6): per-defn
+    /// type-param BOUNDS. defn name → list of (param name, Some(trait name) if
+    /// `<T: Counter>`, else None for an unbounded `<T>`). `fn_type_params`
+    /// records only the names; this records what each name REQUIRES, so that
+    /// inside the body a trait method called on a bound param (`bump(this,_)`
+    /// with `this: T`, `T: Counter`) resolves against the trait's declared
+    /// functions instead of falling through to the `Int` fallback.
+    fn_type_param_bounds: HashMap<String, Vec<(String, Option<String>)>>,
+    /// 2026-10-13: the ACTIVE type-param bounds while checking one defn body —
+    /// param name → bound trait name (only bounded params appear). Set when a
+    /// generic defn body check begins (from the defn's own `type_params`),
+    /// cleared after (transient, like `current_output_type`). The
+    /// trait-method resolution for a call on a bound param reads this.
+    active_type_param_bounds: HashMap<String, String>,
     /// 2026-08-14 (generic `defn f<T>` dispatch): the expected type of the
     /// enclosing `let` initializer, consulted when a nullary generic
     /// (`new_stack<T>()` with no type-constraining args) needs its param bound
@@ -194,6 +208,8 @@ impl<'a> TypecheckContext<'a> {
             type_parents: HashMap::new(),
             fn_return_types: HashMap::new(),
             fn_type_params: HashMap::new(),
+            fn_type_param_bounds: HashMap::new(),
+            active_type_param_bounds: HashMap::new(),
             expected_call_type: None,
             optional_frgns: std::collections::HashSet::new(),
             regular_ops: HashMap::new(),
@@ -1990,6 +2006,14 @@ fn infer_call(name: &str, args: &[Expr], ctx: &mut TypecheckContext) -> Result<T
     if let Some(params) = ctx.fn_type_params.get(name).cloned() {
         if !params.is_empty() {
             if let Some(args_conc) = infer_defn_type_args(name, &params, args, ctx)? {
+                // 2026-10-13 (static trait-constrained generics, SPEC §8.6, S4):
+                // a type param with a trait bound (`<T: Counter>`) binds here to
+                // a concrete type. Verify that type actually PROVIDES the trait's
+                // required operations — otherwise the generic would silently
+                // return a bogus type and the missing op would only surface at
+                // codegen (or never). The bound → concrete pairing is read from
+                // the per-defn bounds registry (S1).
+                check_type_param_bounds(name, &params, &args_conc, ctx)?;
                 for (i, arg) in args.iter().enumerate() {
                     let arg_ty = infer_type_only(arg, ctx)?;
                     if let Some(param_ty) = ctx.fn_param_types.get(name).and_then(|p| p.get(i)) {
@@ -2053,8 +2077,304 @@ fn infer_call(name: &str, args: &[Expr], ctx: &mut TypecheckContext) -> Result<T
     if let Some(ty) = ctx.fn_return_types.get(name) {
         return Ok(ty.clone());
     }
+    // 2026-10-13 (static trait-constrained generics, SPEC §8.6): the free-call
+    // form of a trait method inside a generic body — `bump(this, amount)` where
+    // `this: T` and `T: Counter`. `bump` is NOT a user defn (it is a trait
+    // requirement), so every lookup above missed and the call would fall to the
+    // `Int` fallback. If an argument's type is a bound type param whose trait
+    // declares `name`, resolve against the trait with `Self -> T`.
+    if let Some(resolved) = resolve_bound_param_call(name, args, ctx)? {
+        return Ok(resolved);
+    }
+    // 2026-10-13 (static trait-constrained generics, SPEC §8.6, S3): the
+    // free-call form of a trait method — including a trait DEFAULT — on a
+    // CONCRETE conforming value: `bump_twice(tally, 5)`. `Tally` provides
+    // `Counter`'s required `bump`, so it inherits the default `bump_twice`.
+    // The first argument is the `Self` receiver; the rest match the trait
+    // function's remaining parameters.
+    if let Some((receiver, rest)) = args.split_first() {
+        let receiver_ty = infer_type_only(receiver, ctx)?;
+        if let Some(resolved) = resolve_conforming_trait_call(name, &receiver_ty, rest, ctx)? {
+            return Ok(resolved);
+        }
+    }
     // 2026-07-25: Fallback — bind all destructured names to Int.
     Ok(Type::int())
+}
+
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6): resolve a call
+/// `name(args)` whose first bound-type-param argument supplies the trait. If an
+/// argument's type is a type param `T` that `active_type_param_bounds` binds to
+/// a trait declaring a function `name`, this validates the call against that
+/// requirement (with `Self` substituted by `T`) and returns its result type
+/// (`Self` → `T`). Returns `Ok(None)` when no argument is a bound param whose
+/// trait provides `name` — the caller then keeps its existing behavior.
+///
+/// Models the `Type::Dyn` branch of `resolve_method_call`: the trait's declared
+/// signature is the shape the call must satisfy. Here the receiver is a static
+/// type param rather than a `dyn` value, so monomorphization (the concrete `T`)
+/// happens at the call site that instantiates the generic — this is only the
+/// in-body static check that the trait provides the operation.
+fn resolve_bound_param_call(
+    name: &str,
+    args: &[Expr],
+    ctx: &mut TypecheckContext,
+) -> Result<Option<Type>, TypeError> {
+    if ctx.active_type_param_bounds.is_empty() {
+        return Ok(None);
+    }
+    // Infer the argument types once; find the first that is a bound type param.
+    let arg_tys: Vec<Type> = args
+        .iter()
+        .map(|arg| infer_type_only(arg, ctx))
+        .collect::<Result<_, _>>()?;
+    let Some((param_name, trait_name)) = arg_tys.iter().find_map(|ty| match ty {
+        Type::Custom(candidate) => ctx
+            .active_type_param_bounds
+            .get(candidate)
+            .map(|trait_name| (candidate.clone(), trait_name.clone())),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    // The bound trait must declare `name`; otherwise this is not a trait call
+    // (leave it to the caller's fallback — a genuinely unknown free call).
+    let Some(trait_def) = ctx.trait_defs.get(&trait_name).cloned() else {
+        return Ok(None);
+    };
+    let Some(requirement) = trait_def.functions.iter().find(|fn_def| fn_def.name == name) else {
+        return Ok(None);
+    };
+    // `Self` in the requirement signature is this concrete type param.
+    let self_subst = [Type::Custom(param_name.clone())];
+    let self_key = ["Self".to_string()];
+    let expected_tys: Vec<Type> = requirement
+        .parameters
+        .iter()
+        .map(|(_, ty)| substitute_type_params(ty, &self_key, &self_subst))
+        .collect();
+    if expected_tys.len() != arg_tys.len() {
+        return Err(TypeError::TypeMismatch {
+            expected: format!("{} argument(s)", expected_tys.len()),
+            found: format!("{} argument(s)", arg_tys.len()),
+            context: format!(
+                "call to trait '{}' method '{}' on bound type param '{}'",
+                trait_name, name, param_name
+            ),
+        });
+    }
+    for (index, (expected, actual)) in expected_tys.iter().zip(arg_tys.iter()).enumerate() {
+        if expected == actual {
+            continue;
+        }
+        if types_compatible(expected, actual, ctx) {
+            continue;
+        }
+        return Err(TypeError::TypeMismatch {
+            expected: format!("{}", expected),
+            found: format!("{}", actual),
+            context: format!(
+                "argument {} of trait '{}' method '{}' on bound type param '{}'",
+                index, trait_name, name, param_name
+            ),
+        });
+    }
+    let result = requirement
+        .output_type
+        .as_ref()
+        .and_then(|ot| ot.all_types().into_iter().next())
+        .map(|ret| substitute_type_params(&ret, &self_key, &self_subst))
+        .unwrap_or_else(Type::void);
+    Ok(Some(result))
+}
+
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6): does the concrete
+/// type `type_name` STRUCTURALLY conform to `trait_name`? Conformance here means
+/// the type provides a member for every REQUIRED (empty-body) function of the
+/// trait — defaults are supplied by the trait itself, so they are not required
+/// of the type. This is the structural reading of SPEC §8.6: a type conforms by
+/// providing the operations, with no explicit `: Trait` assertion needed.
+/// Member provision is read from `ctx.type_members` (an obj/struct's own defn
+/// members), the same source method resolution uses.
+/// 2026-10-14 (tier2 phase 1, coll-element-size ADDENDUM 3 hole 1): pushing
+/// a CONCRETE into a `List<dyn Trait>` — the dyn coercion at the push
+/// boundary. The concrete must structurally PROVIDE the trait (the same
+/// conformance rule as a bounded generic call site); the backend boxes it
+/// (tag + fat pointer) at the store. Extracted as a helper — the arrow
+/// check sits deep in `check_program_with_target` (nesting gate).
+fn dyn_push_admitted(ctx: &TypecheckContext, elem_ty: &Type, value_ty: &Type) -> bool {
+    let Type::Dyn(trait_ty) = elem_ty else {
+        return false;
+    };
+    let Type::Custom(trait_name) = trait_ty.as_ref() else {
+        return false;
+    };
+    type_conforms_to_trait(ctx, &value_ty.to_string(), trait_name)
+}
+
+fn type_conforms_to_trait(ctx: &TypecheckContext, type_name: &str, trait_name: &str) -> bool {
+    let Some(trait_def) = ctx.trait_defs.get(trait_name) else {
+        return false;
+    };
+    let members = ctx.type_members.get(type_name).cloned().unwrap_or_default();
+    trait_def.functions.iter().all(|requirement| {
+        if !requirement.body.is_empty() {
+            return true; // a default is provided by the trait, not required
+        }
+        members.iter().any(|member| member_name(member) == requirement.name)
+    })
+}
+
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6, S4): the trait
+/// requirements a concrete type is MISSING — the required (empty-body) trait
+/// functions whose names the type does not provide. Empty ⇒ it conforms.
+fn missing_trait_requirements(ctx: &TypecheckContext, type_name: &str, trait_name: &str) -> Vec<String> {
+    let Some(trait_def) = ctx.trait_defs.get(trait_name) else {
+        return Vec::new();
+    };
+    let members = ctx.type_members.get(type_name).cloned().unwrap_or_default();
+    trait_def
+        .functions
+        .iter()
+        .filter(|requirement| requirement.body.is_empty())
+        .filter(|requirement| !members.iter().any(|member| member_name(member) == requirement.name))
+        .map(|requirement| requirement.name.clone())
+        .collect()
+}
+
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6, S4): at a call to a
+/// trait-bounded generic (`bump_twice<T: Counter>(…)`), verify every bounded
+/// type param's inferred concrete type conforms to its bound. `params` and
+/// `concrete` are aligned by declared order; each param's bound is read from the
+/// per-defn registry. A non-conforming binding is a hard error naming the type,
+/// the trait, the missing operation(s), and the fix — not a silent fallthrough.
+fn check_type_param_bounds(
+    name: &str,
+    params: &[String],
+    concrete: &[Type],
+    ctx: &mut TypecheckContext,
+) -> Result<(), TypeError> {
+    let Some(bounds) = ctx.fn_type_param_bounds.get(name).cloned() else {
+        return Ok(());
+    };
+    for (param, concrete_ty) in params.iter().zip(concrete.iter()) {
+        let Some(trait_name) = bounds
+            .iter()
+            .find(|(bound_param, _)| bound_param == param)
+            .and_then(|(_, bound)| bound.clone())
+        else {
+            continue; // unbounded param — nothing to require
+        };
+        // Only a nominal concrete type can structurally conform. A non-nominal
+        // binding (e.g. a tuple) cannot satisfy a trait of named methods.
+        let Type::Custom(type_name) = concrete_ty else {
+            return Err(TypeError::InvalidOperation {
+                operation: format!(
+                    "'{}' requires {}: {}, but {} is not a type that can provide trait methods",
+                    name, param, trait_name, concrete_ty
+                ),
+                type_name: format!("{}", concrete_ty),
+            });
+        };
+        let missing = missing_trait_requirements(ctx, type_name, &trait_name);
+        if missing.is_empty() {
+            continue;
+        }
+        return Err(TypeError::InvalidOperation {
+            operation: format!(
+                "'{}' requires {}: {}, but '{}' does not provide {}. \
+                 Add {} to '{}', or pass a type that conforms to {}",
+                name,
+                param,
+                trait_name,
+                type_name,
+                missing.join(", "),
+                missing.join(", "),
+                type_name,
+                trait_name
+            ),
+            type_name: type_name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6): resolve a call
+/// `name(args)` where the receiver is a CONCRETE type that conforms to a trait
+/// declaring `name` — e.g. `bump_twice(tally, 5)` / `tally.bump_twice(5)` where
+/// `Tally` provides `Counter`'s `bump`, so it inherits the default `bump_twice`.
+/// `receiver_ty` is the already-inferred type of the receiver argument; `args`
+/// are the remaining (non-receiver) argument expressions, matched against the
+/// trait function's parameters AFTER the leading `Self`. Returns `Ok(None)` when
+/// the receiver is not a concrete conforming type whose trait declares `name`.
+///
+/// Mirrors `resolve_bound_param_call`, but the receiver is a concrete type (so
+/// `Self -> Tally`) found via structural conformance rather than a type-param
+/// bound. Covers both the free-call and method-call surfaces through one path.
+fn resolve_conforming_trait_call(
+    name: &str,
+    receiver_ty: &Type,
+    args: &[Expr],
+    ctx: &mut TypecheckContext,
+) -> Result<Option<Type>, TypeError> {
+    let Type::Custom(type_name) = receiver_ty else {
+        return Ok(None);
+    };
+    // Find a trait this concrete type conforms to that declares `name`. The
+    // trait set is small; a deterministic scan over the sorted names keeps the
+    // choice stable (HashMap iteration order is seed-randomized).
+    let mut trait_names: Vec<String> = ctx.trait_defs.keys().cloned().collect();
+    trait_names.sort();
+    let resolved = trait_names.iter().find_map(|trait_name| {
+        let trait_def = ctx.trait_defs.get(trait_name)?;
+        let requirement = trait_def.functions.iter().find(|fn_def| fn_def.name == name)?;
+        if !type_conforms_to_trait(ctx, type_name, trait_name) {
+            return None;
+        }
+        Some(requirement.clone())
+    });
+    let Some(requirement) = resolved else {
+        return Ok(None);
+    };
+    // `Self` in the requirement is this concrete type. The first parameter is
+    // the `Self` receiver (supplied by `receiver_ty`); the written `args` match
+    // the parameters after it.
+    let self_subst = [receiver_ty.clone()];
+    let self_key = ["Self".to_string()];
+    let value_params: Vec<Type> = requirement
+        .parameters
+        .iter()
+        .skip(1)
+        .map(|(_, ty)| substitute_type_params(ty, &self_key, &self_subst))
+        .collect();
+    if value_params.len() != args.len() {
+        return Err(TypeError::TypeMismatch {
+            expected: format!("{} argument(s) after the receiver", value_params.len()),
+            found: format!("{} argument(s)", args.len()),
+            context: format!("call to trait method '{}' on '{}'", name, type_name),
+        });
+    }
+    for (index, (expected, arg)) in value_params.iter().zip(args.iter()).enumerate() {
+        let actual = infer_type_only(arg, ctx)?;
+        if &actual == expected || types_compatible(expected, &actual, ctx) {
+            continue;
+        }
+        return Err(TypeError::TypeMismatch {
+            expected: format!("{}", expected),
+            found: format!("{}", actual),
+            context: format!(
+                "argument {} of trait method '{}' on '{}'",
+                index, name, type_name
+            ),
+        });
+    }
+    let result = requirement
+        .output_type
+        .as_ref()
+        .and_then(|ot| ot.all_types().into_iter().next())
+        .map(|ret| substitute_type_params(&ret, &self_key, &self_subst))
+        .unwrap_or_else(Type::void);
+    Ok(Some(result))
 }
 
 /// Type-check an intrinsic call against its signature.
@@ -3522,6 +3842,8 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
                 if let Some(elem_ty) = ctx.push_element_type(t) {
                     if value_ty == elem_ty || try_coerce_via_parse(value, &value_ty, &elem_ty, ctx) {
                         arrow_ok = true;
+                    } else if dyn_push_admitted(ctx, &elem_ty, &value_ty) {
+                        arrow_ok = true;
                     }
                 }
                 if !arrow_ok {
@@ -4472,6 +4794,31 @@ pub fn check_program_with_target(
         })
         .collect();
 
+    // 2026-10-13 (static trait-constrained generics, SPEC §8.6): the BOUND of
+    // each type param, parallel to `fn_type_params`. `<T: Counter>` records
+    // `("T", Some("Counter"))`; a plain `<T>` records `("T", None)`. The trait
+    // name is read from a `Type::Custom` bound (the only bound form a single
+    // trait constraint takes). Built for every defn WITH type params, so the
+    // body check can learn what each param requires.
+    let fn_type_param_bounds: HashMap<String, Vec<(String, Option<String>)>> = items
+        .iter()
+        .filter_map(|item| {
+            let (name, type_params) = match item {
+                TopLevel::Definition(d) => (&d.name, &d.type_params),
+                TopLevel::Transaction(t) => (&t.name, &t.type_params),
+                TopLevel::Export(e) => match &*e.inner {
+                    TopLevel::Definition(d) => (&d.name, &d.type_params),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if type_params.is_empty() {
+                return None;
+            }
+            Some((name.clone(), type_param_bounds(type_params)))
+        })
+        .collect();
+
     // 2026-08-09 (Phase 12, SPEC §18.2): the meld declaration collection is
     // removed — foreign shapes adapt through EXPLICIT protocol cast edges,
     // not an implicit meld admission; `meld_coercible` was removed.
@@ -4563,6 +4910,22 @@ pub fn check_program_with_target(
         }
     }
     let mut all_type_members: HashMap<String, Vec<TopLevel>> = HashMap::new();
+    // 2026-10-14 (tier2 phase 1; closes the PR-15 known limitation):
+    // impl-block members participate in STRUCTURAL CONFORMANCE —
+    // `impl Dog { defn greet(...) }` is how a type-decl proves its trait,
+    // and `type_conforms_to_trait` (bounded generics, dyn push) reads
+    // type_members only. Collect the impl functions per target here and
+    // merge them into the type's members below. To undo: delete this map +
+    // the merge at the TypeDef insertion.
+    let mut impl_fn_members: HashMap<String, Vec<TopLevel>> = HashMap::new();
+    for item in items.iter() {
+        if let TopLevel::Impl(i) = item {
+            let entry = impl_fn_members.entry(i.target.clone()).or_default();
+            for f in &i.functions {
+                entry.push(TopLevel::Definition(f.clone()));
+            }
+        }
+    }
     let mut all_type_params: HashMap<String, Vec<String>> = HashMap::new();
     // 2026-08-15 (coll plan): `coll obj`/`coll struct` type names — they
     // accept empty list literals and have a compiler-scaffolded op surface.
@@ -4673,8 +5036,26 @@ pub fn check_program_with_target(
                     }
                 }
                 all_type_members.insert(td.name.clone(), merged);
-            } else if !td.body.members.is_empty() {
-                all_type_members.insert(td.name.clone(), td.body.members.clone());
+            } else {
+                let mut merged = td.body.members.clone();
+                if let Some(imembers) = impl_fn_members.get(&td.name) {
+                    for m in imembers {
+                        let m_name =
+                            crate::backend::llvm::emit_expr::member_briev_name(m);
+                        let dup = merged.iter().any(|ex| {
+                            crate::backend::llvm::emit_expr::member_briev_name(ex) == m_name
+                        });
+                        if !dup {
+                            merged.push(m.clone());
+                        }
+                    }
+                }
+                // A fields-only type-decl (`type Dog: Greeter { base: Int; }`)
+                // has NO body members — its trait proof lives entirely in the
+                // impl block. Insert whenever ANYTHING merged.
+                if !merged.is_empty() {
+                    all_type_members.insert(td.name.clone(), merged);
+                }
             }
             if !td.type_params.is_empty() {
                 all_type_params.insert(
@@ -4797,6 +5178,7 @@ pub fn check_program_with_target(
         optional_frgns: &optional_frgns,
         fn_param_types: &fn_param_types,
         fn_type_params: &fn_type_params,
+        fn_type_param_bounds: &fn_type_param_bounds,
         all_parse_bindings: &all_parse_bindings,
         all_type_parents: &all_type_parents,
         all_regular_ops: &all_regular_ops,
@@ -5029,6 +5411,50 @@ pub fn check_program_with_target(
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+
+    // 2026-10-13 (static trait-constrained generics, SPEC §8.6): type-check
+    // trait DEFAULT bodies. A default (`defn bump_twice(this: Self, …) { … }`
+    // with a body) must itself type-check once, generically over `Self`. Before
+    // this, trait function bodies were never visited at all — a default calling
+    // a required method would never be checked. We check it with `self`/`Self`
+    // in scope and `active_type_param_bounds = {"Self": trait}`, so a call to a
+    // sibling requirement inside the body (`bump(this, amount)`, `this: Self`)
+    // resolves through the SAME bound-param path S2 built — `Self` is just the
+    // bound param here, bound to its own trait. Required functions (empty body)
+    // have nothing to check and are skipped.
+    for item in items.iter() {
+        let TopLevel::Trait(trait_def) = item else {
+            continue;
+        };
+        let self_ty = Type::Custom("Self".to_string());
+        for requirement in &trait_def.functions {
+            if requirement.body.is_empty() {
+                continue;
+            }
+            let member = TopLevel::Definition(requirement.clone());
+            let mut mctx = build_member_ctx(
+                &trait_def.name, &self_ty, &[], &[], &[], &member, &mut errors,
+            );
+            // `Self` is a bound type param of this trait while the default is
+            // checked — this is what lets `bump(this, amount)` resolve. The
+            // trait registry must be present too: `build_member_ctx` builds a
+            // bare context without it, so a trait-method call in the body would
+            // otherwise find no trait and fall through to the Int fallback.
+            mctx.trait_defs = all_trait_defs.clone();
+            mctx.active_type_param_bounds =
+                std::collections::HashMap::from([("Self".to_string(), trait_def.name.clone())]);
+            for (param_name, param_ty) in &requirement.parameters {
+                mctx.bindings.insert(param_name.clone(), param_ty.clone());
+            }
+            mctx.current_output_type =
+                requirement.output_type.as_ref().map(output_type_to_type);
+            for stmt in &requirement.body {
+                if let Err(e) = infer_statement(stmt, &mut mctx) {
+                    errors.push(e);
                 }
             }
         }
@@ -5476,6 +5902,9 @@ struct CheckEnv<'a> {
     fn_param_types: &'a HashMap<String, Vec<Type>>,
     /// 2026-08-14 (generic `defn f<T>`): declared type params per defn.
     fn_type_params: &'a HashMap<String, Vec<String>>,
+    /// 2026-10-13 (static trait-constrained generics): per-defn type-param
+    /// bounds (param → optional trait name). See the context field.
+    fn_type_param_bounds: &'a HashMap<String, Vec<(String, Option<String>)>>,
     all_parse_bindings: &'a HashMap<String, Vec<OperatorBinding>>,
     all_type_parents: &'a HashMap<String, String>,
     all_regular_ops: &'a HashMap<String, Vec<crate::ast::top::OperatorDef>>,
@@ -5537,6 +5966,7 @@ fn make_typecheck_context<'a>(env: &CheckEnv<'a>, universe: &'a TypeUniverse) ->
     ctx.type_params = env.all_type_params.clone();
     ctx.fn_param_types = env.fn_param_types.clone();
     ctx.fn_type_params = env.fn_type_params.clone();
+    ctx.fn_type_param_bounds = env.fn_type_param_bounds.clone();
     ctx.type_protocols = env.all_type_protocols.clone();
     // 2026-09-02: width metadata for the float-literal admission gate.
     ctx.type_max_bits = env.all_type_max_bits.clone();
@@ -5622,9 +6052,20 @@ fn check_top_level<'a>(
                 ctx.bindings.insert(name.clone(), ty.clone());
             }
             ctx.current_output_type = defn.output_type.as_ref().map(output_type_to_type);
+            // 2026-10-13 (static trait-constrained generics, SPEC §8.6): make
+            // this defn's type-param bounds (`<T: Counter>`) visible while the
+            // body is checked, so a trait method called on a bound param
+            // resolves against the trait. Derived directly from the defn's own
+            // type_params (not the pre-collected map) — this is the one site
+            // that knows WHICH defn is being checked.
+            ctx.active_type_param_bounds = type_param_bounds(&defn.type_params)
+                .into_iter()
+                .filter_map(|(param, bound)| bound.map(|trait_name| (param, trait_name)))
+                .collect();
             for stmt in &defn.body {
                 infer_statement(stmt, &mut ctx)?;
             }
+            ctx.active_type_param_bounds.clear();
             Ok(())
         }
         // 2026-07-25: Unwrap exports so exported defns are type-checked.
@@ -6506,6 +6947,18 @@ fn resolve_method_call(
             if ctx.fn_return_types.contains_key(name) {
                 return infer_call(name, &all, ctx);
             }
+            // 2026-10-13 (static trait-constrained generics, SPEC §8.6, S3):
+            // the method-call form of a trait method — including a trait
+            // DEFAULT — on a concrete conforming receiver: `tally.bump_twice(5)`.
+            // The receiver IS the `Self` argument; the chain back-refs and
+            // written args are the value parameters after it.
+            let mut rest = leading.exprs.clone();
+            rest.extend(args.iter().cloned());
+            if let Some(resolved) =
+                resolve_conforming_trait_call(name, receiver, &rest, ctx)?
+            {
+                return Ok(resolved);
+            }
             return Err(TypeError::InvalidOperation {
                 operation: format!("method call '.{}()'", name),
                 type_name: format!("type '{}' has no member '{}'", type_name, name),
@@ -6944,6 +7397,24 @@ fn substitute_type_params(ty: &Type, params: &[String], args: &[Type]) -> Type {
     }
 }
 
+/// 2026-10-13 (static trait-constrained generics, SPEC §8.6): extract each
+/// type param's bound trait name. `<T: Counter, U>` → `[("T", Some("Counter")),
+/// ("U", None)]`. A bound is a single trait reference, carried as a
+/// `Type::Custom(trait_name)` on the `TypeParam`; any other bound shape (none,
+/// or a non-nominal type) records `None` (unbounded for resolution purposes).
+fn type_param_bounds(type_params: &[crate::ast::top::TypeParam]) -> Vec<(String, Option<String>)> {
+    type_params
+        .iter()
+        .map(|tp| {
+            let bound = match &tp.bound {
+                Some(Type::Custom(trait_name)) => Some(trait_name.clone()),
+                _ => None,
+            };
+            (tp.name.clone(), bound)
+        })
+        .collect()
+}
+
 fn obj_type_params(ctx: &TypecheckContext, type_name: &str) -> Vec<String> {
     ctx.type_params
         .get(type_name)
@@ -6953,6 +7424,184 @@ fn obj_type_params(ctx: &TypecheckContext, type_name: &str) -> Vec<String> {
 
 /// 2026-07-31: Substitute a type's generic parameters. `Type::Custom("T")`
 /// names matching a substitution key become the mapped concrete type.
+/// 2026-10-14 (PR-15 follow-up fix): substitute type-param bindings into the
+/// INLINE type annotations of a generic defn body — `let` annotations, `as T`
+/// casts, `is T` tests, and typed match bindings. The S6 specialization
+/// (emit_specialized_definition) substituted the params and return type but
+/// not the body, so `0 as T` kept the generic cast target: the match arms
+/// were judged heterogeneous, every arm value was union-boxed, and
+/// `unwrap: Result<Int, Int> -> Int` returned a box handle (fs_smoke
+/// trunc printed a heap pointer). To undo: revert this fn + the call in
+/// emit_specialized_definition.
+pub(crate) fn substitute_stmt_types(stmt: &mut Statement, subst: &HashMap<String, Type>) {
+    match stmt {
+        Statement::Let { ty, expr, .. } => {
+            if let Some(t) = ty {
+                *t = substitute_type(t, subst);
+            }
+            if let Some(e) = expr {
+                substitute_expr_types(e, subst);
+            }
+        }
+        Statement::Assign(l, r) => {
+            substitute_expr_types(l, subst);
+            substitute_expr_types(r, subst);
+        }
+        Statement::ArrowAssign { target, value, .. } => {
+            if let Some(t) = target {
+                substitute_expr_types(t, subst);
+            }
+            substitute_expr_types(value, subst);
+        }
+        Statement::Term(e) | Statement::EndProgram(e) | Statement::Rollback(e) => {
+            if let Some(e) = e {
+                substitute_expr_types(e, subst);
+            }
+        }
+        Statement::Check(e) | Statement::Gate(e) | Statement::Expression(e) => {
+            substitute_expr_types(e, subst);
+        }
+        Statement::Guarded(c, body) => {
+            substitute_expr_types(c, subst);
+            for s in body.iter_mut() {
+                substitute_stmt_types(s, subst);
+            }
+        }
+        Statement::Block(body)
+        | Statement::SyncBlock(body)
+        | Statement::Defer(body)
+        | Statement::Mutex(body) => {
+            for s in body.iter_mut() {
+                substitute_stmt_types(s, subst);
+            }
+        }
+        Statement::Foreach { list, body, .. } => {
+            substitute_expr_types(list, subst);
+            for s in body.iter_mut() {
+                substitute_stmt_types(s, subst);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn substitute_expr_types(expr: &mut Expr, subst: &HashMap<String, Type>) {
+    // The special forms — the only nodes carrying INLINE types. Everything
+    // else is child recursion (split keeps both fns under the complexity
+    // gate; same shape as the variadic walkers' form/children split).
+    match expr {
+        Expr::Cast(e, ty) | Expr::IsType(e, ty) => {
+            substitute_expr_types(e, subst);
+            *ty = substitute_type(ty, subst);
+            return;
+        }
+        _ => {}
+    }
+    substitute_expr_types_children(expr, subst)
+}
+
+fn substitute_match_arm(arm: &mut crate::ast::MatchArm, subst: &HashMap<String, Type>) {
+    if let crate::ast::Pattern::TypedBinding(_, ty) = &mut arm.pattern {
+        *ty = Box::new(substitute_type(ty, subst));
+    }
+    if let Some(g) = &mut arm.guard {
+        substitute_expr_types(g, subst);
+    }
+    substitute_expr_types(&mut arm.body, subst);
+}
+
+fn substitute_expr_types_children(expr: &mut Expr, subst: &HashMap<String, Type>) {
+    match expr {
+        Expr::Call(_, args, _) => {
+            for a in args.iter_mut() {
+                substitute_expr_types(a, subst);
+            }
+        }
+        Expr::BinaryOp(_, l, r) => {
+            substitute_expr_types(l, subst);
+            substitute_expr_types(r, subst);
+        }
+        Expr::UnaryOp(_, e) => substitute_expr_types(e, subst),
+        Expr::Field(e, _) => substitute_expr_types(e, subst),
+        Expr::MethodCall(recv, _, args, _, _) => {
+            substitute_expr_types(recv, subst);
+            for a in args.iter_mut() {
+                substitute_expr_types(a, subst);
+            }
+        }
+        Expr::Reflect(e, _, _) => substitute_expr_types(e, subst),
+        Expr::Index(l, r) => {
+            substitute_expr_types(l, subst);
+            substitute_expr_types(r, subst);
+        }
+        Expr::Slice { array, start, end, stride } => {
+            substitute_expr_types(array, subst);
+            for part in [start, end, stride].into_iter().flatten() {
+                substitute_expr_types(part, subst);
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            substitute_expr_types(start, subst);
+            substitute_expr_types(end, subst);
+        }
+        Expr::Block(body) => {
+            for s in body.iter_mut() {
+                substitute_stmt_types(s, subst);
+            }
+        }
+        Expr::If(c, t, e) => {
+            substitute_expr_types(c, subst);
+            substitute_expr_types(t, subst);
+            if let Some(e) = e {
+                substitute_expr_types(e, subst);
+            }
+        }
+        Expr::Match(scrut, arms) => {
+            substitute_expr_types(scrut, subst);
+            for arm in arms.iter_mut() {
+                substitute_match_arm(arm, subst);
+            }
+        }
+        Expr::Tuple(items) | Expr::List(items) => {
+            for e in items.iter_mut() {
+                substitute_expr_types(e, subst);
+            }
+        }
+        Expr::StructLiteral { fields, specs, .. } => {
+            for (_, v) in fields.iter_mut() {
+                substitute_expr_types(v, subst);
+            }
+            for (_, v) in specs.iter_mut() {
+                substitute_expr_types(v, subst);
+            }
+        }
+        Expr::Lambda(_, body) => substitute_expr_types(body, subst),
+        Expr::Spawn { args, .. } => {
+            for a in args.iter_mut() {
+                substitute_expr_types(a, subst);
+            }
+        }
+        Expr::Within(l, r) => {
+            substitute_expr_types(l, subst);
+            substitute_expr_types(r, subst);
+        }
+        Expr::DerivationBlock(_) => {}
+        Expr::Deref(e) | Expr::AddrOf(e) | Expr::Consume(e) | Expr::Await(e) => {
+            substitute_expr_types(e, subst)
+        }
+        Expr::PluginIntercept { args, receiver, .. } => {
+            if let Some(r) = receiver {
+                substitute_expr_types(r, subst);
+            }
+            for a in args.iter_mut() {
+                substitute_expr_types(a, subst);
+            }
+        }
+        Expr::Capture { expr, .. } => substitute_expr_types(expr, subst),
+        _ => {}
+    }
+}
+
 pub(crate) fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Custom(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
@@ -10291,3 +10940,111 @@ txn go [base == 0][base == 0] {
 "#;
         check(src).expect("a valid chained plugin receiver must typecheck");
     }
+
+    #[cfg(test)]
+    mod trait_generics_tests {
+        use super::*;
+
+        fn check(src: &str) -> Result<(), Vec<TypeError>> {
+            let tokens = crate::lexer::tokenize(src).unwrap();
+            let mut parser = crate::parser::Parser::new(tokens, src);
+            let mut items = parser.parse_program().unwrap();
+            let universe = crate::type_universe::TypeUniverse::new();
+            check_program(&mut items, &universe)
+        }
+
+        // ── Static trait-constrained generics (SPEC §8.6) ───────────────────
+    // 2026-10-13: the behavioral gates for the trait-generics feature. These
+    // test the CONTRACT (a trait method on a bound/conforming type resolves to
+    // the member's result type, not the Int fallback; a non-conformer is
+    // rejected), not the implementation — they must survive refactoring.
+
+    /// A trait-constrained generic resolves the trait method on its bound type
+    /// param: `bump_twice<T: Counter>` returns `T`, so binding its result to a
+    /// `Tally` typechecks (pre-fix it fell to Int and the `let` was rejected).
+    #[test]
+    fn trait_bounded_generic_resolves_trait_method() {
+        let src = r#"
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+};
+obj Tally {
+    total: Int;
+    defn bump(this: Tally, amount: Int) -> Tally {
+        term Tally { total: this.total + amount };
+    };
+};
+defn bump_twice<T: Counter>(this: T, amount: Int) -> T {
+    term bump(bump(this, amount), amount);
+};
+node entry [beginprogram][true] {
+    let t: Tally = Tally { total: 0 };
+    let t2: Tally = bump_twice(t, 5);
+    endprogram Print#(t2.total);
+};
+"#;
+        check(src).expect("a trait-bounded generic must resolve its trait method to T");
+    }
+
+    /// A trait DEFAULT (body-carrying trait function) resolves on a concrete
+    /// type that structurally conforms, in BOTH the method form (`t.m()`) and
+    /// the free form (`m(t)`). `Tally` provides `bump`, so it inherits the
+    /// default `bump_twice` without an explicit assertion.
+    #[test]
+    fn trait_default_resolves_on_conforming_type_both_forms() {
+        let method_form = r#"
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+    defn bump_twice(this: Self, amount: Int) -> Self {
+        term bump(bump(this, amount), amount);
+    };
+};
+obj Tally {
+    total: Int;
+    defn bump(this: Tally, amount: Int) -> Tally {
+        term Tally { total: this.total + amount };
+    };
+};
+node entry [beginprogram][true] {
+    let t: Tally = Tally { total: 0 };
+    let t2: Tally = t.bump_twice(5);
+    endprogram Print#(t2.total);
+};
+"#;
+        check(method_form).expect("a trait default must resolve on a conforming type (method form)");
+
+        let free_form = method_form.replace("t.bump_twice(5)", "bump_twice(t, 5)");
+        check(&free_form).expect("a trait default must resolve on a conforming type (free form)");
+    }
+
+    /// A non-conforming concrete type passed to a `<T: Counter>` generic is
+    /// REJECTED at the call site — not silently accepted and left to dangle at
+    /// codegen. The diagnostic names the generic, the bound, the type, the
+    /// missing operation, and the fix.
+    #[test]
+    fn non_conforming_type_at_bound_call_is_rejected() {
+        let src = r#"
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+};
+obj Widget {
+    size: Int;
+};
+defn bump_twice<T: Counter>(this: T, amount: Int) -> T {
+    term bump(bump(this, amount), amount);
+};
+node entry [beginprogram][true] {
+    let w: Widget = Widget { size: 0 };
+    let w2: Widget = bump_twice(w, 5);
+    endprogram Print#(w2.size);
+};
+"#;
+        let e = check(src);
+        assert!(e.is_err(), "a non-conforming type at a T: Counter call must be rejected, got: {:?}", e);
+        let msg = e.err().map(|errs| errs.iter().map(|e| format!("{e}")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+        assert!(
+            msg.contains("Counter") && msg.contains("Widget") && msg.contains("bump"),
+            "the diagnostic must name the trait, the type, and the missing op, got: {msg}"
+        );
+    }
+}

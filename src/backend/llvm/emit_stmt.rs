@@ -335,6 +335,29 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 }
                 _ => {}
             }
+            // 2026-10-14 (tier2 phase 2): a PRE-DECLARED bare let (the
+            // SSA main's reassigned-let entry allocas, BUGS.md 9303) binds
+            // the slot DIRECTLY — falling through created a SECOND alloca
+            // and the reassigned branch then stored the fresh alloca
+            // pointer into the slot (`type 'ptr' but expected 'i64'`).
+            // A CONSTRUCTABLE collection bare-let must NOT take this path —
+            // it needs the construction below (the pre-declared i64 slot is
+            // not a list). Only scalar bare-lets bind the slot directly.
+            let bare_coll = expr.is_none()
+                && ty.as_ref().map(|t| match t {
+                    crate::ast::Type::Applied(n, _) | crate::ast::Type::Custom(n) => {
+                        backend.is_coll_type(t) || backend.is_op_surface_coll(n)
+                    }
+                    _ => false,
+                }).unwrap_or(false);
+            if expr.is_none() && !bare_coll && backend.fun.reassigned_lets.contains_key(name) {
+                if let Some(slot) = backend.fun.let_bindings.get(name).cloned() {
+                    return TypedRegister {
+                        name: slot,
+                        ty: ty.clone().unwrap_or(Type::int()),
+                    };
+                }
+            }
             let mut via_scaffolded_construction = false;
             let mut val = match expr {
                 Some(crate::ast::Expr::Identifier(alias))
@@ -429,7 +452,21 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         }).unwrap_or(false);
                         if is_coll && matches!(e, crate::ast::Expr::List(_)) {
                             let briev = ty.clone().unwrap_or(crate::ast::Type::int());
-                            backend.construct_local_collection(out, indent, &briev, e)
+                            // 2026-10-12 (SPEC §8.6.1 Option B): a boxed dyn
+                            // literal records the binding in
+                            // `fun.dyn_boxed_bindings` — the element read path's
+                            // box check consults it (per-function, keyed by the
+                            // binding name the caller owns).
+                            match backend.construct_local_collection(out, indent, &briev, e) {
+                                Some((reg, Some(boxed))) => {
+                                    backend.fun.dyn_boxed_bindings.insert(
+                                        name.clone(),
+                                        boxed.info,
+                                    );
+                                    Some(reg)
+                                }
+                                other => other.map(|(reg, _)| reg),
+                            }
                         } else if is_coll {
                             // 2026-08-16 (hashmap redesign): a LOCAL collection
                             // with a SEED init (`let m: HashMap<K,V> = 0`)
@@ -479,22 +516,140 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         None => backend.emit_expr(out, e, indent),
                     };
                     backend.fun.volatile_read = false;
-                    // 2026-10-05 (BUGS.md int-literal-float-init): the
-                    // DECLARED type wins for the VALUE too, not just the
-                    // binding label (the A5 rule below retypes the binding).
-                    // An Int-literal init of a `Float` let bound the i64
-                    // register under a Float label; every later float-context
-                    // use (the demotion store, fadd) then emitted invalid IR.
+                    // 2026-10-08 (stabilise-for-use T1, Phase 5c): a `dyn <Trait>`
+                    // let coerces its concrete RHS into the FAT POINTER
+                    // `{ i64 data, i64 table }` — `data` is the concrete heap
+                    // handle, `table` is `@__dyn_<Trait>_<Concrete>`. The
+                    // binding is re-typed to `dyn <Trait>` (the A5 rule below
+                    // records the declared type as the binding type).
                     match ty {
-                        Some(declared) => backend.coerce_register_value(out, indent, &v, declared),
+                        Some(crate::ast::Type::Dyn(trait_ty)) => {
+                            // 2026-10-09 (dyn identity-in-value): if the RHS is
+                            // ALREADY a `dyn` of the same trait (a flowed value —
+                            // e.g. the return of `defn make(k) -> dyn Trait`),
+                            // pass it through unchanged. The tag (the concrete's
+                            // identity) is already in the value's tag slot, so
+                            // no re-coercion — re-wrapping would double-box the
+                            // fat pointer. The binding is re-typed to `dyn Trait`
+                            // by the A5 rule below (which runs after this match).
+                            let already_dyn = matches!(&v.ty, crate::ast::Type::Dyn(rhs)
+                                if matches!((trait_ty.as_ref(), rhs.as_ref()),
+                                    (crate::ast::Type::Custom(a), crate::ast::Type::Custom(b)) if a == b));
+                            if already_dyn {
+                                v
+                            } else {
+                                // The RHS must be a concrete value whose type is a
+                                // struct/obj (the struct literal's type). Recover the
+                                // concrete name from the emitted register's type.
+                                let concrete = match &v.ty {
+                                    crate::ast::Type::Custom(n) | crate::ast::Type::Applied(n, _) => n.clone(),
+                                    other => panic!(
+                                        "dyn coercion: RHS type {:?} is not a concrete struct/obj (expected a struct literal or an already-dyn value of the same trait)",
+                                        other
+                                    ),
+                                };
+                                let trait_name = match trait_ty.as_ref() {
+                                    crate::ast::Type::Custom(n) => n.clone(),
+                                    other => panic!(
+                                        "dyn <...>: inner trait type {:?} is not a named trait",
+                                        other
+                                    ),
+                                };
+                                // Record the concrete type of this binding so a later
+                                // `g.member()` member call can recover which thunk
+                                // table to load (the A5 rule below re-types the
+                                // binding to `dyn Trait`, erasing the concrete).
+                                backend.ctx.dyn_concrete_of.insert(name.clone(), concrete.clone());
+                                let tag = backend.ctx.dyn_concrete_tag_of
+                                    .get(&format!("{trait_name}::{concrete}"))
+                                    .copied()
+                                    .unwrap_or(0);
+                                backend.ctx.dyn_concrete_tag_of.insert(name.clone(), tag);
+                                backend.coerce_to_dyn(out, indent, &v.name, &trait_name, &concrete, tag, indent)
+                            }
+                        }
+                        Some(declared) => backend.coerce_register_value(out, indent, &v, &declared),
                         None => v,
                     }
                 }
                 None => {
-                    let v = backend.fun.gen_reg();
-                    let llvm_ty = ty.as_ref().map(|t| backend.llvm_type(t)).unwrap_or("i64".into());
-                    writeln!(out, "{}{} = alloca {}", indent, v, llvm_ty).ok();
-                    TypedRegister { name: v, ty: ty.clone().unwrap_or(Type::int()) }
+                    // 2026-10-14 (tier2 phase 1, docs/plans/
+                    // 2026-10-14-daily-driver-tier2.md): a BARE declaration of
+                    // a collection type (`let xs: List<Int>;`) must CONSTRUCT.
+                    // The naked alloca left the handle slot uninitialized and
+                    // the first `<-` insert dereferenced stack garbage
+                    // (segfault; the working `~<-`-extract idiom constructs
+                    // through its own path, masking this). Same construction
+                    // contract as the initializer paths above: a constructable
+                    // coll constructs via its empty literal (op InitEmpty) or,
+                    // when only the seeded Init exists (hand-written
+                    // HashMap), via op Init(0) — the `= 0` idiom. To undo:
+                    // restore the naked alloca; BUGS.md carries the entry.
+                    let is_coll = ty.as_ref().map(|t| match t {
+                        crate::ast::Type::Applied(n, _) | crate::ast::Type::Custom(n) => {
+                            backend.is_coll_type(t) || backend.is_op_surface_coll(n)
+                        }
+                        _ => false,
+                    }).unwrap_or(false);
+                    let made = if is_coll {
+                        let briev = ty.clone().unwrap_or(crate::ast::Type::int());
+                        let base = match &briev {
+                            crate::ast::Type::Custom(n) | crate::ast::Type::Applied(n, _) => n.clone(),
+                            _ => String::new(),
+                        };
+                        let has_init_empty = backend
+                            .ctx
+                            .operator_defs
+                            .get(&base)
+                            .map(|defs| defs.iter().any(|d| d.op == "InitEmpty"))
+                            .unwrap_or(false);
+                        if has_init_empty {
+                            let empty = crate::ast::Expr::List(vec![]);
+                            // Same result shape as the initializer path above:
+                            // a dyn-boxed literal records the binding; the
+                            // normal (reg, None) case binds the register
+                            // directly. (The first draft pattern-matched
+                            // Some((reg, Some(boxed))) and rejected the normal
+                            // case — the alloca fallback returned.)
+                            match backend.construct_local_collection(out, indent, &briev, &empty)
+                            {
+                                Some((reg, Some(boxed))) => {
+                                    backend
+                                        .fun
+                                        .dyn_boxed_bindings
+                                        .insert(name.clone(), boxed.info);
+                                    Some(reg)
+                                }
+                                other => other.map(|(reg, _)| reg),
+                            }
+                        } else {
+                            let zero = backend.fun.gen_reg();
+                            let hw = format!("i{}", backend.ctx.int_bits);
+                            writeln!(out, "{}{} = add {} 0, 0", indent, zero, hw).ok();
+                            backend.construct_local_collection_seed(
+                                out,
+                                indent,
+                                &briev,
+                                TypedRegister { name: zero, ty: crate::ast::Type::int() },
+                            )
+                        }
+                    } else {
+                        None
+                    };
+                    // The flag gates the alloca-binding marker below (the
+                    // constructed handle is a REGISTER, not a slot) and the
+                    // growable-read path — both must see a scaffolded
+                    // construction, exactly like the initializer arm sets it.
+                    via_scaffolded_construction = made.is_some();
+                    made
+                        .map(|reg| TypedRegister { name: reg.name, ty: reg.ty })
+                        .unwrap_or_else(|| {
+                        let v = backend.fun.gen_reg();
+                        let llvm_ty =
+                            ty.as_ref().map(|t| backend.llvm_type(t)).unwrap_or("i64".into());
+                        writeln!(out, "{}{} = alloca {}", indent, v, llvm_ty).ok();
+                        TypedRegister { name: v, ty: ty.clone().unwrap_or(Type::int()) }
+                    })
                 }
             };
             // 2026-08-17 (tuple correctness, plan
@@ -539,9 +694,18 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // never demoting at the assignment site (dominance violation).
             if backend.fun.reassigned_lets.contains_key(name) {
                 if let Some(slot) = backend.fun.let_bindings.get(name).cloned() {
-                    let store_ty = backend.llvm_type(&val.ty);
-                    let store_val = backend.ensure_typed_value(out, indent, &store_ty, &val.name, Some(val.ty.clone()), backend.ctx.type_universe.clone().as_ref());
-                    writeln!(out, "{}store {} {}, ptr {}", indent, store_ty, store_val, slot).ok();
+                    // 2026-10-14 (tier2 phase 2): a BARE let's `val` IS the
+                    // pre-declared slot itself (the naked alloca — no
+                    // initializer to store). Storing it into itself stored a
+                    // pointer as i64 (`%t defined with type 'ptr' but
+                    // expected 'i64'`). Skip the self-store; the slot is
+                    // already the binding.
+                    let is_self_slot = expr.is_none() && slot == val.name;
+                    if !is_self_slot {
+                        let store_ty = backend.llvm_type(&val.ty);
+                        let store_val = backend.ensure_typed_value(out, indent, &store_ty, &val.name, Some(val.ty.clone()), backend.ctx.type_universe.clone().as_ref());
+                        writeln!(out, "{}store {} {}, ptr {}", indent, store_ty, store_val, slot).ok();
+                    }
                     backend.fun.let_binding_allocas.insert(slot.clone());
                     // 2026-08-28 (String ABI fix): the pre-declaration
                     // (emit_definition) registered a PROVISIONAL Int type —
@@ -557,7 +721,11 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 }
             }
             // 2026-07-18: Track alloca bindings so identifier codegen loads values.
-            if expr.is_none() {
+            // 2026-10-14 (tier2 phase 1): ONLY the naked alloca is an alloca
+            // binding — a bare-let collection CONSTRUCTION binds a heap handle
+            // register; marking it an alloca made is_persistent_slot treat the
+            // handle as a memory slot and the first insert dereferenced it.
+            if expr.is_none() && !via_scaffolded_construction {
                 backend.fun.let_binding_allocas.insert(val.name.clone());
             }
             // 2026-09-07 (swan-song dominance fix): a let-local READ by the
@@ -569,7 +737,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // (async-ready-gate: `produced` from briev_await). Mirrors the
             // reassigned-lets entry-alloca path above.
             let is_struct_ty = match &val.ty {
-                Type::Custom(n) | Type::Applied(n, _) => backend.ctx.struct_types.contains_key(n),
+                Type::Custom(n) | Type::Applied(n, _) => backend.ctx.struct_types.contains_key(n.as_str()),
                 _ => false,
             };
             if backend.fun.swan_song_locals.contains(name)
@@ -1323,6 +1491,22 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         }
                         _ => val.ty.clone(),
                     };
+                    // 2026-10-14 (tier2 phase 1, ADDENDUM 3 hole 1): a
+                    // CONCRETE value into a dyn-element collection — the
+                    // typechecker admits it (structural conformance); the
+                    // push site boxes it below. Without this admission the
+                    // gate rejects, the push silently falls through, and the
+                    // list stays empty (the read is garbage).
+                    let dyn_push: Option<(String, String)> =
+                        elem_ty.as_ref().and_then(|et| match et {
+                            crate::ast::Type::Dyn(t) => match (t.as_ref(), &val_ty) {
+                                (crate::ast::Type::Custom(tr), crate::ast::Type::Custom(c)) if c != tr => {
+                                    Some((tr.clone(), c.clone()))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        });
                     let matches = elem_ty.as_ref().map_or(true, |et| {
                         // 2026-08-18 (Phase D): a BARE generic param (`K` in
                         // `PiggyBank<K>` — the backend instance type carries no
@@ -1355,11 +1539,47 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                             || tuple_arity_match
                             || (matches!(et, crate::ast::Type::Custom(n) if n == "Int")
                                 && matches!(&val_ty, crate::ast::Type::Custom(n) if n == "Int"))
+                            // 2026-10-14 (tier2 phase 1, ADDENDUM 3 hole 1):
+                            // a CONCRETE value into a dyn-element collection —
+                            // the typechecker admits it (structural
+                            // conformance); the push site boxes it below.
+                            || dyn_push.is_some()
                     });
+                    let matches = matches || dyn_push.is_some();
                     if matches {
                         out.push_str(&val_buf);
-                        if emit_strategy_member_call(backend, out, indent, t, &op_def, Some(&val.name)).is_none() {
-                            emit_strategy_fn_call(backend, out, indent, t, &op_def, Some(&val.name));
+                        // 2026-10-14 (tier2 phase 1, coll-element-size
+                        // ADDENDUM 3 hole 1): a CONCRETE value pushed into a
+                        // dyn-element collection is BOXED at the push site
+                        // (tag + fat pointer, the same box the let-coercion
+                        // emits) — the raw concrete handle stored into a dyn
+                        // list reads garbage at dispatch. To undo: delete
+                        // this coercion; the push stores raw again.
+                        // The concrete name comes from val_ty (the RESOLVED
+                        // value type — a struct literal's register carries no
+                        // type info); val.name is the data handle either way.
+                        let push_val = if let Some((trait_name, concrete)) = &dyn_push {
+                            let tag = backend
+                                .ctx
+                                .dyn_concrete_tag_of
+                                .get(&format!("{trait_name}::{concrete}"))
+                                .copied()
+                                .unwrap_or(0);
+                            Some(backend.coerce_to_dyn(
+                                out,
+                                &val.name,
+                                &val.name,
+                                trait_name,
+                                concrete,
+                                tag,
+                                indent,
+                            ))
+                        } else {
+                            None
+                        };
+                        let pushed = push_val.as_ref().unwrap_or(&val);
+                        if emit_strategy_member_call(backend, out, indent, t, &op_def, Some(&pushed.name)).is_none() {
+                            emit_strategy_fn_call(backend, out, indent, t, &op_def, Some(&pushed.name));
                         }
                         return TypedRegister { name: backend.fun.gen_reg(), ty: Type::void() };
                     }
