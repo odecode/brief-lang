@@ -45,21 +45,44 @@ L0  syscall   lib/std/syscall.bv     EXISTS (SysCall# wrappers)
 
 ### L1 - bytes (lib/std/net/bytes.bv) NEW
 
-A growable byte buffer backed by Alloc#/Load#/Store#. The wire protocols need
-precise byte-level framing that String concat cannot express. API:
+Raw byte buffers backed by Malloc#/Load#/Store#/Copy#. The wire protocols need
+precise byte-level framing that String concat cannot express.
 
-- obj ByteBuf { ptr: Int, len: Int, cap: Int }
-- buf_new(cap) -> ByteBuf ; buf_free(b)
-- put_u8(b, v) ; put_u16_be(b, v) ; put_u32_be(b, v) ; put_bytes(b, src_ptr, n)
-- put_cstr(b, s: String)  (writes bytes + NUL; Postgres strings are NUL-terminated)
-- get_u8(b, off) ; get_u16_be(b, off) ; get_u32_be(b, off)
-- as_ptr(b) -> Int ; length(b) -> Int
+CORRECTION (2026-10-12): Alloc# is NOT in the LLVM backend's supported-intrinsic
+set — bytes.bv uses Malloc#/Free# (Alloc# worked only on the GLUE host path).
 
-Contracts: offsets in [0,len); cap grows by doubling; big-endian is explicit
-(Postgres and HTTP chunk sizes are network byte order).
+DESIGN D (2026-10-15): the derived network-byte-order writers are shared across
+two buffer flavors via ONE trait (SPEC §8.6), not duplicated:
 
-Compiler surface exercised: Alloc#/Load#/Store# with computed offsets, Int<->byte
-masking (needs bits.bv shifts/and), obj with mutable Int fields, pointer-as-Int.
+- trait ByteSink
+  - REQUIRED (each buffer provides, with its own contract):
+    put_u8(sink, v) ; put_bytes(sink, src_addr, n)
+  - DEFAULT (written once in the trait, over the required primitives):
+    put_u16_be(sink, v) ; put_u32_be(sink, v) ; put_cstr(sink, s: String)
+- obj ByteBuf { ptr, len, cap } — FIXED: put_u8 keeps a `len < cap` room
+  precondition; ptr is stable (never moves). buf_new(cap) / buf_free(b).
+  Readers: get_u8 / get_u16_be / get_u32_be.
+- obj GrowBuf { ptr, len, cap } — GROWING: put_u8/put_bytes have NO room
+  precondition; on overflow grow_to_fit reallocates (Malloc# double-or-enough,
+  Copy#, Free#, new ptr). grow_new(cap) / grow_free(b) / grow_get_u8.
+
+Conformance is structural: an obj providing the required methods (with refining
+contracts) satisfies the trait — no impl block. A function generic over
+`<S: ByteSink>` serves both buffers with one implementation (see
+examples/net-bytes-sink.bv).
+
+WATCH-FOR: a growing put MOVES ptr. Length-prefix backpatching (Postgres, Task 3)
+must use the FIXED ByteBuf or store OFFSETS, never cached interior addresses.
+
+Contracts: offsets in [0,len); big-endian is explicit (Postgres and HTTP chunk
+sizes are network byte order).
+
+Compiler surface exercised: Malloc#/Load#/Store#/Copy# with computed offsets,
+Int<->byte masking (bits.bv shifts/and at the language level), obj with mutable
+Int fields, pointer-as-Int, SPEC §8.6 trait defaults + structural conformance
+monomorphized onto two concrete types. (En route this exercised — and fixed —
+three compiler bugs: trait-default %state, defn-liveness member-name collision,
+and type-dependent needs_state for monomorphized members; see BUGS.md.)
 
 ### L2 - socket (lib/std/net/socket.bv) NEW
 
@@ -131,7 +154,7 @@ correct and only architecture.
 
 | ID | Module | New/Extend | Scope-bar gate |
 |----|--------|-----------|----------------|
-| S1 | lib/std/net/bytes.bv  | NEW    | round-trip put/get u8/u16/u32 BE unit tests |
+| S1 | lib/std/net/bytes.bv  | NEW ✓ DONE 2026-10-15 | ByteSink trait: ByteBuf (fixed) + GrowBuf (growing) share derived BE writers as defaults; round-trip u8/u16/u32/cstr on both; generic `<S: ByteSink>` serves both. Gate: tests/tier1/byte_sink_trait_smoke.bv (golden "18527210501852721050" in daily_use_smoke.rs) + examples/net-bytes-sink.bv |
 | S2 | lib/std/net/socket.bv | NEW    | tcp_connect to 127.0.0.1, send/recv bytes |
 | S3 | lib/std/db/pg.bv      | NEW    | connect + SELECT + parameterized query, typed rows |
 | S4 | lib/std/net/http.bv   | NEW    | parse a real browser GET, write a JSON 200 |
