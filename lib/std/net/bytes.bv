@@ -11,10 +11,97 @@
 //   len - bytes written so far (the logical size).
 //   cap - bytes allocated (the physical size); we grow when len would exceed it.
 
+// ByteSink - the shared behavioral abstraction (SPEC 8.6 trait) for byte
+// buffers. Two flavors exist (fixed-capacity and growing); both need the SAME
+// network-byte-order writers, so those are written ONCE here as trait DEFAULT
+// methods, built purely on the REQUIRED primitives each implementer provides.
+//
+// REQUIRED (each implementer supplies, with its own contracts):
+//   put_u8    - write one byte at the current end
+//   put_bytes - bulk-copy count bytes from a source address at the current end
+// DEFAULT (written once, over the required ops):
+//   put_u16_be - write a 16-bit value in big-endian (network) order
+//   put_u32_be - write a 32-bit value in big-endian (network) order
+//   put_cstr   - write a String's bytes followed by a NUL terminator
+//
+// Conformance is structural: an obj that provides the required methods (with
+// contracts that refine the trait's) satisfies ByteSink - no impl block needed.
+trait ByteSink {
+    // put_u8 - write one byte (0..255) at the current end, len advances by one.
+    // Body-less: each implementer provides it (ByteBuf keeps a room precondition;
+    // a growing buffer would have none).
+    defn put_u8(sink: Self, val: Int) -> Self;
+
+    // put_bytes - bulk-copy count bytes from src_addr at the current end (the
+    // Copy#/memcpy primitive). Body-less: each implementer provides it (ByteBuf
+    // requires room len + count <= cap; a growing buffer would ensure room by
+    // reallocating). put_cstr builds on this, so it inherits the room contract.
+    defn put_bytes(sink: Self, src_addr: Int, count: Int) -> Self;
+
+    // put_u16_be - write a 16-bit value (0..65535) in BIG-ENDIAN order: the high
+    // byte first, then the low byte. This is network byte order - what Postgres
+    // and HTTP use for multi-byte lengths. Built on put_u8, so the two writes
+    // inherit whatever room contract the concrete put_u8 carries.
+    defn put_u16_be(sink: Self, val: Int) -> Self {
+        let high: Self = put_u8(sink, (val >> 8) & 255);
+        term put_u8(high, val & 255);
+    };
+
+    // put_u32_be - write a 32-bit value (0..4294967295) in BIG-ENDIAN order:
+    // four bytes, most significant first. This is the Postgres message length
+    // prefix. Built by chaining put_u8, inheriting its room contract per byte.
+    defn put_u32_be(sink: Self, val: Int) -> Self {
+        let byte0: Self = put_u8(sink,  (val >> 24) & 255);
+        let byte1: Self = put_u8(byte0, (val >> 16) & 255);
+        let byte2: Self = put_u8(byte1, (val >> 8) & 255);
+        term put_u8(byte2, val & 255);
+    };
+
+    // put_cstr - write a String as a NUL-terminated C string: the raw UTF-8
+    // bytes followed by a single 0x00. This is how Postgres frames user/database/
+    // query strings. A Briev String is a [len][bytes][NUL] value; .^Length is its
+    // byte count and (text as Data) as Int is the address of its [len] header -
+    // the BYTES start 8 after that header, so the copy source is that addr + 8.
+    // Built on put_bytes then put_u8, inheriting their room contracts.
+    defn put_cstr(sink: Self, text: String) -> Self {
+        let count: Int = text .^Length;
+        let data_addr: Int = ((text as Data) as Int) + 8;
+        let copied: Self = put_bytes(sink, data_addr, count);
+        term put_u8(copied, 0);
+    };
+};
+
 obj ByteBuf {
     ptr: Int;
     len: Int;
     cap: Int;
+
+    // put_u8 - write one byte (value 0..255) at the current end, return the
+    // buffer with len advanced by one. Requires room (len < cap); growth is a
+    // GrowBuf concern (design D). defn is pure, so we return a NEW ByteBuf - but
+    // Store# mutates the shared heap allocation in place, so ptr/cap carry over
+    // unchanged and only len moves. This is ByteBuf's ByteSink required method.
+    defn put_u8(sink: ByteBuf, val: Int)
+        [val >= 0 && val <= 255 && sink.len < sink.cap]
+        [term.len == sink.len + 1 && term.cap == sink.cap]
+        -> ByteBuf
+    {
+        Store#(sink.ptr + sink.len, val, 1);
+        term ByteBuf { ptr: sink.ptr, len: sink.len + 1, cap: sink.cap };
+    };
+
+    // put_bytes - copy count bytes from a source address into the buffer at the
+    // current end (Copy# lowers to llvm.memcpy). Requires room: len + count <=
+    // cap. count == 0 is allowed (a no-op copy). This is ByteBuf's ByteSink
+    // required bulk-copy method; the ptr is stable (fixed buffer never moves).
+    defn put_bytes(sink: ByteBuf, src_addr: Int, count: Int)
+        [count >= 0 && sink.len + count <= sink.cap]
+        [term.len == sink.len + count && term.cap == sink.cap]
+        -> ByteBuf
+    {
+        Copy#(sink.ptr + sink.len, src_addr, count);
+        term ByteBuf { ptr: sink.ptr, len: sink.len + count, cap: sink.cap };
+    };
 };
 
 // buf_new - allocate a buffer with room for cap bytes (cap >= 1).
@@ -31,19 +118,6 @@ defn buf_free(buf: ByteBuf) -> Void {
     term;
 };
 
-// put_u8 - write one byte (value 0..255) at the current end, return the buffer
-// with len advanced by one. Requires room (len < cap); growth is a later step.
-// defn is pure, so we return a NEW ByteBuf - but Store# mutates the shared heap
-// allocation in place, so ptr/cap carry over unchanged and only len moves.
-defn put_u8(buf: ByteBuf, val: Int)
-    [val >= 0 && val <= 255 && buf.len < buf.cap]
-    [term.len == buf.len + 1 && term.cap == buf.cap]
-    -> ByteBuf
-{
-    Store#(buf.ptr + buf.len, val, 1);
-    term ByteBuf { ptr: buf.ptr, len: buf.len + 1, cap: buf.cap };
-};
-
 // get_u8 - read the byte at offset off (0..len-1). Reading at or past len would
 // return uninitialized memory, so the precondition forbids it. The result is a
 // single byte, hence 0..255.
@@ -55,19 +129,7 @@ defn get_u8(buf: ByteBuf, off: Int)
     term Load#(buf.ptr + off, 1);
 };
 
-// put_u16_be - write a 16-bit value (0..65535) in BIG-ENDIAN order: the high
-// byte first, then the low byte. This is network byte order - what the Postgres
-// wire protocol and HTTP use for multi-byte lengths. We extract each byte with
-// a shift+mask and reuse put_u8, so the two writes inherit its room contract.
-// Needs room for two bytes: len + 2 <= cap.
-defn put_u16_be(buf: ByteBuf, val: Int)
-    [val >= 0 && val <= 65535 && buf.len + 2 <= buf.cap]
-    [term.len == buf.len + 2 && term.cap == buf.cap]
-    -> ByteBuf
-{
-    let high: ByteBuf = put_u8(buf, (val >> 8) & 255);
-    term put_u8(high, val & 255);
-};
+// (put_u16_be is now a ByteSink trait DEFAULT, defined once in the trait above.)
 
 // get_u16_be - read a 16-bit big-endian value at offset off: high byte at off,
 // low byte at off+1, recombined as (high << 8) | low. Needs both bytes written.
@@ -81,19 +143,7 @@ defn get_u16_be(buf: ByteBuf, off: Int)
     term (high << 8) | low;
 };
 
-// put_u32_be - write a 32-bit value (0..4294967295) in big-endian order: four
-// bytes, most significant first. This is the Postgres message length prefix.
-// Needs room for four bytes: len + 4 <= cap. Built by chaining put_u8.
-defn put_u32_be(buf: ByteBuf, val: Int)
-    [val >= 0 && val <= 4294967295 && buf.len + 4 <= buf.cap]
-    [term.len == buf.len + 4 && term.cap == buf.cap]
-    -> ByteBuf
-{
-    let byte0: ByteBuf = put_u8(buf,   (val >> 24) & 255);
-    let byte1: ByteBuf = put_u8(byte0, (val >> 16) & 255);
-    let byte2: ByteBuf = put_u8(byte1, (val >> 8) & 255);
-    term put_u8(byte2, val & 255);
-};
+// (put_u32_be is now a ByteSink trait DEFAULT, defined once in the trait above.)
 
 // get_u32_be - read a 32-bit big-endian value at offset off: four bytes most
 // significant first, recombined. Needs all four bytes written.
@@ -109,31 +159,5 @@ defn get_u32_be(buf: ByteBuf, off: Int)
     term (byte0 << 24) | (byte1 << 16) | (byte2 << 8) | byte3;
 };
 
-// put_bytes - copy count bytes from a source address into the buffer at the
-// current end. The low-level bulk-copy primitive (Copy# lowers to llvm.memcpy).
-// Needs room: len + count <= cap. count == 0 is allowed (a no-op copy).
-defn put_bytes(buf: ByteBuf, src_addr: Int, count: Int)
-    [count >= 0 && buf.len + count <= buf.cap]
-    [term.len == buf.len + count && term.cap == buf.cap]
-    -> ByteBuf
-{
-    Copy#(buf.ptr + buf.len, src_addr, count);
-    term ByteBuf { ptr: buf.ptr, len: buf.len + count, cap: buf.cap };
-};
-
-// put_cstr - write a String as a NUL-terminated C string: the raw UTF-8 bytes
-// followed by a single 0x00. This is how Postgres frames user/database/query
-// strings. A Briev String is a [len][bytes][NUL] value; .^Length is its byte
-// count and (text as Data) as Int is the address of its [len] header - but the
-// BYTES start 8 after that header, so the copy source is that address + 8.
-// Needs room for the bytes plus the terminator: len + text.^Length + 1 <= cap.
-defn put_cstr(buf: ByteBuf, text: String)
-    [buf.len + (text .^Length) + 1 <= buf.cap]
-    [term.cap == buf.cap]
-    -> ByteBuf
-{
-    let count: Int = text .^Length;
-    let data_addr: Int = ((text as Data) as Int) + 8;
-    let copied: ByteBuf = put_bytes(buf, data_addr, count);
-    term put_u8(copied, 0);
-};
+// (put_bytes is now a ByteBuf member / ByteSink required method, above.)
+// (put_cstr is now a ByteSink trait DEFAULT, defined once in the trait above.)
