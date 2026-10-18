@@ -71,6 +71,27 @@ the GEMM fill-pipeline campaign (see Workstream 3). Stage table:
 
 ---
 
+## Workstream 0 — Stability remediation (2026-10-16)
+
+Plan of record: `2026-10-16-stability-remediation.md`. From the
+cpp-vs-briev session's seven weaknesses: S1 `.ll` determinism gate →
+S5-A toolchain matrix → S2 reserved-word diagnostics → S3 reactive
+recipes doc → S6 config ledger → S4 shared body-emission prologue
+(prologue-only; walkers untouched). Standing guards after S1/S4: the
+determinism script on backend-touching commits.
+
+| Piece | Status | Next |
+|-------|--------|------|
+| cpp-vs-briev fixes (flaw 4, memset, node-inline valve, frame limit, defect ledger) | **DONE** (`93be0795`, `a42de3c0`, `6e3a78ef`, `63107709`, `58b292ca`) | — |
+| S1 determinism gate | **DONE** (`e5dd108c`) | standing per-commit guard |
+| S5-A toolchain matrix | **DONE** (`d7740513`) | pre-release/backend ritual |
+| S2 reserved-word diagnostics + recovery cascade | **DONE** (`6d9d1cea`) | — |
+| S3 reactive recipes | **DONE** (`14d976d5`) | — |
+| S6 config ledger | **DONE** (`27ff8d0c`) | sweeps → followup-stages |
+| S4 shared prologue (5 drivers) | **DONE** (`d7e2b10f`, fixtures `44a75ddc`) | byte-identity held; SSA-main aggregate cross-referenced |
+
+---
+
 ## Workstream 1 — Cross-dialect interop
 
 Plan of record: `2026-09-21-cross-dialect-interop.md`;
@@ -362,6 +383,16 @@ A–E, parity gates, allocator-ownership + `Asm#` amendments).
 
 ## Workstream 5 — Language features / expressiveness
 
+- **Term semantics + tails — LANDED 2026-10-16** (plan
+  `2026-10-16-term-semantics-and-tails.md`, steps 2–8; commits `9915c098`,
+  `72a80571`, `84d37a38`, `5fa723ca`, `442fbd31`): P-gated bare `term;`
+  (interpreter + backend, BUGS.md divergence resolved), defn-body tail
+  expressions (`Statement::Tail`), arrowless output inference
+  (`typechecker::output_inference`), the state-purity probe
+  (`analysis::purity`, first `diagnostics::Block` consumer), SPEC
+  §9.1/§9.3/§9.4 term rule + docs. Step 6 note: the `fn_return_types`
+  Int fallback for arrowless callables remains for the no-value-site
+  shape (pre-existing wart, documented).
 - **Collections/watchdogs/memory Phase E** — `seq`/`vol`/`async`/`sync<g>`
   modifiers + the Rule 22 concurrency-classification gate. User-deferred;
   full track (`2026-07-31-collections-watchdogs-memory.md`,
@@ -509,6 +540,9 @@ stage/execution plans are the concrete campaigns.
 
 | Plan | Closure |
 |------|---------|
+| `2026-10-16-term-semantics-and-tails.md` | Steps 1–8 DONE 2026-10-16 (`9915c098`…`442fbd31` + docs commit) — P-gated bare term, tails, output inference, purity probe, SPEC/execution-model docs |
+| `2026-10-16-cpp-vs-briev-contributor-findings.md` | COMPLETE 2026-10-16 (`35092fe1`…`d79afb94`) — flaw-4 fix, memset threshold, node-inline valve (measured), frame limit, defect ledger, recommender benchmark + corpus |
+| `2026-10-16-stability-remediation.md` | ACTIVE — S1 gate → S5-A matrix → S2 diagnostics → S3 recipes → S6 ledger → S4 prologue |
 | `2026-09-28-daily-use-sweep-and-gpu-session.md` | Phase B GPU (B1–B4) DONE; Phase A core DONE 2026-10-01 (A1 name-capture fix, A2 Stack peek, D5 test_collections repair); A3 executable gate + A5 audit + A6 probe REMAIN |
 | `2026-09-30-stage5-re-rank-and-5c.md` | 5c DONE (`8c0ece90`, byte-identical IR gate + determinism fixes); 5a DONE (72.5 µs); session record `2026-09-30-5a-attention-decode.md` |
 | `2026-09-08-master-workstream.md` | Phases 1-6 DONE; Phase 7 optional, Phase 8 verified done |

@@ -22,6 +22,7 @@ mod tests;
 
 pub use builder::LLVMBuilder;
 pub use context::{CompilerContext, FunctionContext, FunctionGuard};
+pub(crate) use helpers::WatchdogGateLabels;
 
 fn escape_llvm_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -110,7 +111,7 @@ fn collect_called_names_stmt(s: &Statement, out: &mut std::collections::HashSet<
         }
         Statement::Expression(e) => collect_called_names_expr(e, out),
         Statement::Let { expr: Some(e), .. } => collect_called_names_expr(e, out),
-        Statement::Term(Some(e)) => collect_called_names_expr(e, out),
+        Statement::Term(Some(e)) | Statement::Tail(e) => collect_called_names_expr(e, out),
         Statement::Guarded(cond, body) => {
             collect_called_names_expr(cond, out);
             for inner in body {
@@ -435,7 +436,7 @@ fn collect_bytes_stmt(stmt: &Statement, seen: &mut std::collections::HashSet<Vec
                 collect_bytes_expr(e, seen, out);
             }
         }
-        Statement::Term(Some(expr)) => collect_bytes_expr(expr, seen, out),
+        Statement::Term(Some(expr)) | Statement::Tail(expr) => collect_bytes_expr(expr, seen, out),
         Statement::Assign(_, rhs) => collect_bytes_expr(rhs, seen, out),
         Statement::Expression(e) | Statement::Gate(e) => collect_bytes_expr(e, seen, out),
         Statement::Guarded(_, body) | Statement::Block(body) | Statement::SyncBlock(body) => {
@@ -541,7 +542,7 @@ fn collect_masks_tl(tl: &TopLevel, seen: &mut std::collections::HashSet<Vec<u8>>
 fn collect_masks_stmt(stmt: &Statement, seen: &mut std::collections::HashSet<Vec<u8>>, out: &mut Vec<Vec<u8>>) {
     match stmt {
         Statement::Let { expr: Some(e), .. } => collect_masks_expr(e, seen, out),
-        Statement::Term(Some(expr)) | Statement::EndProgram(Some(expr)) => collect_masks_expr(expr, seen, out),
+        Statement::Term(Some(expr)) | Statement::EndProgram(Some(expr)) | Statement::Tail(expr) => collect_masks_expr(expr, seen, out),
         Statement::Assign(_, rhs) => collect_masks_expr(rhs, seen, out),
         Statement::Expression(e) | Statement::Gate(e) => collect_masks_expr(e, seen, out),
         Statement::Guarded(_, body) | Statement::Block(body) | Statement::SyncBlock(body) => {
@@ -700,7 +701,7 @@ fn collect_strings_stmt(stmt: &Statement, seen: &mut std::collections::HashSet<S
         Statement::FreeHint(_) | Statement::KeepHint(_) | Statement::Trap | Statement::Halt => {}
         Statement::Break => {}
         Statement::Expression(e) => { collect_strings_expr(e, seen, out); }
-        Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => { collect_strings_expr(e, seen, out); }
+        Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => { collect_strings_expr(e, seen, out); }
         Statement::Term(None) | Statement::EndProgram(None) => {}
         Statement::Guarded(condition, statements) => {
             collect_strings_expr(condition, seen, out);
@@ -1235,7 +1236,8 @@ pub struct LlvmBackend {
 
     // ── Async / Thread Pool ────────────────────────────────
     pub(crate) has_async_txns: bool,
-    /// 2026-09-11 (buffered stdout): `__stdout_flush` is defined in this
+    /// 2026-09-11 (buffered stdout): `stdout_flush` (was `__stdout_flush`;
+    /// renamed 2026-10-15, core-usable purge) is defined in this
     /// program (the print family is linked) — runtime mains call it before
     /// returning so the buffer tail reaches the fd. Bare/no-stdlib programs
     /// never set it, and no call or declare is emitted.
@@ -1316,6 +1318,22 @@ pub struct LlvmBackend {
     /// 2026-09-14 (machine-entry plan): `@__briev_trap_frame` emitted once
     /// per module when a `full_context` handler exists.
     trap_frame_emitted: bool,
+    /// 2026-10-17 (liveness fixpoint): helpers the IR-scan net found
+    /// EMITTED-but-unrooted in an earlier emission round, plus their
+    /// liveness closure — unioned into `live_defns` on re-entry so round
+    /// N+1 emits them. The net's under-approximation self-corrects from
+    /// ground truth (what emission actually called) instead of demanding
+    /// a hand-maintained table row per cast-lane class. Cleared by the
+    /// public `generate()` entry (state is per-generate, not per-backend).
+    /// Undo: delete this field + the fixpoint block in the IR-scan net.
+    liveness_fixpoint_extra: std::collections::HashSet<String>,
+    /// 2026-10-17 (liveness fixpoint): re-emission rounds consumed — each
+    /// round strictly grows `liveness_fixpoint_extra` (missed names are
+    /// filtered OUT of live sets, so they are always net-new), which
+    /// bounds rounds by the unit's name universe; 16 is a far-above-
+    /// practical guard (real chains resolve in 1–3) whose breach means
+    /// pathological emission, reported with the chain.
+    liveness_fixpoint_rounds: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1416,6 +1434,8 @@ impl LlvmBackend {
             bootstrap_txn: None,
             bootstrap_bad: None,
             trap_frame_emitted: false,
+            liveness_fixpoint_extra: std::collections::HashSet::new(),
+            liveness_fixpoint_rounds: 0,
         }
     }
 
@@ -2322,7 +2342,7 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
             Statement::Expression(e) => {
                 self.check_expr_embedded(e, ctx_name, threading_intrinsics);
             }
-            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => {
+            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => {
                 self.check_expr_embedded(e, ctx_name, threading_intrinsics);
             }
             Statement::Term(None) | Statement::EndProgram(None) => {}
@@ -2457,11 +2477,60 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
         }
     }
 
+    /// 2026-10-17 (liveness fixpoint): public entry — resets per-generate
+    /// fixpoint state, snapshots pre-round warnings, acquires the analysis
+    /// ONCE, then runs the emission body via `generate_with_analysis` (the
+    /// fixpoint's re-entry target). External callers keep using `generate`.
     pub fn generate(&mut self, items: &[TopLevel], exit_condition: Option<Box<Expr>>) -> String {
+        self.liveness_fixpoint_extra.clear();
+        self.liveness_fixpoint_rounds = 0;
+        let entry_warnings = self.warnings.clone();
+        // 2026-08-23 (Plan 0.1): consume the pipeline-computed analysis when
+        // the caller provided it (.with_analysis); otherwise self-compute —
+        // identical inputs, identical result, so both paths agree. Taken
+        // ONCE per public entry: fixpoint re-runs MOVE the same analysis, so
+        // every round sees bit-identical analysis (only live_defns grows).
+        let analysis = match self.precomputed_analysis.take() {
+            Some(a) => a,
+            None => crate::backend::analyze_program(
+                items,
+                false,
+                // 2026-07-31: Phase 3 (§8.1) — vector-phi promotion gate from
+                // config/targets.dbvl `vector_min_width` for this target.
+                crate::config_tuning::target_settings_for(&self.ctx.target_triple).vector_min_width,
+                // 2026-08-06 (accel plan): the populated TypeUniverse for the
+                // flat-type proof in src/analysis/accel.rs (rule 18 — never name
+                // matching). Built by the normalizer before the backend runs.
+                self.ctx.type_universe.as_ref(),
+            ),
+        };
+        self.generate_with_analysis(items, exit_condition, analysis, entry_warnings)
+    }
+
+    /// 2026-10-17 (liveness fixpoint): the emission body, re-entrant by
+    /// design. The IR-scan net recurses here with the same `analysis`
+    /// (moved) after restoring `entry_warnings`, so a discarded round
+    /// leaves no trace. Do NOT route fixpoint re-runs through `generate`
+    /// (it would clear the accumulated extra roots).
+    fn generate_with_analysis(
+        &mut self,
+        items: &[TopLevel],
+        exit_condition: Option<Box<Expr>>,
+        mut analysis: crate::backend::AnalysisResults,
+        entry_warnings: Vec<String>,
+    ) -> String {
+        // 2026-10-17 (liveness fixpoint): one module's worth of emission per
+        // round — this is a dedup guard whose artifact (@__briev_trap_frame
+        // global) goes into the round's `out`, and a discarded round must
+        // not suppress it in the next. Single-round entry: already false
+        // (set only here-adjacent emission at emit_toplevel.rs:6490).
+        // Red-proven: without the reset, test_trap_frame_survives_fixpoint_round
+        // fails on the missing global.
+        self.trap_frame_emitted = false;
         // 2026-09-11 (buffered stdout): gate the epilogue flush on the
         // stdlib lane actually being present — bare programs get no call.
         // 2026-09-17: ALSO gate on liveness — the defn existing is not
-        // enough (a program that never prints defines __stdout_flush but
+        // enough (a program that never prints defines stdout_flush but
         // nothing roots it, so the tail call would hit the defn-liveness
         // gate: "emitted code calls unreached defns"). Print# roots the
         // whole stdout family via intrinsic_helpers, so the tail fires
@@ -2488,23 +2557,6 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
                 self.warnings.push(w.clone());
             }
         }
-        // 2026-08-23 (Plan 0.1): consume the pipeline-computed analysis when
-        // the caller provided it (.with_analysis); otherwise self-compute —
-        // identical inputs, identical result, so both paths agree.
-        let mut analysis = match self.precomputed_analysis.take() {
-            Some(a) => a,
-            None => crate::backend::analyze_program(
-                items,
-                false,
-                // 2026-07-31: Phase 3 (§8.1) — vector-phi promotion gate from
-                // config/targets.dbvl `vector_min_width` for this target.
-                crate::config_tuning::target_settings_for(&self.ctx.target_triple).vector_min_width,
-                // 2026-08-06 (accel plan): the populated TypeUniverse for the
-                // flat-type proof in src/analysis/accel.rs (rule 18 — never name
-                // matching). Built by the normalizer before the backend runs.
-                self.ctx.type_universe.as_ref(),
-            ),
-        };
         self.ctx.dep_graph = analysis.dependency_graph.clone();
         self.ctx.global_free_after = analysis.global_lifetime.free_after.clone();
         self.ctx.observable_names = analysis.observable_names.clone();
@@ -2517,17 +2569,35 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
         // overrides: the shim exports plain txns/defns as ABI symbols, so
         // every callable is live there.
 self.ctx.live_defns = analysis.defn_liveness.live.clone();
+        // 2026-10-17 (liveness fixpoint): union the roots derived from
+        // PREVIOUS rounds' emitted-but-unrooted calls — round N's emission
+        // gates see original ∪ derived.
+        self.ctx.live_defns
+            .extend(self.liveness_fixpoint_extra.iter().cloned());
          self.ctx.emit_all_defns =
              analysis.defn_liveness.keep_all || self.ctx.library_mode || self.ctx.force_emit_all;
+        // 2026-10-15 (lifecycle laws): termination-reachability warning.
+        // The frontend lowered `when G { endprogram; }` laws into monitor
+        // txns (their endprogram counts), reside laws suppress. Stalling
+        // stays LEGAL — this informs, it does not reject.
+        if !self.ctx.library_mode && !self.ctx.is_shared_lib {
+            let term = crate::analysis::lifecycle::analyze_termination(
+                items,
+                &analysis.defn_liveness.live,
+            );
+            if let Some(warn) = crate::analysis::lifecycle::termination_warning(&term) {
+                self.warnings.push(warn.render());
+            }
+        }
         // 2026-09-23 (async-events empty-output fix): the epilogue-flush gate
         // must read the NOW-populated live set. Previously computed at the
         // top of generate() it always saw the default-empty live_defns and
-        // suppressed the main-tail __stdout_flush — a program printing via
+        // suppressed the main-tail stdout_flush — a program printing via
         // the buffered lane (buffered stdout) wrote into a buffer that was
         // never flushed (acc computed correctly, no output).
         self.has_stdout_flush = items.iter().any(|i| {
-            matches!(i, TopLevel::Definition(d) if d.name == "__stdout_flush")
-        }) && self.ctx.live_defns.contains("__stdout_flush");
+            matches!(i, TopLevel::Definition(d) if d.name == "stdout_flush")
+        }) && self.ctx.live_defns.contains("stdout_flush");
         // 2026-08-31 (plan abv-gpu-by-default): pre-register the accel kernel
         // index BEFORE host emission. The dispatch wrapper is decided at
         // txn-emission time via accel_kernel_idx — with kernel collection at
@@ -2590,19 +2660,63 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     .map(|params| (name.clone(), (segs.clone(), params.clone())))
             })
             .collect();
+        // 2026-10-17 (plain storage): classify top-level lets BEFORE any
+        // needs-state consumer reads them. Bare lets referenced by the proof
+        // surface (contracts, watchdogs, `#!exit`, `endprogram` output, view
+        // bindings) are machine state; everything else is plain (module-
+        // scope globals). Declared `state`/`plain` annotations are checked
+        // against this inference — a contradiction is a fatal error quoting
+        // the contradicting reference.
+        let plain_lets = crate::analysis::storage_class::classify_plain_lets(
+            items,
+            exit_condition.as_deref(),
+            &self.ctx.view_bound_fields,
+        );
+        for err in crate::analysis::storage_class::storage_assertion_errors(
+            items,
+            exit_condition.as_deref(),
+            &self.ctx.view_bound_fields,
+        ) {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
+        self.ctx.plain_lets = plain_lets.clone();
+        // Bare lets that demoted: disclose the decision (the info: line is
+        // the classification's user-facing record — same convention as the
+        // dispatch info lines).
+        let mut demoted: Vec<String> = plain_lets
+            .iter()
+            .filter(|n| {
+                crate::analysis::storage_class::declared_storage(items, n).is_none()
+            })
+            .cloned()
+            .collect();
+        demoted.sort();
+        for name in &demoted {
+            self.warnings
+                .push(format!("info: '{}' lowered to plain storage — no contract references it", name));
+        }
+
         // 2026-08-03: Per-export ABI (needs_state) computed once up front by
         // the export ABI analysis — the backend only consumes the decision.
         // 2026-08-04 (compiler-in-Briev, P4): the Briev pass (briev_pass.rs)
         // computes it through the GLUE C ABI when its library is present;
         // otherwise the Rust reference runs.
         self.ctx.export_needs_state =
-            crate::glue::briev_pass::compute_export_needs_state(items);
+            crate::glue::briev_pass::compute_export_needs_state(items, &plain_lets);
         // 2026-09-23 (stateless-defn mechanism): the per-defn needs-state map
         // (ALL defns, not just exports) drives regular-defn emission — pure
         // helpers emit without `%state`, keeping GLUE exports on a clean C
         // ABI. Computed here once; the backend only consumes the decision.
         self.ctx.defn_needs_state =
-            crate::analysis::export_abi::compute_defn_needs_state(items);
+            crate::analysis::export_abi::compute_defn_needs_state(items, &plain_lets);
+        // 2026-10-15 (type-dependent member statefulness): concrete types with
+        // a state-taking member. A trait default/generic monomorphized onto
+        // such a type must itself take `%state` (its specialized body reaches a
+        // stateful member), while the same default on a stateless type stays
+        // stateless. Consumed at the specialization site (emit_expr.rs).
+        self.ctx.type_stateful_members =
+            crate::analysis::export_abi::type_stateful_members(items);
         // 2026-08-01 (Phase 5): a `keep x;` on a field the scheduler would not
         // auto-free anyway is redundant — surface it as a warning.
         for k in &analysis.global_lifetime.redundant_keeps {
@@ -2658,6 +2772,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // read frontend analysis instead of re-walking bodies.
         self.ctx.density = analysis.density.clone();
         self.ctx.inline_decisions = analysis.inline_decisions.clone();
+        self.ctx.node_inline_decisions = analysis.node_inline_decisions.clone();
         self.ctx.modulo_partition = analysis.modulo_partition.clone();
         // 2026-10-12 (SPEC §8.6.1 Option B): per-collection dyn concrete sets
         // + dispatch forms — the frontend's decision the element read-sites
@@ -2676,7 +2791,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             self.check_embedded_restrictions(items);
         }
 
-        self.ctx.exit_condition = exit_condition;
+        // 2026-10-17 (liveness fixpoint): CLONE — the param must survive for
+        // the net's re-entry (the combined/mutated form lives on ctx).
+        self.ctx.exit_condition = exit_condition.clone();
         // 2026-07-13: normalize_to_old_recursive removed in new AST.
         // BinaryOp/UnaryOp exit conditions are already the canonical form.
         // 2026-07-29: Reorder state field declarations to SoA layout before
@@ -3702,7 +3819,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // These are called by inop declarations in lib/std/os/*.bv.
         // All take/return i64 (boxed value) matching Briev's ABI.
         // 2026-08-15 (coll plan §3.6): the coll capacity resize helper.
-        if !defined.contains("__briev_coll_resize") {
+        if !defined.contains("coll_resize") {
             writeln!(out, "declare i64 @__briev_coll_resize(i64, i64) #1").ok();
         }
         writeln!(out, "declare i64 @briev_open(i64, i64, i64) #1").ok();
@@ -3766,13 +3883,15 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // 2026-09-09 (Family B): skipped when a pure-Briev defn provides the
         // symbol (the declare-guard `defined` set) — a declare whose
         // signature differs from the define is an LLVM redefinition error.
-        if !defined.contains("__exit") {
+        // 2026-10-15 (core-usable purge): the helper is `exit_prog`; the C
+        // fallback symbol keeps its briev_rt.c ABI name (__exit).
+        if !defined.contains("exit_prog") {
             writeln!(out, "declare void @__exit(i64) #6").ok();
         }
         writeln!(out, "declare i64 @briev_futex(i64, i64, i64, i64, i64, i64) #1").ok();
         writeln!(out, "declare i64 @__ioctl__(i64, i64, i64) #1").ok();
         writeln!(out, "declare i64 @__isatty__(i64) #1").ok();
-        if !defined.contains("__print") {
+        if !defined.contains("print_str_raw") {
             writeln!(out, "declare i64 @__print(ptr) #1").ok();
         }
         // 2026-08-01 (B0): Print# intrinsic runtime symbol. The dead frgn
@@ -3780,7 +3899,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // symbol and a { i64, i64 } String type); the intrinsic owns this
         // call site, so the backend declares the ABI: String = ptr to a
         // length-prefixed [len][bytes] buffer.
-        if !defined.contains("__print_str") {
+        if !defined.contains("print_str") {
             writeln!(out, "declare i64 @__print_str(ptr) #1").ok();
         }
          // 2026-08-13 (dynamic String slice): `s[a:b]` emits a byte-wise
@@ -4043,6 +4162,34 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
         if !self.ctx.inits.is_empty() { writeln!(out).ok(); }
 
+        // 2026-10-17 (plain storage): plain lets are module-scope mutable
+        // globals — same lowering shape as the `init` invariants (mutable,
+        // seeded in the pre-reactor phase when the initializer is a
+        // non-literal expression). Sorted iteration keeps emission
+        // deterministic. A LITERAL initializer folds into the declaration
+        // (`@name = global i64 3`) — no runtime store. This matters beyond
+        // tidiness: entry stores to the @globals DEFEAT clang's promotion of
+        // the %State alloca in the runtime loop (measured: interval_step
+        // 879ms with the zero-seed stores, 456ms without). The declared
+        // value IS the initial value — the static init is the single
+        // writer for literals, the seeding store for expressions.
+        let mut sorted_plain: Vec<String> = self.ctx.plain_global_types.keys().cloned().collect();
+        sorted_plain.sort();
+        for name in &sorted_plain {
+            let (ty, init) = &self.ctx.plain_global_types[name];
+            let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+            let zero = if llvm_ty == "float" { "0.0" } else if llvm_ty == "double" { "0.0" } else if llvm_ty == "ptr" { "null" } else { "0" };
+            let literal = match init {
+                Some(Expr::Decimal(n)) => Some(n.to_string()),
+                Some(Expr::Float(f)) => Some(float_to_llvm_str(*f, &llvm_ty)),
+                Some(Expr::Bool(b)) => Some((if *b { "true" } else { "false" }).to_string()),
+                _ => None,
+            };
+            let val_str = literal.unwrap_or_else(|| zero.to_string());
+            writeln!(out, "@{} = global {} {}", name, llvm_ty, val_str).ok();
+        }
+        if !self.ctx.plain_global_types.is_empty() { writeln!(out).ok(); }
+
         self.declare_state_type(&mut out);
         // %State no longer has a module-level global. Instead, main()
         // allocates it on the stack as an alloca and passes it to all
@@ -4261,7 +4408,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if self.async_txn_names.iter().any(|n| n.as_str() == name.as_str()) && !self.is_lightweight_async {
                 // 2026-10-07 (view-surface liveness): same gate as the main
                 // loop — a dead async txn's worker wrapper is dead code;
-                // async roots `__wait_for_trigger__`, not the txn name, so
+                // async roots `wait_for_trigger`, not the txn name, so
                 // without this the wrapper body walked unclosed callees.
                 if !self.ctx.emit_all_defns && !self.ctx.live_defns.contains(name.as_str()) {
                     continue;
@@ -4429,14 +4576,32 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // this heuristic was removed 2026-07-31 as dead — the write set comes
         // from the transition graph's node.write_set, and the dispatch decision
         // now comes from the LoopShape, not a field count.)
-        let foldable = graph.nodes.len() == 1
+        //
+        // 2026-10-17 (reactive-only dispatch): a callable `txn` is never a
+        // reactor step — `txn` is always non-reactive (the remnant keyword for
+        // what nodes became). The transition graph and the `txns` list carry
+        // callables by design (the frontend filters them in build_loop_shapes
+        // and program_convergence), so every dispatch gate must count
+        // REACTIVE txns/nodes only. Counting raw entries broke single-node
+        // folding for every program that imports a stdlib module declaring a
+        // callable txn: the prelude imports std/iterator.bv (iter_chain
+        // elaboration, 2026-10-06), whose `iter_take_loop` pushed the counts
+        // to 2 and knocked series_converge off the per-field-phi fold — the
+        // only engine that emits the contract watchdog — onto the direct-SSA
+        // loop, silently dropping the `?[...] -> action` call. Undo: revert
+        // these gates to raw `graph.nodes.len()`/`txns.len()` counts and
+        // re-break series_converge.
+        let reactive_nodes: Vec<&crate::analysis::transition_graph::ReactorNode> =
+            graph.nodes.iter().filter(|n| n.is_reactive).collect();
+        let reactive_txns: Vec<&(String, &crate::ast::Transaction)> =
+            txns.iter().filter(|(_, t)| t.is_reactive).collect();
+        let foldable = reactive_nodes.len() == 1
             && !graph.has_triggers
-            && txns.len() == 1
-            && graph.nodes[0].bounded_pre.is_some()
-            && graph.nodes[0].increments.is_some()
-            && graph.nodes[0].is_reactive;
+            && reactive_txns.len() == 1
+            && reactive_nodes[0].bounded_pre.is_some()
+            && reactive_nodes[0].increments.is_some();
         let folded = if foldable {
-            let node = &graph.nodes[0];
+            let node = reactive_nodes[0];
             let bp = node.bounded_pre.as_ref().unwrap();
             let inc = node.increments.as_ref().unwrap();
             if bp.var != inc.var {
@@ -4482,11 +4647,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                                 // hoist_terminating_guard body re-walk.
                                 let (txn_body, post_hoist) = match analysis.swan_songs.get(&node.name) {
                                     Some((stripped, hoisted)) => (stripped.clone(), hoisted.clone()),
-                                    None => (txns[0].1.body.clone(), Vec::new()),
+                                    None => (reactive_txns[0].1.body.clone(), Vec::new()),
                                 };
                                 let folded = self.emit_folded_loop_shape(
                                     &mut out, &analysis, node, counter_idx, shape, &txn_body, post_hoist,
-                                    txns[0].1.contract.watchdog.as_ref(),
+                                    reactive_txns[0].1.contract.watchdog.as_ref(),
                                 );
                                 // 2026-08-06 (diagnostics): the fold was
                                 // attempted but could not be emitted for this
@@ -4526,6 +4691,24 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             self.emit_trg_step(&mut out, &analysis.dependency_graph, &trg_names);
         }
 
+        // 2026-08-26 (bug sweep B4): the never-dispatched plain-txn warning
+        // must fire for EVERY program dispatch mode, not just EmitSequentialSsa
+        // — folded mains, precomputed mains, enum switch-dispatch,
+        // parallel/sequential reactors all fire is_reactive txns only.
+        // 2026-10-17 (reactive-only dispatch): this call used to sit inside
+        // `!folded` only, and the test pinning it passed for the wrong reason —
+        // its dead callable txn broke the raw-count foldable gate, shunting the
+        // program into the `!folded` branch. With reactive-only counting the
+        // fold happens, so the warning lives here, mode-independent.
+        // Library/shared-lib shims legitimately export plain txns as symbols,
+        // so those two modes keep silence.
+        if !self.ctx.library_mode
+            && !self.ctx.is_shared_lib
+            && !txns.is_empty()
+        {
+            Self::warn_undispatched_txns(items, &txns, &self.ctx.live_defns, &mut self.warnings);
+        }
+
         if !folded {
             let precomputed = if let Some(ref final_values) = precomputed_final_values {
                 // EmitPureCounterFold: fully precomputed — no runtime loop emitted
@@ -4536,18 +4719,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             } else { false };
 
             if !precomputed {
-                // 2026-08-26 (bug sweep B4): the never-dispatched plain-txn
-                // warning must fire for EVERY program dispatch mode, not just
-                // EmitSequentialSsa — enum switch-dispatch, parallel/sequential
-                // reactors, and folded mains all fire is_reactive txns only.
-                // Library/shared-lib shims legitimately export plain txns as
-                // symbols, so those two modes keep silence.
-                if !self.ctx.library_mode
-                    && !self.ctx.is_shared_lib
-                    && !txns.is_empty()
-                {
-                    Self::warn_undispatched_txns(items, &txns, &self.ctx.live_defns, &mut self.warnings);
-                }
                 // A004: warn when a runtime loop has zero observability
                 if !txns.is_empty() {
                     let any_has_ffi = txns.iter().any(|(_, t)|
@@ -4585,6 +4756,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     for name in &self.async_txn_names {
                         let node = graph.nodes.iter().find(|n| n.name == *name);
                         let Some(node) = node else { multi_foldable = false; break };
+                        // 2026-10-17 (reactive-only dispatch): an `async txn`
+                        // callable is invoked, never dispatched — it neither
+                        // joins nor vetoes the multi-txn fold.
+                        if !node.is_reactive { continue; }
                         let (Some(bp), Some(inc)) = (&node.bounded_pre, &node.increments) else {
                             multi_foldable = false; break;
                         };
@@ -4610,6 +4785,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 if multi_foldable {
                     for txn_name in &self.async_txn_names {
                         if let Some(node) = graph.nodes.iter().find(|n| n.name == *txn_name) {
+                            // 2026-10-17 (reactive-only dispatch): callables
+                            // never join the fold.
+                            if !node.is_reactive { continue; }
                             if let Some(ref bp) = node.bounded_pre {
                                 if let Some(&cidx) = self.ctx.field_index_map.get(&bp.var) {
                                     let tidx = self.ctx.field_index_map.get(&bp.bound_var).copied();
@@ -4738,9 +4916,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     }
                     m
                 };
-                // Legacy single-txn params for chain composition (unchanged)
-                let (enum_ci, enum_ti, enum_tcn): (usize, Option<usize>, Option<String>) = if graph.nodes.len() == 1 && txns.len() == 1 {
-                    if let Some(bp) = graph.nodes[0].bounded_pre.as_ref() {
+                // Legacy single-txn params for chain composition (unchanged).
+                // 2026-10-17 (reactive-only dispatch): count reactive
+                // nodes/txns — callable `txn`s are not reactor steps.
+                let (enum_ci, enum_ti, enum_tcn): (usize, Option<usize>, Option<String>) = if reactive_nodes.len() == 1 && reactive_txns.len() == 1 {
+                    if let Some(bp) = reactive_nodes[0].bounded_pre.as_ref() {
                         if let Some(&cidx) = self.ctx.field_index_map.get(&bp.var) {
                             let tidx = self.ctx.field_index_map.get(&bp.bound_var).copied();
                             let tcname = if tidx.is_none() {
@@ -4854,6 +5034,14 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 }
                 self.fun.txn_counter = 0;
                 self.fun.within_counter = 0;
+                // 2026-10-17 (readiness gate 1): async nodes' watchdog specs
+                // for the phase gate (emit_async_phase needs &mut self, so
+                // the contracts ride in ctx).
+                self.ctx.async_phase_watchdogs = txns
+                    .iter()
+                    .filter(|(n, t)| t.is_reactive && self.async_txn_names.contains(n))
+                    .map(|(n, t)| (n.clone(), t.contract.watchdog.clone()))
+                    .collect();
                 if !self.ctx.no_main {
                     self.emit_main(&mut out, has_wake_triggers);
                 }
@@ -4907,6 +5095,14 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // ── DEAD-FIELD INFO DIAGNOSTICS (A002/A003) ─────────
         if !self.ctx.dead_info_disabled {
             for node in &graph.nodes {
+                // 2026-10-17 (reactive-only dispatch): these diagnostics speak
+                // for reactor-dispatched txns. A callable `txn` is invoked,
+                // never dispatched — when dead it is not even emitted, so
+                // "stores eliminated"/"folded to O(1)" claims are false for it
+                // (the prelude's iter_take_loop printed them on every build).
+                if !node.is_reactive {
+                    continue;
+                }
                 // 2026-08-11 (view wiring): view-bound fields are consumed by
                 // the DOM — observability-as-liveness. The transition graph's
                 // live_fields is body/contract-driven and knows nothing about
@@ -5571,17 +5767,131 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 .collect();
             missed.sort();
             if !missed.is_empty() {
-                panic!(
-                    "defn liveness: emitted code calls unreached defn(s) {:?} — \
-                     add the intrinsic→helper row in src/analysis/defn_liveness.rs \
-                     (intrinsic_helpers) or root the caller; see \
-                     docs/architecture/defn-liveness.md",
-                    missed
+                // ── 2026-10-17 (liveness fixpoint) ─────────────────────────
+                // Ground truth: emission actually CALLED these. The names are
+                // defn_params keys with a real `@name(` in the IR — not a
+                // declare false-positive (unit-defined symbols skip declares;
+                // `define` lines exist only for LIVE defns, and the filter
+                // above excluded live names). The type-agnostic liveness walk
+                // cannot see cast-LANE sources — an any-cast consuming root
+                // was tried 2026-10-12 and rejected (it rooted the parse
+                // family in every unit + exposed WASM byte_at) — so this
+                // class never gets an intrinsic_helpers row (a plain `as`
+                // cast has no intrinsic name). Derive instead of predicting:
+                // root the missed names + their liveness closure, restore
+                // the pre-round warnings (the discarded round leaves no
+                // trace), re-emit with the same analysis.
+                // Termination: missed ⊆ defn_params, missed ∩ (live ∪ extra)
+                // = ∅ (live names are filtered out above), so every round's
+                // extra set STRICTLY grows by ≥ |missed| — bounded by the
+                // unit's name universe. 16 = far-above-practical ceiling
+                // (real chains resolve in 1–3 rounds); breach = reportable
+                // pathological emission, surfaced with the chain.
+                if self.liveness_fixpoint_rounds >= 16 {
+                    let chain: Vec<&String> = missed.iter().copied().collect();
+                    panic!(
+                        "defn liveness: emitted code calls unreached defn(s) {:?} — \
+                         still unreached after {} re-emission rounds (chain too \
+                         deep to derive; please report this program); see \
+                         docs/architecture/defn-liveness.md",
+                        chain, self.liveness_fixpoint_rounds
+                    );
+                }
+                let extra_roots: std::collections::HashSet<String> =
+                    missed.iter().map(|n| (*n).clone()).collect();
+                let closure = crate::analysis::defn_liveness::DefnLiveness::build_with_roots(
+                    items, &extra_roots,
+                );
+                self.liveness_fixpoint_extra
+                    .extend(closure.live.iter().cloned());
+                self.liveness_fixpoint_rounds += 1;
+                self.warnings = entry_warnings.clone();
+                return self.generate_with_analysis(
+                    items,
+                    exit_condition,
+                    analysis,
+                    entry_warnings,
                 );
             }
         }
 
+        // ── Frame-limit check (2026-10-16, absolute-limit addendum part 1) ──
+        // The one a-priori-computable absolute: every alloca's byte size is
+        // known from the emitted type string, so Σ(frame bytes) per function
+        // is exact for scalars/arrays and conservative (align-8 floors) for
+        // named structs. Enforced only when the target row declares
+        // `frame_limit_bytes` (machine fact — displacement cliffs / RAM
+        // stack); hosted targets without the field skip the check.
+        self.check_frame_limits(&out);
+
         out
+    }
+
+    /// Sum each emitted function's `alloca` sizes against the target's
+    /// `frame_limit_bytes`. Post-emission textual accounting: one choke point
+    /// over the finished module (44 alloca emission sites across 10 files —
+    /// instrumenting each would be churn). Single left-to-right pass, so the
+    /// diagnostics are deterministic (house rule §4).
+    fn check_frame_limits(&mut self, out: &str) {
+        let Some(limit) =
+            crate::config_tuning::target_settings_for(&self.ctx.target_triple).frame_limit_bytes
+        else {
+            return;
+        };
+        // %State's size from the declared field types; unknown spellings
+        // over-count at 8 bytes (safe direction for a limit).
+        let state_size: u64 = self
+            .ctx
+            .field_types
+            .iter()
+            .map(|t| {
+                crate::backend::llvm::emit_toplevel::llvm_type_bytes(t, None)
+                    .unwrap_or(8)
+                    .div_ceil(8)
+                    * 8
+            })
+            .sum();
+        let mut breaches: Vec<(String, u64)> = Vec::new();
+        for block in out.split("define ") {
+            let Some(name_end) = block.find('(') else { continue };
+            let name = block[..name_end].rsplit('@').next().unwrap_or("?").to_string();
+            let body_end = block.find("\n}").unwrap_or(block.len());
+            let mut total = 0u64;
+            for line in block[..body_end].lines() {
+                let Some(rest) = line.trim().strip_suffix(", align 8") else {
+                    continue;
+                };
+                let Some(ty) = rest.strip_prefix("%").and_then(|r| r.split("= alloca ").nth(1))
+                else {
+                    continue;
+                };
+                total = total
+                    .checked_add(
+                        crate::backend::llvm::emit_toplevel::llvm_type_bytes(ty, Some(state_size))
+                            .unwrap_or(8),
+                    )
+                    .unwrap_or(u64::MAX);
+            }
+            if total > limit {
+                breaches.push((name, total));
+            }
+        }
+        if !breaches.is_empty() {
+            breaches.sort();
+            panic!(
+                "frame limit: function(s) {} exceed the {} target's frame_limit_bytes ({}): \
+                 the stack frame would be unaddressable or overflow the target's RAM stack. \
+                 fix: split the node or move the large buffer to the heap (Malloc# + Ptr<T>), \
+                 or raise frame_limit_bytes for this deployment in config/targets.dbvl",
+                breaches
+                    .iter()
+                    .map(|(n, b)| format!("@{} ({} bytes)", n, b))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.ctx.target_triple,
+                limit
+            );
+        }
     }
 
     /// 2026-09-10 (Family F): does this call line target a symbol that is
@@ -5599,7 +5909,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             "briev_host_arity_of",
             // __getenv_int/__getenv_briev are NOT here: they are adapter-
             // served (the backend emits C-ABI defines over the captured
-            // environ). Same for the __argv_* family (retired with cli.bv).
+            // environ). Same for the argv_* family (retired with cli.bv).
             // libc
             "malloc", "free", "realloc", "calloc", "getenv", "printf",
             "briev_getenv_int_impl", "briev_getenv_briev_impl",
@@ -5836,7 +6146,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         analysis: &crate::backend::AnalysisResults,
     ) -> Option<InternalFoldInfo> {
         let nodes = &analysis.transition_graph.nodes;
-        if nodes.len() <= 1 {
+        // 2026-10-17 (reactive-only dispatch): "single-node main fold" means
+        // one REACTIVE node — callable `txn`s ride along in the graph but are
+        // not reactor steps, so they must not unlock (or starve) this path.
+        if nodes.iter().filter(|n| n.is_reactive).count() <= 1 {
             return None; // the single-node main fold handles this
         }
         if self.accel_kernel_idx.contains_key(name) {
@@ -5883,7 +6196,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 .into_iter()
                 .filter(|f| f != counter)
                 .collect();
-        for other in nodes {
+        // 2026-10-17 (reactive-only dispatch): eligibility is "no other
+        // REACTOR node can fire mid-pass" — callables are filtered before the
+        // proof (a callable's precondition speaks of its parameters at call
+        // time; the runtime call check is unaffected by folding).
+        for other in nodes.iter().filter(|n| n.is_reactive) {
             if other.name == *name {
                 continue;
             }
@@ -5922,6 +6239,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         writeln!(out, "define void @txn_{}({}) local_unnamed_addr #0 noinline {{", name, self.ctx.state_ptr_param).ok();
         writeln!(out, "  entry:").ok();
         self.fun.txn_name = name.to_string();
+        self.fun.item_post = Some(txn.contract.post_condition.clone());
         self.fun.ssa_old_int_regs.clear();
         self.fun.ssa_old_float_regs.clear();
         self.fun.clear_locals();
@@ -6137,6 +6455,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             &body_stmts, &node.write_set, is_decreasing_vd, Some(&bp.var),
             analysis.global_lifetime.free_after.get(&node.name)
                 .map(|v| v.as_slice()).unwrap_or(&[]),
+            &node.name, watchdog,
         ) {
             return true;
         }
@@ -6154,7 +6473,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
 
             self.warnings.push(format!("info: txn '{}' dispatched via inline SSA ({} fields)", node.name, total_fields));
 
-            self.emit_folded_main(out, &node.name, counter_idx, total_idx, total_const_name, bp.bound_literal, false, Some(&body_stmts), Some(&bp.var));
+            self.emit_folded_main(out, &node.name, counter_idx, total_idx, total_const_name, bp.bound_literal, false, Some(&body_stmts), Some(&bp.var), watchdog);
             return true;
         }
 
@@ -6571,7 +6890,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 break;
             }
             match s {
-                crate::ast::Statement::Term(Some(e)) => {
+                crate::ast::Statement::Term(Some(e)) | crate::ast::Statement::Tail(e) => {
                     let reg = self.emit_expr(out, e, "  ");
                     last_val = Some(self.adapt_to_i64(out, "  ", &reg));
                     self.fun.terminated = true;
@@ -6616,6 +6935,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
     fn build_field_index(&mut self, items: &[TopLevel]) {
         self.ctx.field_index_map.clear();
         self.ctx.field_types.clear();
+        // 2026-10-17 (liveness fixpoint): field_briev_types is documented
+        // parallel to field_types (push_field_type pushes both in lockstep),
+        // so the rebuild must clear it too — the fixpoint re-enters this
+        // function, and an uncleared parallel vector would only stay
+        // correct by coincidence (identical round inputs ⇒ identical prefix).
+        // Clearing makes the invariant structural instead.
+        self.ctx.field_briev_types.clear();
         self.ctx.field_initializers.clear();
         if !self.ctx.mmio_prepopulated {
             self.ctx.mmio_fields.clear();
@@ -6668,6 +6994,35 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             // can evaluate and store the runtime value at startup.
             } else if let TopLevel::Statement(stmt) = item {
                 if let crate::ast::Statement::Let { name, ty, expr, .. } = stmt.as_ref() {
+                    // 2026-10-17 (plain storage): plain lets are module-scope
+                    // globals, not %State fields — same name/type/init/
+                    // read/write semantics, no machine membership. Emitted as
+                    // `@name = global <ty> 0` beside the `init` globals; the
+                    // read/write resolvers check plain_lets before the field
+                    // map. Obj-instance unpacking stays a state-field feature
+                    // (plain plumbing is scalar) — an unpack candidate is a
+                    // fatal diagnostic, never a silent reclassification.
+                    if self.ctx.plain_lets.contains(name) {
+                        let field_ty = ty.clone().unwrap_or(crate::ast::Type::int());
+                        let unpack_candidate = match &field_ty {
+                            Type::Applied(base, _) | Type::Custom(base)
+                                if self.ctx.obj_members.contains_key(base) => true,
+                            _ => false,
+                        };
+                        if unpack_candidate {
+                            eprintln!(
+                                "error: '{}' is declared `plain`, but its type unpacks into \
+machine instance columns — plain storage is for scalar plumbing. Remove the \
+`plain` declaration (bare `let` infers state for instance types) or change the type.",
+                                name
+                            );
+                            std::process::exit(1);
+                        }
+                        self.ctx
+                            .plain_global_types
+                            .insert(name.clone(), (field_ty, expr.clone()));
+                        continue;
+                    }
                     let field_ty = ty.clone().unwrap_or(crate::ast::Type::int());
                     // 2026-08-07 (object instance pools): a top-level obj
                     // instance (`let st: Stack<Int, 256> = 0`) UNPACKS its

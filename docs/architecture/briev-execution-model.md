@@ -12,6 +12,13 @@ no node can fire, the program is at **equilibrium** (idle). When a
 precondition becomes true (hardware interrupt, sensor read, timer tick), the
 reactor fires that node.
 
+**Lifecycle laws (2026-10-15, SPEC §9.4.3).** Equilibrium is forever unless
+the program declares otherwise. `when G { endprogram; };` lowers to a
+reactor monitor (a synthesized `__briev_lifecycle_N` txn) that ends the
+process when `G` holds; `when G { reside; };` declares open-ended residency
+at compile time. A program with no reachable terminator and no reside law
+warns — stalling stays legal, the warning names the fix.
+
 ```
 ┌─────────────────────────────────────────────┐
 │  Reactor Loop                               │
@@ -121,6 +128,34 @@ node tick [count < total][count == total] {
 
 Without `term`, the reactor has no point at which to evaluate the goal.
 `term` is mandatory in looping bodies.
+
+> **2026-10-16 (term-semantics plan).** The checkpoint is P-gated in both
+> directions: postcondition MET ⇒ the firing stops here (the txn commits,
+> the node stops firing); postcondition UNMET ⇒ control CONTINUES past
+> the `term` into the rest of the body (the same convergence loop that a
+> body without `term` takes). Bare `term;` and value `term <e>;` are both
+> P-gated in txn/node bodies; in plain defns `term <e>;` is an
+> unconditional return and a final bare expression (a tail) is the
+> body's implicit value (SPEC §9.1). The reference interpreter implements
+> the identical rule (`interpreter::eval::pgated_term`); the backend's
+> P-gated emission landed with plan step 4, tails with step 5.
+
+> **2026-10-16 (cpp-vs-briev findings).** Multi-node handoff via a shared
+> phase field: the compiler's front door now settles every shape a
+> contributor hit in the LLVM-17 era. A `beginprogram` (or any convergent)
+> node whose goal the body does not counter-advance toward is rejected at
+> compile time with the fix in the message; a reactive cycle with no
+> completion in any postcondition is rejected as non-convergent ("state
+> the completion in the nodes' postconditions … or make the exit
+> condition explicit in a pre"). Plain convergent counter nodes hand off
+> correctly without any keyword. For per-tick parallel-LOOKING nodes the
+> classification demand (Rule 22) stands: mark the pair `async` (the
+> `benchmarks/nbody_newton_accel.bv` distinct-phase-gate pattern — also
+> the shape of `benchmarks/recommender.bv`) or `sync<g>`. The
+> `__wait_for_trigger__` runtime panic reported against the LLVM-17-era
+> compiler no longer reproduces; the liveness analysis rejects those
+> shapes before emission. Probe programs: `benchmarks/recommender_corpus/`
+> reconstruction notes and the 2026-10-16 results file.
 
 ### Postcondition semantics
 

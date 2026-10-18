@@ -99,8 +99,22 @@ impl LlvmBackend {
         is_decreasing: bool,
         bound_literal: Option<i64>,
         counter_var: Option<&str>,
+        watchdog: Option<&crate::ast::top::WatchdogSpec>,
     ) {
         let c0 = self.fun.txn_counter;
+        // 2026-10-17 (readiness gate 1): a watchdog `within N ms` deadline
+        // captures the loop-entry clock here (mirrors emit_countable_main's
+        // cm_start). The gate itself sits between the bound check and the
+        // body below.
+        let wd_start = watchdog
+            .filter(|w| w.deadline_ns.is_some())
+            .map(|_| {
+                let nsym = if self.ctx.defn_params.contains_key("rt_now_ns") { "rt_now_ns" } else { "__briev_now" };
+                let nst = if self.ctx.defn_takes_state(nsym) { "%state" } else { "" };
+                let s = self.fun.gen_reg();
+                writeln!(out, "  {} = call i64 @{}({})", s, nsym, nst).ok();
+                s
+            });
         let bound_reg = self.fun.next_reg_with_prefix("flb");
         self.emit_countable_load_bound(out, &bound_reg, total_idx, total_const_name, bound_literal, c0);
         let (init_name, _) = self.emit_state_load_i64_by_idx(out, "  ", counter_idx);
@@ -154,8 +168,33 @@ impl LlvmBackend {
             let cmp = self.narrow_counter_for_bound(out, "flc", &counter_ty, &counter_name);
             writeln!(out, "  {} = icmp slt i64 {}, {}", done_reg, cmp, bound_reg).ok();
         }
-        writeln!(out, "  br i1 {}, label %{}.body, label %{}", done_reg, label_prefix, exit_label).ok();
-        writeln!(out, "{}.body:", label_prefix).ok();
+        // 2026-10-17 (readiness gate 1): the watchdog liveness gate —
+        // previously this engine dropped the contract silently (BUGS.md).
+        // Continue while ?[cond] (+ cycles/deadline bounds) holds; on false
+        // fire the handler and exit. The gate's hold label IS the body label.
+        if let Some(wd) = watchdog {
+            writeln!(out, "  br i1 {}, label %{}.wd, label %{}", done_reg, label_prefix, exit_label).ok();
+            writeln!(out, "{}.wd:", label_prefix).ok();
+            self.fun.cur_block = Some(format!("{}.wd", label_prefix));
+            // 2026-10-17: the gate's condition reads the counter — resolve it
+            // to the LIVE PHI, not the stale %State slot (which is stored once,
+            // after the loop). Without this the gate compares 0 forever and
+            // never fires (the body's phi registration happens below).
+            if let Some(cv) = counter_var {
+                self.fun.phi_field_regs.insert(cv.to_string(), counter_name.clone());
+            }
+            let hold_body = format!("{}.body", label_prefix);
+            let g = crate::backend::llvm::WatchdogGateLabels {
+                counter_reg: Some(&counter_name),
+                start_reg: wd_start.as_deref(),
+                hold_label: &hold_body,
+                exit_label: &exit_label,
+            };
+            self.emit_watchdog_gate(out, "  ", wd, &g);
+        } else {
+            writeln!(out, "  br i1 {}, label %{}.body, label %{}", done_reg, label_prefix, exit_label).ok();
+            writeln!(out, "{}.body:", label_prefix).ok();
+        }
 
         // 2026-08-03 (loop-guard state-store fix): register the guard field →
         // counter phi so body reads of `count` resolve to the live phi value,
@@ -213,15 +252,16 @@ impl LlvmBackend {
         use_phi: bool,
         body: Option<&[Statement]>,
         counter_var: Option<&str>,
+        watchdog: Option<&crate::ast::top::WatchdogSpec>,
     ) {
         self.emit_main_header(out, "#0", true);
         self.emit_state_base(out);
         self.emit_inline_init_stores(out, "%state");
         self.emit_folded_loop(out, txn_name, counter_idx, total_idx, total_const_name,
-            ".fmain", use_phi, body, 1, false, bound_literal, counter_var);
+            ".fmain", use_phi, body, 1, false, bound_literal, counter_var, watchdog);
         // 2026-09-11 (buffered stdout): flush the stdlib buffer before main
         // returns — the tail bytes reach the fd. Gated: bare/no-stdlib
-        // programs have no __stdout_flush and get neither call nor declare.
+        // programs have no stdout_flush and get neither call nor declare.
         self.emit_stdout_flush_tail(out);
         writeln!(out, "  ret i32 0").ok();
         writeln!(out, "}}").ok();
@@ -375,7 +415,9 @@ impl LlvmBackend {
         let cm_start = if let Some(wd) = watchdog {
             if wd.deadline_ns.is_some() {
                 let s = self.fun.gen_reg();
-                writeln!(out, "  {} = call i64 @__briev_now(%state)", s).ok();
+                let nsym = if self.ctx.defn_params.contains_key("rt_now_ns") { "rt_now_ns" } else { "__briev_now" };
+                let nst = if self.ctx.defn_takes_state(nsym) { "%state" } else { "" };
+                writeln!(out, "  {} = call i64 @{}({})", s, nsym, nst).ok();
                 Some(s)
             } else {
                 None
@@ -471,7 +513,9 @@ impl LlvmBackend {
             if let Some(secs) = wd.deadline_ns {
                 if let Some(start) = &cm_start {
                     let now = self.fun.gen_reg();
-                    writeln!(out, "  {} = call i64 @__briev_now(%state)", now).ok();
+                    let nsym = if self.ctx.defn_params.contains_key("rt_now_ns") { "rt_now_ns" } else { "__briev_now" };
+                    let nst = if self.ctx.defn_takes_state(nsym) { "%state" } else { "" };
+                    writeln!(out, "  {} = call i64 @{}({})", now, nsym, nst).ok();
                     let el = self.fun.gen_reg();
                     writeln!(out, "  {} = sub i64 {}, {}", el, now, start).ok();
                     let db = self.fun.gen_reg();
@@ -496,7 +540,7 @@ impl LlvmBackend {
             } else if wd.is_required {
                 // 2026-09-10 (Family I): pure-Briev defn takes the hidden %state and
                 // returns i64 (defns cannot be void).
-                writeln!(out, "  call i64 @__watchdog_fail(ptr %state)").ok();
+                writeln!(out, "  call i64 @watchdog_fail(ptr %state)").ok();
             }
             writeln!(out, "  br label %{}", exit_label).ok();
         } else {
@@ -628,7 +672,7 @@ impl LlvmBackend {
         if is_main {
             // 2026-09-11 (buffered stdout): flush the stdlib buffer before main
         // returns — the tail bytes reach the fd. Gated: bare/no-stdlib
-        // programs have no __stdout_flush and get neither call nor declare.
+        // programs have no stdout_flush and get neither call nor declare.
         self.emit_stdout_flush_tail(out);
         writeln!(out, "  ret i32 0").ok();
             writeln!(out, "}}").ok();
@@ -643,7 +687,7 @@ impl LlvmBackend {
 
     // ── Garbage-scheduler free emission ───────────────────────────────
 
-    /// 2026-08-06 (Phase 9): emit `__briev_free` for each scheduled state
+    /// 2026-08-06 (Phase 9): emit `rt_free` for each scheduled state
     /// field whose reactor-ordered last consumer is the enclosing fold. The
     /// handle is the field's STORED value (the ptrtoint of the allocation),
     /// loaded from %State — re-evaluating the initializer would re-malloc.
@@ -654,7 +698,11 @@ impl LlvmBackend {
             let ptr = self.fun.gen_reg();
             writeln!(out, "  {} = inttoptr i64 {} to ptr", ptr, handle).ok();
             // 2026-09-10 (Family I): pure-Briev defn — hidden %state + i64 return.
-            writeln!(out, "  call i64 @__briev_free(ptr %state, ptr {})", ptr).ok();
+            // Symbol branches on the defn (prelude world: rt_free; bare unit:
+                // the C-fallback name, matching emit_toplevel's conditional
+                // declare); the call shape stays the proven stateful one.
+                let fsym = if self.ctx.defn_params.contains_key("rt_free") { "rt_free" } else { "__briev_free" };
+                writeln!(out, "  call i64 @{}(ptr %state, ptr {})", fsym, ptr).ok();
         }
     }
 
@@ -935,7 +983,7 @@ impl LlvmBackend {
         }
         // 2026-09-11 (buffered stdout): flush the stdlib buffer before main
         // returns — the tail bytes reach the fd. Gated: bare/no-stdlib
-        // programs have no __stdout_flush and get neither call nor declare.
+        // programs have no stdout_flush and get neither call nor declare.
         self.emit_stdout_flush_tail(out);
         writeln!(out, "  ret i32 0").ok();
 
@@ -1063,7 +1111,9 @@ impl LlvmBackend {
         let wd_start = if let Some(wd) = watchdog {
             if wd.deadline_ns.is_some() {
                 let s = self.fun.gen_reg();
-                writeln!(out, "  {} = call i64 @__briev_now(%state)", s).ok();
+                let nsym = if self.ctx.defn_params.contains_key("rt_now_ns") { "rt_now_ns" } else { "__briev_now" };
+                let nst = if self.ctx.defn_takes_state(nsym) { "%state" } else { "" };
+                writeln!(out, "  {} = call i64 @{}({})", s, nsym, nst).ok();
                 Some(s)
             } else {
                 None
@@ -1159,7 +1209,9 @@ impl LlvmBackend {
             if let Some(secs) = wd.deadline_ns {
                 if let Some(start) = &wd_start {
                     let now = self.fun.gen_reg();
-                    writeln!(out, "  {} = call i64 @__briev_now(%state)", now).ok();
+                    let nsym = if self.ctx.defn_params.contains_key("rt_now_ns") { "rt_now_ns" } else { "__briev_now" };
+                    let nst = if self.ctx.defn_takes_state(nsym) { "%state" } else { "" };
+                    writeln!(out, "  {} = call i64 @{}({})", now, nsym, nst).ok();
                     let el = self.fun.gen_reg();
                     writeln!(out, "  {} = sub i64 {}, {}", el, now, start).ok();
                     let db = self.fun.gen_reg();
@@ -1183,8 +1235,10 @@ impl LlvmBackend {
                 };
                 self.emit_user_call(out, &call_reg, &on_fire.handler, &args, "  ");
             } else if wd.is_required {
-                // Required watchdog with no handler: error exit.
-                writeln!(out, "  call void @__watchdog_fail()").ok();
+                // Required watchdog with no handler: error exit (the Briev
+                    // watchdog_fail defn — i64, stateful; core-usable purge fixed
+                    // the old void @__watchdog_fail shape here).
+                writeln!(out, "  call i64 @watchdog_fail(ptr %state)").ok();
             }
             writeln!(out, "  br label %.cde_{}", c0).ok();
         } else {
@@ -1373,12 +1427,12 @@ impl LlvmBackend {
         // loop completes (a per-iteration free would be a use-after-free). The
         // handle is the field's STORED value (the ptrtoint of the allocation),
         // loaded from %State — re-evaluating the initializer would re-malloc.
-        // Routed through __briev_free so the benchmark can assert frees ==
+        // Routed through rt_free so the benchmark can assert frees ==
         // allocs (no leak).
         self.emit_scheduled_frees(out, free_after);
         // 2026-09-11 (buffered stdout): flush the stdlib buffer before main
         // returns — the tail bytes reach the fd. Gated: bare/no-stdlib
-        // programs have no __stdout_flush and get neither call nor declare.
+        // programs have no stdout_flush and get neither call nor declare.
         self.emit_stdout_flush_tail(out);
         writeln!(out, "  ret i32 0").ok();
         writeln!(out, "}}").ok();
@@ -1441,6 +1495,8 @@ impl LlvmBackend {
         is_decreasing: bool,
         counter_var: Option<&str>,
         free_after: &[String],
+        node_name: &str,
+        watchdog: Option<&crate::ast::top::WatchdogSpec>,
     ) -> bool {
         use crate::analysis::node_decompose::{PredicateClass, Segment, split_into_segments};
         // 2026-08-23 (vd-phi repro fix): a body that ENDS THE PROGRAM mid-loop
@@ -1480,7 +1536,7 @@ impl LlvmBackend {
         }
         let wrote = self.emit_version_dag_main_inner(
             out, counter_idx, total_idx, total_const_name, bound_literal,
-            body, write_set, is_decreasing, counter_var, free_after,
+            body, write_set, is_decreasing, counter_var, free_after, node_name, watchdog,
         );
         self.fun.defer_struct_allocas = false;
         wrote
@@ -1499,6 +1555,8 @@ impl LlvmBackend {
         is_decreasing: bool,
         counter_var: Option<&str>,
         free_after: &[String],
+        node_name: &str,
+        watchdog: Option<&crate::ast::top::WatchdogSpec>,
     ) -> bool {
         use crate::analysis::node_decompose::{PredicateClass, Segment, split_into_segments};
         let segments = split_into_segments(body);
@@ -1677,10 +1735,32 @@ impl LlvmBackend {
         } else {
             writeln!(out, "  {} = icmp slt i64 {}, {}", done_h, cmp_counter_h, bound_reg).ok();
         }
-        writeln!(out, "  br i1 {}, label %{}, label %{}", done_h, absent_label, end_label).ok();
-
-        // ── Guard-absent body: [pre], predicate check ───────────────
-        writeln!(out, "{}:", absent_label).ok();
+        // 2026-10-17 (readiness gate 1): the watchdog liveness gate — this
+        // engine previously dropped the contract silently (BUGS.md). The
+        // gate's hold label IS the absent (pre) block label (the helper emits
+        // it; the no-watchdog branch emits it below). `within` bounds are
+        // refused: they need a counter-fold dispatch's counter/clock.
+        if let Some(wd) = watchdog {
+            if wd.cycles_bound.is_some() || wd.deadline_ns.is_some() {
+                eprintln!(
+                    "error: node '{}' declares a watchdog with `within` bounds, but its dispatch is the version-DAG fold — bounds need a counter-fold dispatch (a bounded counter with increments). Give the node a bounded counter or drop the bounds.",
+                    node_name
+                );
+                std::process::exit(1);
+            }
+            let hold_absent = absent_label.clone();
+            let g = crate::backend::llvm::WatchdogGateLabels {
+                counter_reg: None,
+                start_reg: None,
+                hold_label: &hold_absent,
+                exit_label: &end_label,
+            };
+            self.emit_watchdog_gate(out, "  ", wd, &g);
+        } else {
+            writeln!(out, "  br i1 {}, label %{}, label %{}", done_h, absent_label, end_label).ok();
+            // ── Guard-absent body: [pre], predicate check ───────────────
+            writeln!(out, "{}:", absent_label).ok();
+        }
         self.fun.pending_phi_backedge.clear();
         for fname in &sorted_fields {
             let init_val = self.fun.phi_field_regs.get(fname.as_str())
@@ -1806,7 +1886,7 @@ impl LlvmBackend {
         self.emit_scheduled_frees(out, free_after);
         // 2026-09-11 (buffered stdout): flush the stdlib buffer before main
         // returns — the tail bytes reach the fd. Gated: bare/no-stdlib
-        // programs have no __stdout_flush and get neither call nor declare.
+        // programs have no stdout_flush and get neither call nor declare.
         self.emit_stdout_flush_tail(out);
         writeln!(out, "  ret i32 0").ok();
         writeln!(out, "}}").ok();
@@ -2145,7 +2225,7 @@ impl LlvmBackend {
                         _ => {}
                     }
                 }
-                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => {
+                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => {
                     let val = self.emit_expr(out, e, "  ");
                     let name = format!("%t{}", self.fun.txn_counter);
                     self.fun.txn_counter += 1;
@@ -2322,7 +2402,7 @@ impl LlvmBackend {
                     self.emit_expr(out, e, indent);
                 }
             }
-            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => {
+            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => {
                 self.emit_expr(out, e, indent);
             }
             Statement::ArrowAssign { .. } => {
@@ -2375,7 +2455,7 @@ impl LlvmBackend {
             Statement::Guarded(cond, body) => {
                 self.emit_guard_block(out, stmt, indent);
             }
-            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => {
+            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => {
                 self.emit_expr(out, e, indent);
             }
             Statement::Assign(lhs, expr) => {
@@ -2425,7 +2505,7 @@ fn collect_hoist_identifiers_stmt(
     out: &mut std::collections::HashSet<String>,
 ) {
     match s {
-        Statement::Expression(e) | Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) => {
+        Statement::Expression(e) | Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) | Statement::Tail(e) => {
             collect_hoist_identifiers(e, fields, constants, out);
         }
         Statement::Let { expr: Some(e), .. } => {
@@ -2484,7 +2564,17 @@ impl LlvmBackend {
     /// must flush the buffered stdout lane at its host exit.
     pub(crate) fn emit_stdout_flush_tail(&mut self, out: &mut String) {
         if self.has_stdout_flush {
-            writeln!(out, "  %__flush = call i64 @__stdout_flush(ptr %state)").ok();
+            // 2026-10-17 (plain storage): the flush's signature follows its
+            // needs-state verdict — stdout_buf/stdout_fill are plain, so the
+            // chain (flush included) is stateless. A hardcoded `ptr %state`
+            // here emitted a call whose signature MISMATCHED the stateless
+            // definition (invalid IR the linker tolerated as UB).
+            let st = if self.ctx.defn_takes_state("stdout_flush") {
+                "ptr %state"
+            } else {
+                ""
+            };
+            writeln!(out, "  %__flush = call i64 @stdout_flush({})", st).ok();
         }
     }
 }

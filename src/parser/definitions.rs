@@ -848,6 +848,13 @@ impl<'a> Parser<'a> {
                     let line_start = self.source[..span_start.min(self.source.len())]
                         .rfind("\n").map(|p| p + 1).unwrap_or(0);
                     if span_start - line_start == 0 {
+                        // 2026-10-16 (stability S2): consume the boundary brace
+                        // (plus its trailing semicolons) — breaking ON it left
+                        // the leftover `}` for the top-level parser, which
+                        // reported a bogus "expected identifier, found '}'"
+                        // cascade after every real error.
+                        self.advance();
+                        while self.eat(&Token::Semicolon) {}
                         break;
                     }
                 }
@@ -1011,8 +1018,11 @@ impl<'a> Parser<'a> {
         // type (see parse_output_and_contract).
         let (output_type, contract) = self.parse_output_and_contract()?;
         // 2026-07-28: Body is optional — `defn f(x) -> T := { ... }` has no { body }.
+        // 2026-10-16 (tails plan §2): the body parses via parse_tail_body — a
+        // final bare expression (no `;`) is the body's implicit value
+        // (Statement::Tail), an unconditional return.
         let body = if self.check(&Token::LBrace) {
-            self.parse_block()?
+            self.parse_tail_body()?
         } else {
             Vec::new()
         };
@@ -1448,6 +1458,17 @@ impl<'a> Parser<'a> {
     fn starts_modifier_run(&self) -> bool {
         match self.peek() {
             Some(t) if Self::is_modifier_token(t) || Self::is_net_modifier(t) => true,
+            // 2026-10-17 (plain storage): `state let` / `plain let` — the
+            // storage-class assertions open a modifier run.
+            Some(Token::Identifier(s))
+                if (s == "state" || s == "plain")
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|(t, _)| t),
+                        Some(Token::Let)
+                    ) =>
+            {
+                true
+            }
             Some(Token::Identifier(s))
                 if s == "stage"
                     || s == "tile"
@@ -1489,12 +1510,14 @@ impl<'a> Parser<'a> {
             Some(Token::Node) => {
                 self.reject_memory_pins(&prefix, "a node has no memory pin")?;
                 self.reject_net_names(&prefix, "a node")?;
+                self.reject_storage_assertions(&prefix, "a node")?;
                 let txn = self.parse_node()?;
                 self.finish_reactive(txn, prefix)
             }
             Some(Token::Txn) => {
                 self.reject_memory_pins(&prefix, "a txn has no memory pin")?;
                 self.reject_net_names(&prefix, "a txn")?;
+                self.reject_storage_assertions(&prefix, "a txn")?;
                 let txn = self.parse_transaction(false, prefix.is_async)?;
                 self.finish_reactive(txn, prefix)
             }
@@ -1532,6 +1555,7 @@ impl<'a> Parser<'a> {
                 }
                 self.reject_net_names(&prefix, "a defn")?;
                 self.reject_shape_modifiers(&prefix, "a defn")?;
+                self.reject_storage_assertions(&prefix, "a defn")?;
                 let mut defn = self.parse_definition()?;
                 defn.modifiers.extend(prefix.annotations);
                 Ok(TopLevel::Definition(defn))
@@ -1582,6 +1606,26 @@ impl<'a> Parser<'a> {
             matches!(a.name.as_str(), "vol" | "mem" | "reg")
         }) {
             self.error_at_current(&format!("'vol'/'mem'/'reg' apply to `let` only — {why}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 2026-10-17 (plain storage): `state`/`plain` are top-level-let
+    /// storage-class assertions — reject them on a node/txn/defn.
+    fn reject_storage_assertions(
+        &self,
+        prefix: &ModifierPrefix,
+        why: &str,
+    ) -> Result<(), SyntaxError> {
+        if prefix
+            .annotations
+            .iter()
+            .any(|a| matches!(a.name.as_str(), "state" | "plain"))
+        {
+            self.error_at_current(&format!(
+                "'state'/'plain' apply to a top-level `let` only — {why}"
+            ))
         } else {
             Ok(())
         }
@@ -2326,14 +2370,33 @@ impl<'a> Parser<'a> {
     /// static when law. Parses the same shape as a guarded statement but
     /// yields a TopLevel so the analysis treats it as a forced fact, not
     /// reactive behavior.
+    /// 2026-10-15 (lifecycle laws, plan
+    /// docs/plans/2026-10-15-lifecycle-laws-termination-warning.md): a
+    /// lifecycle arm — `when G { endprogram; }` or `when G { reside; }` —
+    /// replaces facts. `reside;` parses as a bare identifier expression (no
+    /// new grammar); the arm is stripped out of `facts` so the fact-law
+    /// consumers see an empty list. A lifecycle law carries EXACTLY ONE arm
+    /// — anything else is a fact law (unchanged path).
     fn parse_top_level_when_law(&mut self) -> Result<TopLevel, SyntaxError> {
         self.pos += 1; // consume 'when'
         let guard = self.parse_expression()?;
-        let facts = self.parse_block()?;
+        let mut facts = self.parse_block()?;
         self.eat(&Token::Semicolon);
+        let lifecycle = match facts.as_slice() {
+            [Statement::EndProgram(None)] => {
+                facts.clear();
+                Some(crate::ast::top::LifeCycleArm::EndProgram)
+            }
+            [Statement::Expression(Expr::Identifier(id))] if id == "reside" => {
+                facts.clear();
+                Some(crate::ast::top::LifeCycleArm::Reside)
+            }
+            _ => None,
+        };
         Ok(TopLevel::WhenLaw(crate::ast::top::WhenLawDecl {
             guard,
             facts,
+            lifecycle,
             span: None,
         }))
     }
@@ -2421,9 +2484,12 @@ impl<'a> Parser<'a> {
         let guard = self.parse_expression()?;
         let facts = self.parse_block()?;
         self.eat(&Token::Semicolon);
+        // Type-body laws are FACT laws only — lifecycle arms are a
+        // top-level construct (residency/termination are program-scoped).
         Ok(crate::ast::top::WhenLawDecl {
             guard,
             facts,
+            lifecycle: None,
             span: None,
         })
     }
@@ -6897,6 +6963,57 @@ mod tests {
             crate::ast::TopLevel::Transaction(t) => Ok(t),
             other => panic!("expected Transaction, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    // ── 2026-10-16 (tails plan §2): defn-body tails ──────────────────────
+
+    /// A defn body's final bare expression (no `;`) parses as Statement::Tail.
+    #[test]
+    fn defn_body_final_bare_expr_is_tail() {
+        let d = parse_defn("defn f(x: Int) -> Int { x * 2 }").expect("parse");
+        let last = d.body.last().expect("body");
+        match last {
+            crate::ast::Statement::Tail(e) => {
+                assert!(matches!(e, crate::ast::Expr::BinaryOp(..)), "{e:?}");
+            }
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    /// A defn body with semicolons only parses as today (no Tail).
+    #[test]
+    fn defn_body_semicolon_statements_unchanged() {
+        let d = parse_defn("defn f(x: Int) -> Int { term x * 2; }").expect("parse");
+        assert!(matches!(
+            d.body.last(),
+            Some(crate::ast::Statement::Term(Some(_)))
+        ));
+    }
+
+    /// A mid-body missing `;` stays a syntax error (the honest one).
+    #[test]
+    fn defn_body_mid_missing_semicolon_is_error() {
+        let r = parse_defn("defn f(x: Int) -> Int { let y: Int = x + 1 term x; }");
+        assert!(r.is_err(), "mid-body missing `;` must not parse as a tail");
+    }
+
+    /// `when` bodies are execution blocks — no tails (missing `;` errors).
+    #[test]
+    fn when_body_has_no_tail() {
+        let r = parse_defn("defn f() -> Void { when true { Print#(1) }; }");
+        assert!(r.is_err(), "a when body is not a tail position");
+    }
+
+    /// A tail can be a match expression (the json-shaped body).
+    #[test]
+    fn defn_body_match_tail_parses() {
+        let d = parse_defn("defn f(x: Int) -> Int { match x { 0 => 1, _ => 2 } }")
+            .expect("parse");
+        assert!(
+            matches!(d.body.last(), Some(crate::ast::Statement::Tail(crate::ast::Expr::Match(..)))),
+            "{:?}",
+            d.body.last()
+        );
     }
 
     fn is_single(out: &Option<crate::ast::OutputType>) -> bool {

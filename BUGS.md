@@ -33,6 +33,114 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## compare_baseline.sh compared against stale binaries — FIXED 2026-10-17
+
+**Symptom:** three sweep A/B "regressions" (queue_drain 2.51x,
+float_math_nonzero 1.30x, interval_step 1.11x vs the baseline worktree)
+that (a) contradicted the harness's own suite numbers and (b) vanished
+when re-measured. Root cause: `compare_baseline.sh` rebuilt the baseline
+binary only `if [ ! -f ... ]`, so the baseline worktree's binaries were
+left from whatever compiler had last built them — queue_drain's binary
+was from **August 16** and float_math_nonzero/interval_step's from
+**September 7**, while the checked-out baseline commit was `13ee67fa`
+(September 30). The A/B silently compared against compilers *older than
+the baseline itself*.
+
+**Fix:** the script now rebuilds BOTH binaries on every invocation — an
+A/B verdict is only as good as the provenance of both binaries, and a
+release build of one benchmark is cheap.
+
+**Lesson:** any harness that caches compiled artifacts across compiler
+versions must key the cache on the compiler identity (or rebuild); an
+mtime alone can silently invalidate days of ratio conclusions. Full
+triage context: `docs/2026-10-17-dispatch-regression-report.md` §7.
+
+## Dead callable txn knocked single-node programs off the watchdog fold — FIXED 2026-10-17
+
+**Symptom:** `benchmarks/series_converge` printed `""` (C reference
+`0.500050008`) — MISMATCH in every results file since 2026-10-13; last
+MATCH 2026-09-30. Bisect (deterministic IR-property gate:
+`txn 'converge' dispatched via per-field phi` present/absent) pinned the
+first bad commit to `eae6ab66` (2026-10-06, "List + List elaborates to
+iter_chain; arrow push").
+
+**Root cause:** `eae6ab66` added `Import$("std/iterator.bv")` to the
+native prelude. `txn iter_take_loop<T>(...)` is **callable** (`txn` is
+always non-reactive — the remnant keyword for what nodes became) and dead
+(never referenced, not emitted), but it enters the transition graph and
+the backend `txns` list (both carry callables by design — the frontend
+consumers filter). The backend dispatch gates re-derived counts WITHOUT
+the reactive filter: `foldable` (`graph.nodes.len() == 1 &&
+txns.len() == 1`) saw 2, went false, and dispatch fell to the direct-SSA
+loop — which never emits the contract watchdog. The watchdog
+`?[(x - last)^2 > eps] -> print_best(x)` (and any `-> action`) is emitted
+only by the counter engine, so the print went silent.
+
+**Fix (reactive-only dispatch):** every dispatch gate and diagnostic now
+counts REACTIVE txns/nodes only — `foldable`, the enum legacy single-txn
+params, the A003/dead-fields diagnostics (which also stopped printing the
+false `info: txn 'iter_take_loop' folded to O(1)` line), the
+`multi_foldable` async set (callables neither join nor veto), and
+`internal_fold_info` (reactive-count early-out; eligibility proof skips
+non-reactive others — a callable's precondition speaks of its parameters
+at call time, unaffected by folding). The B4 never-dispatched warning
+moved ahead of dispatch-mode selection so the folded and precomputed
+modes fire it too — the test pinning it had passed for the wrong reason
+(its dead callable broke the raw-count gate, shunting the program into
+`!folded`).
+
+**Verified:** new regression test
+`dead_callable_txn_does_not_break_single_node_fold` (node + dead generic
+callable txn → per-field-phi dispatch, `.cmwd_` check, on-fire call);
+`series_converge` output `0.500050008` MATCH; full `cargo test --lib`
+3154/0.
+
+**Known gap — CLOSED 2026-10-17 (readiness gate 1):** watchdog emission
+existed ONLY on the counter-engine paths; InlineSsa, version-DAG, the
+direct-SSA loop, the async-body phase, and the reactor tick silently
+dropped the `?[...] -> action` contract. Closed honor-or-refuse
+(docs/plans/2026-10-17-readiness-gates.md): the shared
+`emit_watchdog_gate` now honors the gate in InlineSsa, version-DAG, the
+direct-SSA loop, AND the async-body phase (Family-H sequential — the
+fire halts the main convergence loop); the reactor tick REFUSES with a
+diagnostic (its fire must latch the node off across ticks — machinery
+the tick does not have). `within N cycles` bounds are refused on
+non-counter dispatches (naming the node and the fix); `within N ms`
+deadlines are honored everywhere via a phase-entry clock. Behavioral
+tests per engine: `watchdog_fires_on_{direct_ssa,inline_ssa,version_dag}_dispatch`.
+
+
+## Two latent IR bugs in event/watchdog emission — FIXED 2026-10-15
+
+**Symptom (latent — no committed test exercised the paths):**
+1. The strict-event trap call (`emit_expr.rs`, two sites) emitted a
+   stateless `call i64 @__briev_event_strict_trap()` even though the
+   `event_strict_trap` defn is transitively stateful (its body calls
+   `write_all` → `stdout_byte` → stdout state fields). The call could
+   never resolve to the defn's symbol, and no C fallback exists for it.
+2. The second scheduler engine's watchdog emission (`counter.rs`) wrote a
+   void no-state `call void @__watchdog_fail()` while the first engine
+   correctly wrote `call i64 @watchdog_fail(ptr %state)`. No C
+   `__watchdog_fail` exists either, so any program that reached the
+   second engine's required-watchdog path produced an unresolvable
+   `void @__watchdog_fail()` call.
+
+**Root cause:** both sites predate the stateless-defn fixpoint
+(`export_abi::compute_defn_needs_state`); the trap call predates the
+defn-takes-state gate entirely, and the second engine's watchdog shape
+was hand-copied from the C-fallback era.
+
+**Fix (family-4 core-usable rename, same commit):** the trap call is now
+emitted by `emit_event_trap_call`, which passes `%state` when
+`defn_takes_state("event_strict_trap")` is true. The second engine's
+watchdog writes the same shape as the first (`call i64 @watchdog_fail(ptr
+%state)`).
+
+**Verified:** full `cargo test --lib` (3086/0); the event/watchdog link
+tests continue to pass. No committed benchmark or test previously
+exercised either path (they were latent; the fixes keep every green
+assertion green).
+
 ## Trait-constrained generics returned Int instead of the trait type — FIXED 2026-10-13
 
 **Symptom:** a trait method called on a bound type param inside a generic body
@@ -9564,3 +9672,321 @@ state-taking. `or_insert` preserves the "a real top-level defn of this name wins
 precedence. Gates A–E green (probe_sink_generic→2, probe_sink_nodefault→2,
 probe_trait_3→10; 4 regression tests in export_abi::tests). Branch:
 fix/trait-default-needs-state.
+
+## Monomorphized trait member's type-dependent statefulness lost — FIXED 2026-10-15
+
+A trait default/generic monomorphized onto a concrete type whose members are
+STATEFUL was emitted stateless, so its body's call to a genuinely state-taking
+helper referenced an undefined `%state`: `.ll: use of undefined value '%state'`
+on `call i64 @grow_to_fit(ptr %state, ...)` inside a stateless-emitted
+`put_cstr$GrowBuf` / `write_tagged$GrowBuf`.
+
+DISCRIMINATOR (type-dependent): the SAME trait default is stateless on one impl
+and stateful on another. `put_cstr$ByteBuf` is genuinely stateless (ByteBuf's
+put_u8/put_bytes do Store#/Copy# only); `put_cstr$GrowBuf` is stateful (GrowBuf's
+put_u8/put_bytes call free-standing `grow_to_fit` → `Malloc#`). One type-agnostic
+verdict cannot be correct for both.
+
+ROOT CAUSE (two compounding gaps, src/analysis/export_abi.rs + emit_expr.rs):
+1. `index_program` had NO arm for `TopLevel::TypeDef`/`TopLevel::Impl`, so obj
+   members were NEVER nodes in the needs-state fixpoint. A trait default calling
+   a required method by bare name (`put_cstr` → `put_bytes`) saw `put_bytes` as
+   an unknown external/frgn call → stateless. The member → member → `Malloc#`
+   path was invisible.
+2. The monomorphization site (emit_expr.rs, `try_emit_monomorphized_generic_call`)
+   set the mangled copy's needs_state by COPYING the base (type-agnostic) bare-name
+   verdict (`defn_needs_state.get(name)`), with no per-instantiation recomputation.
+   Even with members indexed, a single bare-name verdict could not differ per
+   concrete `Self`.
+
+FIX 2026-10-15:
+- export_abi.rs: index obj/impl members under TYPE-QUALIFIED keys
+  (`type_member_key` → `GrowBuf::put_bytes`), so `ByteBuf::put_bytes` (stateless)
+  and `GrowBuf::put_bytes` (stateful via grow_it→Malloc#) are DISTINCT fixpoint
+  nodes — no bare-name collision. New `type_stateful_members(items)` derives, from
+  the same least-fixpoint, the set of concrete types with ≥1 state-taking member.
+- backend: thread `type_stateful_members` onto the codegen ctx (populated beside
+  compute_defn_needs_state in mod.rs). At the specialization site, the mangled
+  copy's verdict is `base_needs || any concrete binding ∈ type_stateful_members`.
+  So `put_cstr$GrowBuf`/`write_pair$Growing` take `%state`; `put_cstr$ByteBuf`
+  stays stateless. Over-approximation (a threaded-but-unused `%state` on a
+  specialization that doesn't call the stateful member) is sound and harmless —
+  the pass's standing conservative-keeping stance; the ALT of walking each
+  specialized body to resolve exact member calls was rejected as more fragile for
+  no observable gain.
+
+VERIFIED: self-contained probe (generic write_pair<S: Sink> over a Growing whose
+put_one reaches Malloc#) builds + runs (prints 9) where it previously failed the
+`%state` IR check. Regression tests in export_abi::tests:
+obj_member_reaching_stateful_intrinsic_is_indexed_stateful +
+type_stateful_members_reports_only_types_with_a_stateful_member. cargo test --lib
+green. Branch: fix/needs-state-type-dependent-members. NOTE: the two-same-named-
+members variant additionally needs the liveness member-collision fix
+(fix/liveness-member-name-collision) so the free-standing helper is not judged
+dead; the two fixes are independent and compose.
+
+## Same-named obj members collided in defn-liveness → free-standing helper judged dead — FIXED 2026-10-15
+
+A free-standing defn called ONLY from an obj member body is wrongly judged dead
+when ANOTHER obj declares a same-named member first, so the IR-scan soundness net
+panics at emission: `defn liveness: emitted code calls unreached defn(s)
+["grow_to_fit"]` (mod.rs:5574).
+
+DISCRIMINATOR (controlled A/B, proves it is the collision, not the member path):
+a SINGLE obj whose member calls a free-standing helper builds + runs fine (prints
+7). Adding a SECOND obj with a same-named member declared BEFORE it — whose body
+does NOT call the helper — makes the helper be judged dead and the build panic.
+Only the same-name collision triggers it.
+
+ROOT CAUSE: src/analysis/defn_liveness.rs — `index_defn`/`index_txn` key obj
+MEMBER bodies by BARE name with `or_insert`/`insert` (first/last-wins). Obj
+members share a name across objs BY DESIGN (a trait requirement like `put_u8` is
+provided by both `ByteBuf` and `GrowBuf`). So `defns["put_u8"]` retained only ONE
+body. When construction rooted the OTHER obj's `put_u8`, the worklist walked the
+wrong obj's body (`ByteBuf.put_u8`, which calls nothing), missed the call edge
+into `grow_to_fit`, and judged it dead. The emitted (inlined) `GrowBuf.put_u8`
+DOES call `grow_to_fit`, so the post-emission IR scan caught the drop.
+
+REPRO (minimal, confirmed): two objs Alpha then Beta each with a `bump` member
+under one trait; Alpha.bump calls nothing, Beta.bump calls free-standing
+`helper`; construct+use only Beta → panic `unreached defn [helper]`. The real
+trigger was Design D's bytes.bv: ByteBuf.put_u8/put_bytes (no free calls) are
+declared before GrowBuf.put_u8/put_bytes (call grow_to_fit).
+
+FIX 2026-10-15: added a collision-safe multimap `member_bodies: HashMap<String,
+Vec<(&[Statement], &Contract)>>` that keeps EVERY member body+contract under its
+bare name (populated by `index_member_body` from `index_typedef` and the
+`TopLevel::Obj` arm). The worklist closure walks ALL member bodies+contracts
+registered under a live name, in addition to the single `defns`/`txns`/`contracts`
+entry — so no obj's member call edges are lost. Over-approximation (walking a
+member body for an unconstructed obj) only keeps a few extra helpers live, which
+is the pass's deliberate, documented coarse-sound stance. Top-level last-wins
+semantics and the construction-rooting path are untouched. Regression tests:
+`same_named_member_bodies_all_contribute_call_edges` (the bug) +
+`single_member_body_edge_is_followed` (the control) in defn_liveness::tests.
+Branch: fix/liveness-member-name-collision.
+
+## Callable-txn gate read undeclared `@term` and never monomorphized generic contract calls — FIXED 2026-10-15
+
+`dir_loop` (lib/std/os/dir.bv) was the first callable TXN with a
+generic-Result contract (`[is_ok(term) || is_err(term)] ->
+Result<List<String>, Int>`) to reach emission; export defns never emit
+convergence gates, so nothing had exercised the shape before. Two stacked
+defects, both fixed:
+
+1. **Gate `term` binding**: the postcondition's `term` identifier fell to
+   the global-identifier fallback — `load i64, ptr @term` — a global that
+   was never declared or written anywhere (`term <val>` stores to the
+   `%result` slot). Fix: the gate binds `term` to `%result` in
+   `let_bindings` (registered in `let_binding_allocas` so the read loads),
+   typed with the txn's DECLARED return type
+   (emit_toplevel.rs, "gate term binding"). The declared type is what
+   drives monomorphization unification.
+2. **Import-contract closure**: `referenced_function_names` /
+   `referenced_state_names` walked only defn/txn BODIES — contract calls
+   were invisible to the transitive import closure, so result.bv's
+   generics (`is_ok`, `is_err`) never spliced and the gate emitted bare
+   i64 calls to never-defined generics (`use of undefined value '@is_err'`).
+   Fix: both walkers also traverse `contract.pre_condition`,
+   `contract.post_condition`, and `contract.watchdog.condition`
+   (import_resolver.rs, "contract closure").
+
+With both fixes the gate emits `call i8 @is_ok$List$String$Int(i64 %t…)`
+against a defined monomorphized copy. Behavioral pin:
+`tests/dir_smoke.rs` (build + link + run + golden). Also en route: the
+bool-width hardening (`coerce_to_i8_bool`) is what kept this gate's
+disjunction valid once the call results were i64-typed during the broken
+intermediate states — `or i8` under a bool label throughout.
+
+## Interpreter/backend divergence: bare `term;` in a void-defn guard — RESOLVED 2026-10-16 (plan `2026-10-16-term-semantics-and-tails.md`)
+
+The backend lowered `when cond { term; };` in a void defn as an
+early-return (guard inversion: `icmp slt` + body under `guard.then`);
+the interpreter treated `Term(None)` as a convergence checkpoint and
+CONTINUED past the guard (eval.rs:2447). print_all-style recursion on a
+List was the repro shape: backend listed exactly Count#() entries; the
+interpreter read out of bounds past the guard.
+
+**Resolution (rested decision, plan §1):** bare `term;` is P-gated
+everywhere — the postcondition is evaluated AT the term site: met →
+return, unmet → continue. The interpreter lowers each bare term into
+`when P { term <void>; }` once at FunctionDef registration
+(`lower_bare_terms`, eval.rs) and splits dispatch by `FnKind` (a defn is
+linear; a txn converges). The backend's early-return becomes correct
+under the rule; its next step is the explicit cond-P emission (plan step
+4). Behavioural pins: `interpreter::eval::pgated_term` — both divergence
+directions (met → tail never runs; unmet → tail runs) plus the txn
+livelock shape (bare term + unmet post used to loop forever). The
+dir_smoke print_all flip to the tail idiom lands with plan step 5.
+
+## LESSON (testing discipline): probe crashes against inconsistent intermediate binaries — OBSERVED 2026-10-15
+
+The dir.bv E2E "segfault" consumed an hour of investigation that was
+unmoored from reality: probe runs executed `target/release/brievc` while
+`cargo build --release` had FAILED (E0382) or had not been rerun after
+edits — several "reproductions" ran binaries built from source states
+that never coexisted. The md5-stability check (3 identical runs) verified
+within-binary determinism but not WHICH binary. Rule: before chasing a
+runtime misbehavior, confirm the binary is fresher than every source file
+involved (`ls -la target/release/brievc` vs `git status --short`), and
+rebuild after ANY failed build before running probes. The genuine defects
+behind the noise were the gate/mono bugs above; the bare-term guard
+works end to end on the complete build.
+
+## Reassigned-let alloca demoted into guard block in the reactive `@txn_<name>` emitters — FIXED 2026-10-16 (plan `2026-10-16-cpp-vs-briev-contributor-findings.md`, flaw 4)
+
+The 2026-08-04 reassigned-let entry-alloca pre-declaration (emit_definition)
+and its 2026-10-14 SSA-main cross-txn aggregation (BUGS.md 9303) covered two
+of the four body-emission paths. The reactive per-node emitters were missed:
+`@txn_<name>` (standard + `assume_shape`, emit_toplevel.rs) and
+`@async_body_<name>` (emit_async_body) demoted a `let b = 0;` +
+`when c { b = …; }` alloca into `guard.thenN` while the post-guard reads
+landed in `guard.endN` — "Instruction does not dominate all uses!", clang
+rejects the module at every -O level. Every program in Otto Westerlund's
+cpp-vs-briev recommender (github.com/odecode/cpp-vs-briev) hit it; his
+binaries predate the regression window (built from an earlier clone).
+
+**Resolution:** `predeclare_reassigned_lets(out, body)` helper (emit_toplevel.rs)
+called from all four paths after `clear_locals()` — the defn path migrated to
+it (DRY), the three reactive emitters newly call it; the cold-guard outliner
+clears `reassigned_lets` first to keep its param-binding behavior
+byte-identical. All four .ll outputs verify clean (giant single-node,
+7-node async, beginprogram probe). Behavioral pins: `backend::tests` —
+reassigned let across a guard in a reactive txn emits an entry alloca and
+the module verifies (added with this fix); giantnode/multinode compile
+at -O0/-O1/-O2/-O3 on clang 23 and produce identical outputs.
+
+## Candidate diagnostics from the cpp-vs-briev analysis — NOTED 2026-10-16, for review (no action taken)
+
+Recorded during P0 for possible future error/warning assignment; nothing
+implemented. The first one bit this session's own reconstruction:
+
+1. **Provable self-assignment / effectless reassignment** — `tr` bound from
+   `t1r`, then `t1r = tr;` two statements later (swap-typo shape,
+   `recommender_giantnode.bv`): accepted silently, corrupted the top-5
+   swap (`t2r` never restored). Candidate: purity-probe-style WARNING
+   (warn-the-default per keyword-taxonomy) — "assignment provably has no
+   effect; RHS is LHS's own value with no intervening write". Error is
+   too strong: effectless in isolation, bug only vs intent.
+2. **Unchecked `SysCall#` results** — `open(2)`/`read(2)` return codes
+   discarded everywhere in the corpus (`fd` used while `-1` on a missing
+   file → silent nonsense downstream). Candidate: warning on a syscall
+   result consumed without an error check, or stdlib `open_or_die!`-style
+   wrapper (stdlib-first per Rule 14).
+3. **Loop continues past its provable goal** — the sim-line scanner keeps
+   byte-scanning ~2M iterations after `line == QUERY_USER` is reached
+   (`foreach scan in 0..size` with a `when line < QUERY_USER` body).
+   Candidate: info/warning — "loop bound continues N iterations after its
+   postcondition goal is provably met" (the frontend already proves the
+   goal; it just doesn't report the waste).
+4. **`0..size + 1` parses as `(0..size) + 1`** — type error correctly
+   fires, but its advice ("add an explicit `as` cast") cannot help a
+   range; suggest parenthesizing the range end instead (diagnostic-quality
+   note, no new check needed).
+
+## LLVM 17 greedy register allocator segfault on whole-program-inlined reactive txn — DEFECT (upstream, version-bounded), LEDGER ENTRY 2026-10-16
+
+**Classification: backend defect, NOT a language/compiler limit.** LLVM 17's
+`RegAllocBase::allocatePhysRegs` segfaults when a single function concentrates
+the whole program (the pre-P2 emission inlined every acyclic node body into
+the dispatch loop; Otto Westerlund's single-node recommender,
+github.com/odecode/cpp-vs-briev, was the reported instance). Not present on
+clang 23.1.1 (verified: the identical full-inlined shape compiles and runs at
+-O0/-O1/-O2/-O3).
+
+- **Affected:** LLVM 17 (his WSL toolchain); floor supported toolchain of
+  this repo (clang 23) unaffected.
+- **Valve covering it:** `node_inline_weight_threshold`
+  (`config/ir-lowering.dbvl`, P2 commit `6e3a78ef`) — oversized node bodies
+  keep their own function, so no toolchain is handed the concentrated shape.
+- **Retirement gate:** when the floor supported LLVM rises above 17, the
+  defect no longer justifies the valve — it remains only as compile-resource
+  hygiene, with its value re-derived by the RA-knee sweep protocol
+  (`benchmarks/ra_knee_sweep.sh`, see the 2026-10-16 results file).
+- **Epistemic note:** the interim value 600 was the boundary between two
+  corpus data points, not a derived constant; the sweep protocol replaces it.
+
+## Defn-liveness net panic on cast-lane calls (`pp-types.bv` blocker) — FIXED 2026-10-17 (plan `2026-10-17-liveness-emission-fixpoint.md`)
+
+**Cause:** three commits each necessary — `734a8dac` 2026-10-05 (String-target
+family row roots `float_to_str` from `cstr_to_briev`'s `(buf as Data) as
+String`), frgn-elim `b78a03e7` 2026-09-24 (deleted C `str_to_int` from
+`briev_rt.c`), and the 10-13 revert `74ba6742` of the over-approximating
+consuming-lane root. Chain: `glue/c.bv` CastTo/CastFrom → `float_to_str` →
+`float_format` → … → `strip_frac_zeros`, whose `frac[…] as Int` is a
+String→Int ExtCall lane emitting `call i64 @str_to_int(…)` — a plain `as`,
+no intrinsic name, so no `intrinsic_helpers` row could ever cover it.
+`str_to_int` unrooted → IR-scan net panicked: `brievc build pp-types.bv`
+failed, aborting the benchmark suite at bridge_glue (`set -e`; no full
+suite ran 10-13→10-17). The net was CORRECT — unit-defined symbols skip
+`declare`, so the emitted `.ll` would reference undefined `@str_to_int`.
+
+**Why never flagged:** harness `set -e` abort + the exercising fixtures are
+integration tests (`pp_roundtrip_tests.rs`, `c_driver_library.rs`), excluded
+from the per-commit `cargo test --lib` gate; no CI; full `cargo test`
+hadn't compiled since `aac37915` 2026-10-06 (separate entry below).
+
+**Fix:** emission-derived fixpoint (Option A) in `src/backend/llvm/mod.rs`:
+on net hit, root the missed names + their liveness closure
+(`DefnLiveness::build_with_roots`), union into `live_defns`
+(`liveness_fixpoint_extra`), restore pre-round warnings, re-emit through
+the new `generate_with_analysis` (public `generate` = fresh-entry wrapper
+that clears fixpoint state and takes the analysis once). Termination:
+missed ⊆ defn_params, missed ∩ (live ∪ extra) = ∅ → extra strictly grows;
+cap 16 rounds → terminal panic with the chain. Kills the entire incident
+class (6th of its kind) — future misses self-heal; no over-approx, no
+bloat (respects the 10-13 revert). Regression test:
+`test_liveness_fixpoint_roots_emitted_lane_helper`.
+
+**Undo:** revert the mod.rs fixpoint commits; the net's panic returns
+(and pp-types/bridge stop compiling).
+
+**Verified 2026-10-17:** bare probe + pp-types + boundary/rank/bench/reader
+builds exit 0 (`define i64 @str_to_int` present); `cargo test --lib` 3152
+green; `pp_roundtrip_tests` + `c_driver_library` green; full determinism
+ALL DETERMINISTIC; Praetor 79=79 baseline diagnostics (only `generate`
+metric values drifted 423→424 / 1587→1590).
+
+## Full `cargo test` uncompilable since 2026-10-06 — FIXED 2026-10-17 (partial)
+
+**Cause:** `aac37915` 2026-10-06 (web `host_fns`) added a field to
+`GlueTarget` without updating `tests/glue_bridge_tests.rs` (two struct
+literals) → E0063 → the ENTIRE integration-test compilation failed; every
+`cargo test` since silently tested nothing outside `--lib`. Compounding
+rot in the same category: the 62ae145d "Massive rename" left
+`briv_compiler` crate paths in two FFI test files.
+
+**Fix (this commit):** `host_fns: HashMap::new()` added to both fixture
+literals; the two `tests/ffi_*_tests.rs` files are untracked WIP from a
+concurrent session (created 2026-10-17 09:49) — crate-path rename applied
+in passing, their remaining dead-API errors (`ffi::loader`,
+`typechecker::TypeChecker` — modules long removed) belong to their author.
+Full `cargo test` therefore still blocked on those two files; the
+per-commit `--lib` gate and the targeted integration runs
+(`pp_roundtrip_tests`, `c_driver_library`) are green.
+
+**Lesson:** an uncompilable test suite fails OPEN (looks green: nothing
+runs). Full `cargo test` now belongs to the pre-release ritual (alongside
+`toolchain_matrix.sh`) so rot cannot hide for 11 days.
+
+## rbv-no-script-tags emits raw Briev source into the JS bundle — OPEN (web audit, 2026-10-17)
+
+**Symptom:** `brievc build examples/rbv-no-script-tags.rbv` exits 0 and
+emits a bundled HTML whose JS contains the file's PROSE COMMENTS and RAW
+Briev source (`let count: Int = 0; ... <view>...`) — `node --check`
+rejects it. Every other .rbv example emits valid JS.
+
+**Root cause (initial):** the "Briev-as-default" .rbv format (no
+`<script>` wrapper) is not parsed as Briev — the non-view/style content
+falls through to the JS bundle verbatim. The compile should either
+parse the default content as Briev (the format's documented contract,
+per the fixture's own header comment) or reject the file with a
+diagnostic; silently pasting it into the JS is the dropped-contract
+class again, in the web lane.
+
+**Found by:** the readiness web audit
+(docs/plans/2026-10-17-readiness-gates.md §Results, gate 2). The other
+eight examples, the host-fn chain (console probe: module-scope emission
++ wasm import binding), wasm embedding, the state-layout table, the
+router fixture, AND the real-browser smoke gate (rbv_browser_smoke +
+rbv_gate: file:// load, click round-trip) all verified working.

@@ -145,6 +145,18 @@ fn unify_generic_binding(
 /// identifier), which is why the Custom-only guard below rejected every
 /// compound instantiation and its call sites fell back to the plain
 /// (never-emitted) name. To undo: revert to the Display fallback + guard.
+/// 2026-10-15 (type-dependent member statefulness): the bare nominal name of a
+/// concrete type binding, for looking it up in `type_stateful_members`
+/// (`Custom("GrowBuf")` / `Applied("Stack", …)` → the base name). Compound and
+/// primitive shapes without a nominal head have no obj members, so `None`.
+fn concrete_type_name(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Custom(n) => Some(n.as_str()),
+        Type::Applied(n, _) | Type::Generic(n, _) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
 fn mangle_specialization(name: &str, concrete: &[Type]) -> String {
     let args = concrete
         .iter()
@@ -3876,6 +3888,7 @@ impl LlvmBackend {
         let saved_ctr = self.fun.callable_txn_result.clone();
         let saved_ctpl = self.fun.callable_txn_post_label.clone();
         let saved_terminated = self.fun.terminated;
+        let saved_item_post = self.fun.item_post.take();
         self.fun.callable_txn_result = None;
         self.fun.callable_txn_post_label = None;
         self.fun.terminated = false;
@@ -3972,23 +3985,30 @@ impl LlvmBackend {
         // foreach in cursor ops from leaking stale entries into outer scope.
         let saved_allocas = self.fun.let_binding_allocas.clone();
         let saved_break_labels = self.fun.foreach_break_labels.clone();
-        let (params, body): (Vec<(String, Type)>, Vec<crate::ast::Statement>) = match member {
+        let (params, body, member_post): (Vec<(String, Type)>, Vec<crate::ast::Statement>, Expr) = match member {
             crate::ast::TopLevel::Transaction(t) => (
                 t.parameters.iter().map(|(n, ty)| (n.clone(), ty.clone())).collect(),
                 t.body.clone(),
+                t.contract.post_condition.clone(),
             ),
             crate::ast::TopLevel::Definition(d) => (
                 d.parameters.iter().map(|(n, ty)| (n.clone(), ty.clone())).collect(),
                 d.body.clone(),
+                d.contract.post_condition.clone(),
             ),
             // 2026-08-12 (Iterable protocol, op-as-member): an operator member
             // emits exactly like a defn member — the body is the implementation.
             crate::ast::TopLevel::TypeDefOperator(d) => (
                 d.parameters.iter().map(|(n, ty)| (n.clone(), ty.clone())).collect(),
                 d.body.clone(),
+                d.contract.post_condition.clone(),
             ),
-            _ => (Vec::new(), Vec::new()),
+            _ => (Vec::new(), Vec::new(), Expr::Bool(true)),
         };
+        // 2026-10-16 (term-semantics plan §1): the member's own post gates
+        // its bare `term;` sites (saved/restored above/below like the
+        // callable-txn state).
+        self.fun.item_post = Some(member_post);
         // 2026-08-12 (Iterable protocol, slice 4): substitute the member's
         // PARAM types with the collection's concrete args (`List<Int>` init's
         // `val: T` → `val: Int`) — without it a wasm32 member body bound `val`
@@ -4103,6 +4123,7 @@ impl LlvmBackend {
         self.fun.callable_txn_result = saved_ctr;
         self.fun.callable_txn_post_label = saved_ctpl;
         self.fun.terminated = saved_terminated;
+        self.fun.item_post = saved_item_post;
         let _ = v;
         // 2026-08-01 (D3): a defn member's `term` value is the call's result —
         // return it (the caller binds it). Otherwise fall back to a fresh
@@ -5693,8 +5714,25 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 .map(|ty| crate::typechecker::substitute_type(ty, &subst))
                 .collect();
             self.ctx.defn_return_types.insert(mangled.clone(), ret_tys);
-            // The specialization needs state iff the base defn does.
-            let needs_state = self.ctx.defn_needs_state.get(name).copied().unwrap_or(true);
+            // The specialization needs state iff the base defn does OR a
+            // concrete type it is specialized onto has a state-taking member.
+            // 2026-10-15 (type-dependent member statefulness): the base
+            // (type-agnostic) verdict cannot see that a trait default like
+            // `put_cstr` resolves its bare `put_bytes` call to the concrete
+            // `GrowBuf.put_bytes` (→ `grow_to_fit` → `Malloc#`, stateful) under
+            // `S = GrowBuf`, while `S = ByteBuf` resolves to a stateless member.
+            // So OR in whether ANY concrete binding has a stateful member — the
+            // specialized body may reach it. Over-approximation (an unused but
+            // threaded `%state` param) is sound and harmless; the alternative
+            // of walking the specialized body to resolve exact member calls is
+            // more fragile for no observable gain. See
+            // export_abi::type_stateful_members.
+            let base_needs = self.ctx.defn_needs_state.get(name).copied().unwrap_or(true);
+            let concrete_member_stateful = concrete.iter().any(|ty| {
+                concrete_type_name(ty)
+                    .is_some_and(|n| self.ctx.type_stateful_members.contains(n))
+            });
+            let needs_state = base_needs || concrete_member_stateful;
             self.ctx.defn_needs_state.insert(mangled.clone(), needs_state);
             // A specialization is live by construction — it exists only because
             // a live call site referenced it, and it is always emitted via the
@@ -6776,6 +6814,44 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
     }
  
     /// Emit a binary operation.
+    /// 2026-10-15 (bool-width canonicalization, plan
+    /// docs/plans/2026-10-15-bool-width-canonicalization.md): the canonical
+    /// Bool register is an i8 holding 0/1 — invariant I1. The casting graph
+    /// fixes Bool at i8 (`Fixed("i8")`), comparisons emit `zext i1 to i8`,
+    /// and every consumer (`trunc i8 … to i1`, 11 sites) assumes it. The
+    /// logic ops (`&&`/`||`/`!`) were the one producer that emitted at the
+    /// OPERAND's width while still labeling the result `bool_()` — a wide
+    /// operand produced `or i64` under a bool label and the consumer's
+    /// `trunc i8` mis-typed (clang: "defined with type 'i64' but expected
+    /// 'i8'"). Normalize any operand to the canonical form so I1 holds by
+    /// construction. Undo: restore the And/Or/Not arms to direct
+    /// `llvm_type(&l.ty)` emission (re-opens the class; the IR regression
+    /// test catches it).
+    pub(super) fn coerce_to_i8_bool(
+        &mut self,
+        out: &mut String,
+        indent: &str,
+        reg: &TypedRegister,
+    ) -> TypedRegister {
+        if reg.ty == Type::bool_() {
+            return reg.clone();
+        }
+        let ty_str = self.llvm_type(&reg.ty);
+        if ty_str == "i8" {
+            return reg.clone();
+        }
+        let v = self.fun.gen_reg();
+        if ty_str == "i1" {
+            writeln!(out, "{}{} = zext i1 {} to i8", indent, v, reg.name).ok();
+        } else {
+            writeln!(out, "{}{} = trunc {} {} to i8", indent, v, ty_str, reg.name).ok();
+        }
+        TypedRegister {
+            name: v,
+            ty: Type::bool_(),
+        }
+    }
+
     fn emit_binary_op(
         &mut self,
         out: &mut String,
@@ -7177,26 +7253,26 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 }
             }
             crate::ast::BinaryOpKind::And => {
-                let cmp_ty = self.llvm_type(&l.ty);
-                writeln!(
-                    out,
-                    "{}{} = and {} {}, {}",
-                    indent, v, cmp_ty, l.name, r.name
-                )
-                .ok();
+                // 2026-10-15 (bool-width canonicalization): normalize both
+                // operands to the canonical i8 Bool (invariant I1) — the old
+                // arm emitted at the operand's width while labeling the
+                // result `bool_()`, so a wide operand produced `and i64`
+                // under a bool label and the consumer's `trunc i8` hit an
+                // i64. See coerce_to_i8_bool.
+                let l = self.coerce_to_i8_bool(out, indent, l);
+                let r = self.coerce_to_i8_bool(out, indent, r);
+                writeln!(out, "{}{} = and i8 {}, {}", indent, v, l.name, r.name).ok();
                 TypedRegister {
                     name: v.to_string(),
                     ty: Type::bool_(),
                 }
             }
             crate::ast::BinaryOpKind::Or => {
-                let cmp_ty = self.llvm_type(&l.ty);
-                writeln!(
-                    out,
-                    "{}{} = or {} {}, {}",
-                    indent, v, cmp_ty, l.name, r.name
-                )
-                .ok();
+                // 2026-10-15 (bool-width canonicalization): same
+                // normalization as And — see coerce_to_i8_bool.
+                let l = self.coerce_to_i8_bool(out, indent, l);
+                let r = self.coerce_to_i8_bool(out, indent, r);
+                writeln!(out, "{}{} = or i8 {}, {}", indent, v, l.name, r.name).ok();
                 TypedRegister {
                     name: v.to_string(),
                     ty: Type::bool_(),
@@ -7274,10 +7350,16 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 }
             }
             crate::ast::UnaryOpKind::Not => {
+                // 2026-10-15 (bool-width canonicalization): normalize the
+                // operand to the canonical i8 Bool and label the result
+                // `bool_()` unconditionally — the old arm propagated the
+                // operand's label (`operand.ty.clone()`), the mirror of the
+                // And/Or label/width desync. See coerce_to_i8_bool.
+                let operand = self.coerce_to_i8_bool(out, indent, &operand);
                 writeln!(out, "{}{} = xor i8 {}, 1", indent, v, operand.name).ok();
                 TypedRegister {
                     name: v.to_string(),
-                    ty: operand.ty.clone(),
+                    ty: Type::bool_(),
                 }
             }
             crate::ast::UnaryOpKind::BitNot => {
@@ -7922,6 +8004,15 @@ impl crate::backend::llvm::LlvmBackend {
     ///                 aggregate (the read heads its segment — presplit — so
     ///                 post-wake re-runs start here). Outside a task: trap.
     ///   strict (2)  → trap (read with no scheduler and no event).
+    /// 2026-10-15 (family-4 rename): emit the strict-trap call. The
+    /// `event_strict_trap` defn is stateful (write_all → stdout state), so
+    /// pass `%state` when present — the old stateless call could never
+    /// resolve to the defn (pre-existing latent bug, fixed here).
+    fn emit_event_trap_call(&mut self, out: &mut String) {
+        let st = if self.ctx.defn_takes_state("event_strict_trap") { "ptr %state, " } else { "" };
+        writeln!(out, "  call i64 @event_strict_trap({})", st).ok();
+    }
+
     fn emit_event_payload_read(
         &mut self,
         out: &mut String,
@@ -7988,7 +8079,7 @@ impl crate::backend::llvm::LlvmBackend {
             )
             .ok();
             writeln!(out, "evr.trap{uid}:").ok();
-            writeln!(out, "  call i64 @__briev_event_strict_trap()").ok();
+            self.emit_event_trap_call(out);
             writeln!(out, "  unreachable").ok();
             writeln!(out, "{blk_lbl}:").ok();
             // BLOCKED: cursor untouched, waiter registered. The migrated
@@ -7997,7 +8088,7 @@ impl crate::backend::llvm::LlvmBackend {
         } else {
             writeln!(out, "{indent}br i1 {is_ready}, label %{ready_lbl}, label %evr.trap{uid}").ok();
             writeln!(out, "evr.trap{uid}:").ok();
-            writeln!(out, "  call i64 @__briev_event_strict_trap()").ok();
+            self.emit_event_trap_call(out);
             writeln!(out, "  unreachable").ok();
         }
         writeln!(out, "{ready_lbl}:").ok();

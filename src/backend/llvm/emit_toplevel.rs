@@ -55,6 +55,91 @@ pub(super) struct LocalDynBoxed {
     pub info: crate::analysis::dyn_concrete_sets::DynCollectionInfo,
 }
 
+/// Byte size of an LLVM `[N x T]` aggregate type string, recursing into
+/// nested arrays. `None` for anything this conservative parser cannot size
+/// exactly (structs — padding makes their size layout-dependent — and
+/// unknown element spellings); the aggregate-zero-init decision falls back
+/// to the plain store on `None`. 2026-10-16 (cpp-vs-briev P1, flaw 1).
+fn llvm_aggregate_byte_size(ty: &str) -> Option<u64> {
+    let inner = ty.strip_prefix('[')?.strip_suffix(']')?;
+    let (count_str, elem) = inner.split_once(" x ")?;
+    let count: u64 = count_str.trim().parse().ok()?;
+    let elem_bytes = match elem.trim() {
+        "float" => 4,
+        "double" => 8,
+        "ptr" | "i8*" => 8,
+        e if e.starts_with('[') => llvm_aggregate_byte_size(e)?,
+        e if e.starts_with('i') => e[1..].parse::<u64>().ok().map(|b| b.div_ceil(8))?,
+        _ => return None,
+    };
+    count.checked_mul(elem_bytes)
+}
+
+/// Conservative byte size of any LLVM type string the backend emits in
+/// `alloca` positions — scalars exact, arrays exact, structs the align-8 sum
+/// of their members (over-counts padding, the safe direction for a LIMIT),
+/// `%State` the caller-provided field sum. `None` = unknown spelling; the
+/// frame-limit checker floors unknowns at 8 bytes. 2026-10-16 (absolute-limit
+/// addendum part 1).
+pub(crate) fn llvm_type_bytes(ty: &str, state_size: Option<u64>) -> Option<u64> {
+    let t = ty.trim();
+    match t {
+        "i1" => Some(1),
+        "i8" => Some(1),
+        "i16" => Some(2),
+        "i32" => Some(4),
+        "float" => Some(4),
+        "i64" | "double" | "ptr" | "i8*" => Some(8),
+        "%State" => state_size,
+        _ if t.starts_with('[') => llvm_aggregate_byte_size(t),
+        _ if t.starts_with('{') => {
+            // Split top-level commas only (nested braces/brackets).
+            let inner = &t[1..t.len() - 1];
+            let mut depth = 0i32;
+            let mut members: Vec<&str> = Vec::new();
+            let mut start = 0usize;
+            for (i, ch) in inner.char_indices() {
+                match ch {
+                    '[' | '{' => depth += 1,
+                    ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        members.push(&inner[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            members.push(&inner[start..]);
+            let mut total = 0u64;
+            for m in members {
+                total = total.checked_add(llvm_type_bytes(m, state_size)?.div_ceil(8) * 8)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
+/// Per-driver options for `emit_body_prologue` — which state resets each
+/// body-emission driver performed historically (the helper reproduces each
+/// driver's sequence EXACTLY; a flag left false preserves that driver's old
+/// behavior byte-for-byte). 2026-10-16 (stability S4).
+#[derive(Default)]
+struct PrologueOpts {
+    /// `ssa_old_int_regs`/`ssa_old_float_regs` clears (reactive emitters).
+    reset_ssa_caches: bool,
+    /// `clear_locals()` — binding maps, dedup caches, last-value temps
+    /// (reactive emitters; callable txns clear selectively instead).
+    clear_locals: bool,
+    /// `in_callable_txn = false` (reactive emitters; defns stay callable).
+    reset_callable_flag: bool,
+    /// `returns_i64 = false; fn_ret_ty = "void"` (standard `@txn_` only).
+    reset_return_state: bool,
+    /// `terminated = false` (defn and reactive drivers; `emit_async_body`
+    /// inherits the caller's state).
+    reset_terminated: bool,
+}
+
 impl LlvmBackend {
     /// 2026-08-04 (compiler-in-Briev): top-level `let` names in a body that are
     /// ASSIGNED later (incl. inside when/if/foreach/sync blocks). Such lets get
@@ -104,6 +189,113 @@ impl LlvmBackend {
         let mut assigned: HashSet<String> = HashSet::new();
         for s in stmts { walk(s, &mut lets, &mut assigned); }
         lets.into_iter().filter(|(n, _)| assigned.contains(n)).collect()
+    }
+
+    /// Pre-declare entry-block allocas for every let in `body` that is
+    /// reassigned inside a nested block, and bind them in `let_bindings` so
+    /// the let handler (emit_stmt.rs) stores into the entry slot instead of
+    /// demoting an alloca at the assignment site. Call AFTER clear_locals()
+    /// (it wipes the binding maps) and BEFORE the body loop.
+    ///
+    /// 2026-10-16 (cpp-vs-briev P0, flaw 4): the reactive `@txn_<name>`
+    /// emitters were a third emission path the two earlier fixes missed —
+    /// emit_definition (2026-08-04, compiler-in-Briev) and the SSA main's
+    /// cross-txn aggregation (2026-10-14, BUGS.md 9303) both pre-declare,
+    /// but `@txn_parse_data` et al. demoted `let b = 0;` + `when c { b = …; }`
+    /// into guard.thenN while the post-guard reads landed in guard.endN
+    /// ("Instruction does not dominate all uses!" — clang rejects the module
+    /// at every -O level; every Otto/Westerlund recommender program hit it).
+    /// Centralizes the alloca-emission block that previously lived inline in
+    /// emit_definition. Undo: delete this helper and restore the inline
+    /// blocks at the three call sites.
+    /// The shared body-emission prologue: the per-driver state resets, then
+    /// the reassigned-let entry-alloca pre-declaration.
+    ///
+    /// 2026-10-16 (stability S4): flaw 4 happened because the reset+predeclare
+    /// sequence was hand-rolled in every body-emission driver and two of them
+    /// forgot the predeclare (guard-scoped allocas, non-dominating reads).
+    /// One helper, every driver calls it — the omission class is dead. The
+    /// `opts` reproduce each driver's historical reset set exactly; `###`
+    /// -pinned corpus byte-identity is the gate. The SSA main's cross-txn
+    /// aggregate (loop_engine/ssa.rs) is a DIFFERENT mechanism (one map over
+    /// all txns) and stays explicit with a cross-reference. Undo: re-inline
+    /// the sequences at the call sites.
+    fn emit_body_prologue(
+        &mut self,
+        out: &mut String,
+        body: &[Statement],
+        opts: PrologueOpts,
+    ) {
+        if opts.reset_ssa_caches {
+            self.fun.ssa_old_int_regs.clear();
+            self.fun.ssa_old_float_regs.clear();
+        }
+        if opts.clear_locals {
+            self.fun.clear_locals();
+        }
+        if opts.reset_terminated {
+            self.fun.terminated = false;
+        }
+        self.predeclare_reassigned_lets(out, body);
+        if opts.reset_callable_flag {
+            self.fun.in_callable_txn = false;
+        }
+        if opts.reset_return_state {
+            self.fun.returns_i64 = false;
+            self.fun.fn_ret_ty = "void".to_string();
+        }
+    }
+
+    fn predeclare_reassigned_lets(&mut self, out: &mut String, body: &[Statement]) {        self.fun.reassigned_lets = Self::collect_reassigned_lets(body);
+        // Sorted by name: reassigned_lets is a HashMap, and unsorted
+        // iteration assigns the entry-alloca register numbers in per-process
+        // random order (house rule §4 — the .ll drift BUGS.md 9303 fixed for
+        // the sa-slots). The pre-2026-10-16 emit_definition block had the
+        // same latent nondeterminism.
+        let mut reassigned: Vec<(String, Option<Type>)> = self.fun.reassigned_lets.iter()
+            .map(|(n, t)| (n.clone(), t.clone())).collect();
+        reassigned.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ty) in &reassigned {
+            let slot = self.fun.gen_reg();
+            let slot_ty = ty.as_ref().map(|t| self.llvm_type(t)).unwrap_or_else(|| "i64".to_string());
+            writeln!(out, "  {} = alloca {}, align 8", slot, slot_ty).ok();
+            self.fun.let_bindings.insert(name.clone(), slot.clone());
+            self.fun.let_binding_allocas.insert(slot.clone());
+            self.fun.let_binding_types.insert(name.clone(), ty.clone().unwrap_or_else(Type::int));
+            self.fun.let_original_types.insert(name.clone(), ty.clone().unwrap_or_else(Type::int));
+        }
+    }
+
+    /// Zero-init an aggregate slot (`ty` is an LLVM `[N x T]` / `{ ... }`
+    /// string): `llvm.memset` at or above
+    /// `config_tuning::ir_lowering().aggregate_zero_init_memset_bytes`, the
+    /// plain `store <ty> zeroinitializer` below it (byte-identical to the
+    /// pre-2026-10-16 emission).
+    ///
+    /// 2026-10-16 (cpp-vs-briev P1, flaw 1): a 1.6M-element global array
+    /// lowered to one multi-megabyte aggregate store that crashed LLVM 17's
+    /// X86 instruction selector (Otto Westerlund's `probe_bigarray`;
+    /// ENVIRONMENT-DEPENDENT — clang 23 handles it) and is pathological at
+    /// any version. The memset intrinsic is declared unconditionally in the
+    /// module prelude. `llvm_struct_size` is a byte-accurate size for the
+    /// types this site sees; on a parse miss we keep the old store (no
+    /// speculative memset of a wrong length). Undo: point both call sites
+    /// back at the `store … zeroinitializer` write.
+    fn emit_aggregate_zero_init(&mut self, out: &mut String, indent: &str, ty: &str, gep: &str) {
+        let threshold = crate::config_tuning::ir_lowering().aggregate_zero_init_memset_bytes;
+        match llvm_aggregate_byte_size(ty) {
+            Some(bytes) if bytes as usize >= threshold => {
+                writeln!(
+                    out,
+                    "{}call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)",
+                    indent, gep, bytes
+                )
+                .ok();
+            }
+            _ => {
+                writeln!(out, "{}store {} zeroinitializer, ptr {}, align {}", indent, ty, gep, self.align_of(ty)).ok();
+            }
+        }
     }
     /// Check if any modifier has the given name and extract its export name.
     /// Returns Some(export_name) if #export or #export("name") was found.
@@ -659,7 +851,7 @@ impl LlvmBackend {
         writeln!(out).ok();
         writeln!(out, "declare void @llvm.assume(i1) #1").ok();
         writeln!(out, "declare void @llvm.trap() noreturn").ok();
-        // 2026-09-11 (buffered stdout): NO declare — __stdout_flush is a
+        // 2026-09-11 (buffered stdout): NO declare — stdout_flush is a
         // Briev defn emitted in full in this module when present; a textual
         // declare duplicates it and LLVM rejects the redefinition. Bare
         // programs never call it (has_stdout_flush gate).
@@ -696,29 +888,29 @@ impl LlvmBackend {
         // optional-frgn runtime availability check (briev_rt.c).
         writeln!(out, "declare i64 @briev_symbol_available(ptr)").ok();
         // 2026-08-01 (D2): garbage scheduling — scheduled frees route through
-        // __briev_free so a benchmark can assert frees == allocs. argmemonly:
+        // rt_free so a benchmark can assert frees == allocs. argmemonly:
         // the call only touches memory via its pointer arg, so a scheduled
         // free after a loop must not make LLVM treat the whole function's
         // memory as clobbered (without it, hash_ops' loop ran 23x slower —
         // LLVM could not promote the state slots to registers).
-        if !self.ctx.defn_params.contains_key("__briev_free") {
+        if !self.ctx.defn_params.contains_key("rt_free") {
             writeln!(out, "declare void @__briev_free(ptr) nounwind argmemonly").ok();
         }
         // 2026-08-01 (D2): `Now#` — monotonic clock for the watchdog
         // `within N ms` deadline compare.
         // 2026-09-10 (Family I): declare-guarded — the pure-Briev defn takes
         // the hidden %state, so an unconditional () declare would conflict.
-        if !self.ctx.defn_params.contains_key("__briev_now") {
+        if !self.ctx.defn_params.contains_key("rt_now_ns") {
             writeln!(out, "declare i64 @__briev_now() nounwind").ok();
         }
         // 2026-08-23 (process.bv revival): process/environment helpers.
         writeln!(out, "declare i64 @__briev_spawn(ptr) nounwind").ok();
         writeln!(out, "declare ptr @__briev_spawn_output(ptr)").ok();
         writeln!(out, "declare i64 @__briev_setenv(ptr, ptr) nounwind").ok();
-        if !self.ctx.defn_params.contains_key("__briev_getcwd") {
+        if !self.ctx.defn_params.contains_key("rt_getcwd") {
             writeln!(out, "declare ptr @__briev_getcwd()").ok();
         }
-        if !self.ctx.defn_params.contains_key("__briev_chdir") {
+        if !self.ctx.defn_params.contains_key("rt_chdir") {
             writeln!(out, "declare i64 @__briev_chdir(ptr) nounwind").ok();
         }
         // getenv/strlen already declared at line ~638 (GetEnv# path).
@@ -2607,6 +2799,7 @@ impl LlvmBackend {
             Statement::Let { expr: Some(e), .. }
             | Statement::Expression(e)
             | Statement::Term(Some(e))
+            | Statement::Tail(e)
             | Statement::EndProgram(Some(e))
             | Statement::Gate(e) => Self::has_observable_expr(e, observable),
             Statement::Assign(_, e) => Self::has_observable_expr(e, observable),
@@ -2733,13 +2926,13 @@ impl LlvmBackend {
                 // Decimal), emit zeroinitializer for a zero value instead.
                 if ty.starts_with('[') || ty.starts_with('{') {
                     if n == 0 {
-                        writeln!(out, "{}store {} zeroinitializer, ptr {}, align {}", indent, ty, gep, self.align_of(ty)).ok();
+                        self.emit_aggregate_zero_init(out, indent, ty, gep);
                     } else {
                         // Non-zero scalar into a struct slot: zero-init the
                         // struct, then store the scalar into the first element.
                         // This is the op-Init fallback — correct for the
                         // common `obj` layout { data, len }.
-                        writeln!(out, "{}store {} zeroinitializer, ptr {}, align {}", indent, ty, gep, self.align_of(ty)).ok();
+                        self.emit_aggregate_zero_init(out, indent, ty, gep);
                         let first = field_reg("f");
                         let inner = &ty[2..ty.len() - 1]; // strip `[N x ` and `]`
                         writeln!(out, "{}{} = getelementptr {}, ptr {}, i64 0", indent, first, inner, gep).ok();
@@ -2810,12 +3003,7 @@ impl LlvmBackend {
                 } else if ty.starts_with('[') {
                     // 2026-07-31 (A4): array state fields initialize to
                     // zeroinitializer (`store [16 x float] 0` is invalid IR).
-                    writeln!(
-                        out,
-                        "{}store {} zeroinitializer, ptr {}, align {}",
-                        indent, ty, gep, self.align_of(ty)
-                    )
-                    .ok();
+                    self.emit_aggregate_zero_init(out, indent, ty, gep);
                 } else {
                     writeln!(out, "{}store {} 0, ptr {}, align {}", indent, ty, gep, self.align_of(&ty)).ok();
                 }
@@ -3014,6 +3202,25 @@ impl LlvmBackend {
                 self.emit_init_seeding_body(out, indent, name, &init);
             }
         }
+        // 2026-10-17 (plain storage): seed plain lets whose initializer is a
+        // NON-LITERAL expression (literals fold into the module-scope
+        // declaration — a runtime store for them is dead weight AND defeats
+        // %State promotion; see the emission note in mod.rs). Same phase as
+        // the `init` invariants. Sorted for deterministic IR.
+        let mut sorted_plain: Vec<String> = self.ctx.plain_global_types.keys().cloned().collect();
+        sorted_plain.sort();
+        for name in &sorted_plain {
+            let (ty, init) = self.ctx.plain_global_types[name].clone();
+            let is_literal = matches!(&init, Some(Expr::Decimal(_)) | Some(Expr::Float(_)) | Some(Expr::Bool(_)));
+            if let Some(value) = &init {
+                if is_literal {
+                    continue;
+                }
+                let reg = self.emit_expr(out, value, indent);
+                let llvm_ty = protocol_llvm_type(&ty, self.ctx.type_universe.as_ref());
+                writeln!(out, "{}store {} {}, ptr @{}, align 8", indent, llvm_ty, reg.name, name).ok();
+            }
+        }
     }
 
     /// Emit a body-form init's seeding statements once, storing the yielded
@@ -3032,7 +3239,7 @@ impl LlvmBackend {
         let mut last = "".to_string();
         for stmt in &init.body {
             match stmt {
-                crate::ast::Statement::Term(Some(expr)) => {
+                crate::ast::Statement::Term(Some(expr)) | crate::ast::Statement::Tail(expr) => {
                     let reg = self.emit_expr(out, expr, indent);
                     last = reg.name;
                     break;
@@ -3123,6 +3330,9 @@ impl LlvmBackend {
     pub(super) fn emit_definition(&mut self, out: &mut String, d: &crate::ast::Definition, needs_state: bool) {
         self.fun.pending_cleanup.clear();
         self.fun.clear_locals();
+        // 2026-10-16 (term-semantics plan §1): bare `term;` in this defn is
+        // P-gated against the defn's postcondition.
+        self.fun.item_post = Some(d.contract.post_condition.clone());
         // 2026-09-24: a stateless body must never reference %state — arena
         // lowering (emit_arena_alloc) consults this and falls back to malloc.
         self.fun.stateless_body = !needs_state;
@@ -3207,7 +3417,7 @@ impl LlvmBackend {
         // exit_group — it never returns. #13's willreturn lied to LLVM and
         // -O3 LTO collapsed the whole main (the EndProgram call site's
         // `unreachable` became UB). Emit it noreturn (#14).
-        let attr_idx = if d.name == "__exit" { "#14" } else { attr_idx };
+        let attr_idx = if d.name == "exit_prog" { "#14" } else { attr_idx };
         writeln!(out, ") local_unnamed_addr {}{} {{", attr_idx, section_attr).ok();
         writeln!(out, "  entry:").ok();
         self.fun.ssa_old_int_regs.clear();
@@ -3295,22 +3505,16 @@ impl LlvmBackend {
         // this register. Reset per-defn so stale values never leak.
         self.fun.last_expr_reg = None;
         // 2026-08-04 (compiler-in-Briev): pre-declare entry-block allocas for
-        // top-level lets that are reassigned inside a guard/loop — the 
+        // top-level lets that are reassigned inside a guard/loop — the
         // reassignment must NOT demote to an alloca at the assignment site
         // (dominance violation). The alloca is bound BEFORE the body so the
         // let's initial store and later stores both target the entry alloca.
-        self.fun.reassigned_lets = Self::collect_reassigned_lets(&d.body);
-        let reassigned: Vec<(String, Option<Type>)> = self.fun.reassigned_lets.iter()
-            .map(|(n, t)| (n.clone(), t.clone())).collect();
-        for (name, ty) in &reassigned {
-            let slot = self.fun.gen_reg();
-            let slot_ty = ty.as_ref().map(|t| self.llvm_type(t)).unwrap_or_else(|| "i64".to_string());
-            writeln!(out, "  {} = alloca {}, align 8", slot, slot_ty).ok();
-            self.fun.let_bindings.insert(name.clone(), slot.clone());
-            self.fun.let_binding_allocas.insert(slot.clone());
-            self.fun.let_binding_types.insert(name.clone(), ty.clone().unwrap_or_else(Type::int));
-            self.fun.let_original_types.insert(name.clone(), ty.clone().unwrap_or_else(Type::int));
-        }
+        // 2026-10-16 (flaw 4 → S4): the sequence lives in the shared
+        // emit_body_prologue (this defn driver resets `terminated` only).
+        self.emit_body_prologue(out, &d.body, PrologueOpts {
+            reset_terminated: true,
+            ..Default::default()
+        });
         let body_len = d.body.len();
         for (idx, s) in d.body.iter().enumerate() {
             if self.fun.terminated { break; }
@@ -3489,7 +3693,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             Statement::Assign(l, r) => { expr_has(l, found); expr_has(r, found); }
             Statement::Expression(e) => expr_has(e, found),
             Statement::Let { expr: Some(e), .. } => expr_has(e, found),
-            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => expr_has(e, found),
+            Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => expr_has(e, found),
             Statement::Guarded(_, b) | Statement::Block(b) | Statement::SyncBlock(b) => {
                 for x in b { stmt_has(x, found); }
             }
@@ -3599,6 +3803,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
                 )
             }
             Statement::Term(Some(e)) => Statement::Term(Some(Self::rewrite_expr_idents(e, field_names, param_names))),
+                Statement::Tail(e) => Statement::Tail(Self::rewrite_expr_idents(e, field_names, param_names)),
             Statement::EndProgram(Some(e)) => Statement::EndProgram(Some(Self::rewrite_expr_idents(e, field_names, param_names))),
             Statement::Guarded(cond, body) => {
                 Statement::Guarded(
@@ -3658,6 +3863,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         }
         // 2026-07-27: Set txn_name for per-function arena gating.
         self.fun.txn_name = name.to_string();
+        self.fun.item_post = Some(txn.contract.post_condition.clone());
         self.fun.pending_cleanup.clear();
         // 2026-10-05 (json.bv): the local-binding caches are PER-FUNCTION.
         // A reactive node body resolved a match binding through a stale
@@ -3769,7 +3975,20 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
                 Some("alwaysinline") => " alwaysinline",
                 Some("inlinehint") => " inlinehint",
                 _ => {
-                    if !self.ctx.has_cycles { " alwaysinline" } else { "" }
+                    if !self.ctx.has_cycles {
+                        // 2026-10-16 (cpp-vs-briev P2, flaw 2): the frontend's
+                        // weighted node-inline decision gates the fallback —
+                        // oversized node bodies stay real functions (LLVM 17's
+                        // greedy regalloc segfaults on the whole-program-
+                        // inlined shape at -O2/-O3). Explicit directives above
+                        // always win.
+                        match self.ctx.node_inline_decisions.get(name) {
+                            Some(crate::analysis::inline_cost::InlineDecision::AlwaysInline) => " alwaysinline",
+                            _ => "",
+                        }
+                    } else {
+                        ""
+                    }
                 }
             }
         };
@@ -3830,7 +4049,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             match stmt {
                 Statement::Let { expr: Some(e), .. } => is_ffi_call(e, observable),
                 Statement::Expression(e) => is_ffi_call(e, observable),
-                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => is_ffi_call(e, observable),
+                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => is_ffi_call(e, observable),
                 Statement::Assign(_, e) => is_ffi_call(e, observable),
                 Statement::Guarded(_, body) => body.iter().any(|s| has_ffi_call(s, observable)),
                 Statement::Block(body) => body.iter().any(|s| has_ffi_call(s, observable)),
@@ -3892,7 +4111,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             match stmt {
                 Statement::Expression(e) => outlinable_expr(e),
                 Statement::Let { expr: Some(e), .. } => outlinable_expr(e),
-                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => outlinable_expr(e),
+                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => outlinable_expr(e),
                 _ => false,
             }
         }
@@ -3900,7 +4119,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             match stmt {
                 Statement::Let { expr: Some(e), .. } => collect_expr_idents(e, names),
                 Statement::Expression(e) => collect_expr_idents(e, names),
-                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) => collect_expr_idents(e, names),
+                Statement::Term(Some(e)) | Statement::EndProgram(Some(e)) | Statement::Tail(e) => collect_expr_idents(e, names),
                 Statement::Assign(lhs, rhs) => { collect_expr_idents(lhs, names); collect_expr_idents(rhs, names); }
                 Statement::Guarded(_, body) => { for s in body { collect_idents(s, names); } }
                 Statement::Block(body) => { for s in body { collect_idents(s, names); } }
@@ -3959,20 +4178,20 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             // Arena for body emission — same rationale as the standard path:
             // the reactor dispatch calls @txn_name as a separate function,
             // so arena allocas must live here, not in main().
-            self.emit_arena_init(out, "  ");            self.fun.ssa_old_int_regs.clear();
-            self.fun.ssa_old_float_regs.clear();
+            self.emit_arena_init(out, "  ");
             // 2026-06-28: Do NOT reset txn_counter here — this emits into the
             // existing @main() function. Resetting would produce duplicate
             // %t{N} registers across inlined transactions, violating SSA.
             // The counter keeps incrementing across all inlined transactions.
-            self.fun.clear_locals();
-            self.fun.terminated = false;
-            // 2026-06-26: Reset in_callable_txn — emit_definition may have left
-            // it true from a prior TopLevel::Definition. Reactive transactions
-            // use the non-callable code path (emit_stmt.rs:162). Without this,
-            // term!/TermBang inside guards takes the callable path, emits no
-            // ret/br, and leaves basic blocks unterminated.
-            self.fun.in_callable_txn = false;
+            // 2026-10-16 (S4): resets + the reassigned-let predeclare (flaw 4)
+            // live in the shared prologue.
+            self.emit_body_prologue(out, &txn.body, PrologueOpts {
+                reset_ssa_caches: true,
+                clear_locals: true,
+                reset_callable_flag: true,
+                reset_terminated: true,
+                ..Default::default()
+            });
             self.fun.returns_i64 = false;
             self.fun.fn_ret_ty = "void".to_string();
             if !matches!(txn.contract.pre_condition, Expr::Bool(true)) {
@@ -4115,6 +4334,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
                         Statement::Let { expr: Some(e), .. }
                         | Statement::Expression(e)
                         | Statement::Term(Some(e))
+            | Statement::Tail(e)
                         | Statement::EndProgram(Some(e)) => expr_has_user_call(e, &self.ctx.frgn_map),
                         Statement::Assign(_, r) => expr_has_user_call(r, &self.ctx.frgn_map),
                         _ => false,
@@ -4219,13 +4439,17 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
             self.fun.cur_block = None;
             writeln!(out, "define void @{}({}) local_unnamed_addr {}{}{} {{", cpu_name, self.ctx.state_ptr_param, local_txn_attr, alwaysinline, meta_attrs).ok();
             writeln!(out, "  entry:").ok();
-            self.fun.ssa_old_int_regs.clear();
-            self.fun.ssa_old_float_regs.clear();
-            self.fun.clear_locals();
-            self.fun.terminated = false;
-            self.fun.in_callable_txn = false;
-            self.fun.returns_i64 = false;
-            self.fun.fn_ret_ty = "void".to_string();
+            // 2026-10-16 (S4): resets + the reassigned-let predeclare (flaw 4)
+            // live in the shared prologue; arena init stays between it and the
+            // precondition check, matching the pre-S4 emission order.
+            self.emit_body_prologue(out, &txn.body, PrologueOpts {
+                reset_ssa_caches: true,
+                clear_locals: true,
+                reset_callable_flag: true,
+                reset_return_state: true,
+                reset_terminated: true,
+                ..Default::default()
+            });
             self.emit_arena_init(out, "  ");
             if !matches!(txn.contract.pre_condition, Expr::Bool(true)) {
                 self.emit_precondition_check(out, &txn.contract.pre_condition, "  ");
@@ -4478,6 +4702,12 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
                 let saved_let_original_types = self.fun.let_original_types.clone();
                 let saved_reg_float_cache = self.fun.reg_float_cache.clone();
                 let saved_reg_type_cache = self.fun.reg_type_cache.clone();
+                let saved_reassigned_lets = self.fun.reassigned_lets.clone();
+                // 2026-10-16 (flaw 4): cold-guard bodies were emitted with an
+                // empty reassigned_lets before the fix; keep their demotion
+                // behavior byte-identical (params bind via let_bindings below,
+                // not via pre-declaration).
+                self.fun.reassigned_lets.clear();
                 self.fun.let_bindings.clear();
                 self.fun.let_binding_types.clear();
                 self.fun.let_original_types.clear();
@@ -4925,6 +5155,7 @@ fn probe_ok_checks(
     pub(super) fn emit_callable_txn(&mut self, out: &mut String, txn: &crate::ast::Transaction, name: &str) {
         // 2026-07-27: Set txn_name for per-function arena gating.
         self.fun.txn_name = name.to_string();
+        self.fun.item_post = Some(txn.contract.post_condition.clone());
         self.fun.pending_cleanup.clear();
         self.fun.let_bindings.clear();
         self.fun.let_binding_types.clear();
@@ -4949,6 +5180,14 @@ fn probe_ok_checks(
         self.fun.param_slots.clear();
         self.fun.ssa_old_int_regs.clear();
         self.fun.ssa_old_float_regs.clear();
+        // 2026-10-16 (S4, fifth path): callable-txn bodies had the SAME flaw-4
+        // shape — no reassigned-let pre-declaration, so `let b = 0;` +
+        // `when c { b = …; }` demoted the alloca into the guard block while
+        // post-guard reads landed outside its dominance. The prologue runs
+        // before the parameter slots bind (:pN_s / let_bindings below), so a
+        // body let shadows nothing and params win any collision exactly as
+        // before. Default opts: this driver's selective clears above stand.
+        self.emit_body_prologue(out, &txn.body, PrologueOpts::default());
 
         let has_return = if let Some(ref ot) = txn.output_type {
             match ot {
@@ -5164,7 +5403,44 @@ fn probe_ok_checks(
         // convergence GOAL — satisfied → done (return), else → loop (body
         // re-runs). Unconditional for callable txns.
         if !matches!(txn.contract.post_condition, Expr::Bool(true)) {
+            // 2026-10-15 (gate term binding): the postcondition's `term`
+            // reads the txn's RESULT slot (`%result` — where `term <val>`
+            // stores), TYPED with the declared return type. Previously
+            // `term` fell to the global-identifier fallback (`@term` —
+            // never declared or written anywhere) and generic contract
+            // calls (`is_ok(term)` over `Result<T, E>`) saw an Int-typed
+            // argument, failed monomorphization unification, and emitted
+            // bare i64 calls to never-defined generics — undefined symbols
+            // at link. dir.bv's `dir_loop` is the first program to exercise
+            // a generic-Result contract through a callable-txn gate (defn
+            // contracts never emit gates). The declared type drives both
+            // the load's IR shape (the boxed handle is i64 either way) and
+            // the type-level unification. To undo: delete this binding —
+            // the gate regresses to `@term` loads and bare generic calls.
+            let term_ty = txn
+                .outputs
+                .first()
+                .cloned()
+                .or_else(|| {
+                    txn.output_type
+                        .as_ref()
+                        .and_then(|ot| ot.all_types().first().cloned())
+                });
+            if let Some(ty) = &term_ty {
+                self.fun.let_bindings.insert("term".to_string(), "%result".to_string());
+                // %result IS an alloca — register it so the identifier arm
+                // emits a LOAD (typed unbox path) instead of passing the
+                // slot pointer raw (`call i64 @is_ok(ptr %result)`).
+                self.fun.let_binding_allocas.insert("%result".to_string());
+                self.fun.let_binding_types.insert("term".to_string(), ty.clone());
+                self.fun.let_original_types.insert("term".to_string(), ty.clone());
+            }
             let cond = self.emit_expr(out, &txn.contract.post_condition, "  ");
+            if term_ty.is_some() {
+                self.fun.let_bindings.remove("term");
+                self.fun.let_binding_types.remove("term");
+                self.fun.let_original_types.remove("term");
+            }
             let i1 = format!("%pc{}", self.fun.txn_counter); self.fun.txn_counter += 1;
             if cond.ty == Type::bool_() {
                 writeln!(out, "  {} = trunc i8 {} to i1", i1, cond).ok();
@@ -5381,6 +5657,7 @@ fn probe_ok_checks(
         // `@briev_begin_<name>` entry flag — bind the txn name for the body's
         // precondition check.
         self.fun.txn_name = name.to_string();
+        self.fun.item_post = Some(txn.contract.post_condition.clone());
         let async_name = format!("async_body_{}", name);
         let async_attr = "#0".to_string();
         writeln!(out, "define void @{}({}) local_unnamed_addr {} {{", async_name, self.ctx.state_ptr_param, async_attr).ok();
@@ -5432,6 +5709,11 @@ fn probe_ok_checks(
             writeln!(out, "}}").ok();
             return;
         }
+        // 2026-10-16 (flaw 4 → S4): async workers inlining their node body
+        // here get the shared prologue (default opts = predeclare only, the
+        // allocas land at the top of the txn_fire_N block — entry is taken by
+        // the precondition branch, so it dominates every guard block).
+        self.emit_body_prologue(out, &txn.body, PrologueOpts::default());
         for s in &txn.body {
             if self.fun.terminated { break; }
             emit_statement(self, out, s, "  ");
@@ -5475,7 +5757,7 @@ fn probe_ok_checks(
     //   that A and B do not conflict on any state field.
     pub(super) fn emit_fused(&mut self, out: &mut String, a: &crate::ast::Transaction, b: &crate::ast::Transaction, name: &str) {
         let body_a: Vec<Statement> = a.body.iter()
-            .filter(|s| !matches!(s, Statement::Term(..) | Statement::EndProgram(..) | Statement::Rollback(_)))
+            .filter(|s| !matches!(s, Statement::Term(..) | Statement::EndProgram(..) | Statement::Rollback(_) | Statement::Tail(_)))
             .cloned().collect();
         let combined: Vec<Statement> = body_a.into_iter().chain(b.body.iter().cloned()).collect();
         let fused_attr = "#0";
@@ -5657,7 +5939,14 @@ impl LlvmBackend {
     /// only the mechanical IR check or a runtime probe catches it).
     pub(super) fn callee_declares_void(&self, name: &str) -> bool {
         if let Some(types) = self.ctx.defn_return_types.get(name) {
-            return types.is_empty();
+            // `-> Void` registers as `[Void]` (OutputType::Single(Void) →
+            // all_types()), not `[]`. Both forms define a `void` function
+            // (emit_definition: Single(Void) → llvm_ret_abi_type → "void");
+            // recognize the single-Void form too, else the call site falls to
+            // the named path and emits `%t = call void @f(...)` — a void
+            // result given a register name, which clang rejects.
+            return types.is_empty()
+                || (types.len() == 1 && matches!(types[0], crate::ast::Type::Void));
         }
         self.ctx
             .frgn_map
@@ -6491,5 +6780,190 @@ impl crate::backend::llvm::LlvmBackend {
         writeln!(out, "  store i64 {finished}, ptr {outs}").ok();
         writeln!(out, "  ret i64 {finished}").ok();
         writeln!(out, "}}").ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse real Briev source into top-level items (behavioral tests —
+    /// AGENTS "test the contract, not the implementation"). Same helper
+    /// shape as the other analysis-pass test modules (defn_liveness,
+    /// export_abi).
+    fn parse(src: &str) -> Vec<TopLevel> {
+        let tokens = crate::lexer::tokenize(src).expect("tokenize");
+        let mut parser = crate::parser::Parser::new(tokens, src);
+        parser.parse_program().expect("parse")
+    }
+
+    #[test]
+    fn void_defn_call_site_binds_no_result() {
+        // 2026-10-15 (`-> Void` callees): a defn declared `-> Void` registers
+        // its return type as `[Void]` (OutputType::Single(Void) → all_types()),
+        // not `[]`. `callee_declares_void` must recognize BOTH forms, else the
+        // call site names the void result — `%tN = call void @bump()`, which
+        // clang rejects ("instructions returning void cannot have a name").
+        // The discriminator is the `= call void` binding: the buggy emitter
+        // contains it, the fixed one only a bare `call void`.
+        let src = r#"
+            defn bump() -> Void { Store#(8, 7, 1); };
+            node entry [beginprogram][true] {
+                bump();
+                endprogram Print#(7);
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(
+            ir.contains("define void @bump"),
+            "the `-> Void` defn must be emitted: {ir}"
+        );
+        assert!(
+            ir.contains("call void @bump()"),
+            "the call site must emit a plain void call: {ir}"
+        );
+        assert!(
+            !ir.contains("= call void @bump()"),
+            "a void result must not be bound to a register name: {ir}"
+        );
+    }
+
+    /// 2026-10-16 (term-semantics plan §1): a bare `term;` in a defn with a
+    /// real postcondition emits a conditional stop — the met block branches
+    /// to the exit, the cont block carries the rest of the body.
+    #[test]
+    fn bare_term_in_defn_is_p_gated() {
+        // The defn must be CALLED from a live node or liveness drops it
+        // (dead defns are never emitted — see src/analysis/defn_liveness.rs).
+        let src = r#"
+            defn f(x: Int) -> Void [true][x > 0] {
+                when x > 5 { term; };
+            };
+            node entry [beginprogram][true] {
+                f(3);
+                endprogram Print#(1);
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(ir.contains("define void @f"), "called defn emitted: {ir}");
+        assert!(ir.contains("term.met"), "P-gated stop block: {ir}");
+        assert!(ir.contains("term.cont"), "unmet path continues: {ir}");
+        assert!(ir.contains("br i1"), "P evaluated as a branch: {ir}");
+    }
+
+    /// A bare `term;` with NO postcondition is an unconditional stop.
+    #[test]
+    fn bare_term_without_post_stops_unconditionally() {
+        let src = r#"
+            defn g() -> Void {
+                term;
+                Store#(8, 7, 1);
+            };
+            node entry [beginprogram][true] {
+                g();
+                endprogram Print#(1);
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(ir.contains("define void @g"), "called defn emitted: {ir}");
+        assert!(
+            !ir.contains("term.met"),
+            "no P — no conditional stop: {ir}"
+        );
+    }
+
+    /// A reactive node's bare `term;` P-gates against the node's
+    /// postcondition (met → the abort/next-txn label, unmet → continue).
+    #[test]
+    fn bare_term_in_node_is_p_gated() {
+        let src = r#"
+            let n: Int = 0;
+            node main [n == 0][n == 1] {
+                when n == 0 { term; };
+                n = 1;
+                endprogram;
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(ir.contains("term.met"), "node bare term P-gated: {ir}");
+        assert!(ir.contains("term.cont"), "unmet path continues: {ir}");
+    }
+
+    #[test]
+    fn coerce_to_i8_bool_normalizes_wide_registers() {
+        // 2026-10-15 (bool-width canonicalization): the helper must convert
+        // a wide register to the canonical i8 Bool (invariant I1) — the
+        // And/Or arms used to emit at the operand's width under a bool
+        // label, the desync that produced `or i64` feeding `trunc i8`.
+        let mut backend = LlvmBackend::new();
+        let mut out = String::new();
+        let wide = TypedRegister {
+            name: "%wide".to_string(),
+            ty: Type::int(),
+        };
+        let coerced = backend.coerce_to_i8_bool(&mut out, "  ", &wide);
+        assert_eq!(coerced.ty, Type::bool_(), "result must carry the bool label");
+        assert!(
+            out.contains("trunc i64 %wide to i8"),
+            "an i64-labeled operand must be truncated to the canonical i8: {out}"
+        );
+
+        let mut out2 = String::new();
+        let canonical = TypedRegister {
+            name: "%b".to_string(),
+            ty: Type::bool_(),
+        };
+        let same = backend.coerce_to_i8_bool(&mut out2, "  ", &canonical);
+        assert!(
+            out2.is_empty(),
+            "a canonical bool passes through without new IR: {out2}"
+        );
+        assert_eq!(same.name, "%b");
+    }
+
+    #[test]
+    fn result_gate_or_emits_canonical_i8() {
+        // 2026-10-15 (bool-width canonicalization): the callable-txn
+        // convergence gate `[yes(term) || no(term)]` must emit `or i8` under
+        // the bool label — the desync class produced `or i64` feeding the
+        // gate's `trunc i8`, which clang rejects ("defined with type 'i64'
+        // but expected 'i8'").
+        let src = r#"
+            defn yes(x: Int) -> Bool { term true; };
+            defn no(x: Int) -> Bool { term false; };
+            txn step(k: Int)
+                [k >= 0][yes(term) || no(term)] -> Int {
+                term k;
+            };
+            let n: Int = 0;
+            node main [n == 0][n == 1] {
+                let r: Int = step(3);
+                endprogram Print#(r);
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(
+            ir.contains("or i8"),
+            "the gate disjunction emits at the canonical width: {ir}"
+        );
+        assert!(
+            !ir.contains("= or i64"),
+            "no i64 disjunction may feed a bool-labeled gate: {ir}"
+        );
+        assert!(
+            ir.contains("%pc"),
+            "the convergence gate must be emitted (guards the vacuous pass \
+             where the txn folds away entirely)"
+        );
     }
 }

@@ -896,9 +896,51 @@ Provenance: every item in the resolved program carries its module of origin (the
 let counter: Int = 0;
 const MaxRetries: Int = 3;
 init BufSize: Int = get_env_int!("BUFSIZE");
+plain let stdout_buf: Int = 0;   // library plumbing — not machine state
+state let emissions: Int = 0;    // asserted machine state (checked)
 ```
 
-Top-level `let` declares reactive program state. Local `let` declares a local binding. There is no `state` keyword.
+Top-level `let` declares reactive program state. Local `let` declares a local binding.
+
+**Storage classes (2026-10-17).** A top-level `let` belongs to one of two
+storage classes, decided by the compiler and disclosed via an `info:` line:
+
+- **state** — machine state. The variable lives in the machine's state
+  struct; contracts, watchdogs, `#!exit` conditions, result expressions,
+  and view bindings may reference it; the transition graph, liveness, and
+  dead-field elimination govern it.
+- **plain** — an ordinary variable. Same name, type, initializer, and
+  read/write behavior, but the machine does not reason about it: no
+  contract may reference it, it is not part of the transition graph, and
+  defns that touch only plain lets do not carry machine state.
+
+**Inference.** A bare top-level `let` is **state** when the proof surface
+(contracts, watchdog conditions and on-fire arguments, `#!exit`
+conditions, out-pragmas, result expressions, view bindings) references
+it, and **plain** otherwise. Node and defn *bodies* never affect the
+classification — reading or writing a plain let from a body compiles to
+ordinary access to its storage.
+
+**Checked assertions.** `state let` and `plain let` assert a category;
+the compiler checks the assertion against inference and rejects a
+contradicted declaration as an error, quoting the contradicting
+reference:
+
+- `plain let x` referenced by any contract → *"declared `plain`, but …
+  references it — a contract makes a variable machine state. Remove the
+  reference or declare it `state`."*
+- `state let x` referenced by nothing in the proof surface → *"declared
+  `state`, but no contract, watchdog, exit condition, or result
+  expression references it — the machine never reasons about it.
+  Contract over it or declare it `plain`."*
+
+`state` and `plain` are contextual modifiers (they are only modifiers
+when they directly precede a top-level `let`; a variable named `state`
+or `plain` is unaffected). Both classes have identical semantics for
+reads, writes, and initialization; they differ only in machine
+membership and backing storage. Library plumbing (buffers, fill
+pointers, RNG state — anything no contract references) is the canonical
+`plain` use.
 
 `const` declares an immutable top-level value. `$const` is a separate compile-time-only binding erased before runtime.
 
@@ -1480,7 +1522,7 @@ a statement, as a guarded (`when`) body, and as a `match`-arm body.
 
 ```briev
 defn parse(tag: Int) -> Int {
-    if tag > 4095 {
+    when tag > 4095 {
         trap;            // protocol violation — abort the process
     };
     term tag;
@@ -1638,6 +1680,14 @@ defn add(left: Int, right: Int) -> Int [true][term == left + right] {
 
 `term expression;` completes the current callable or convergence step. Briev has no `return` keyword.
 
+**The term rule (2026-10-16, term-semantics plan).** `term` has three shapes, and one gate:
+
+- `term expression;` — a VALUE term. In a defn it returns unconditionally. In a txn/node convergence body it is **P-gated**: when the item's precondition P still holds at the term, the firing stops (the txn commits, the node stops firing); when P no longer holds, control CONTINUES past the term into the rest of the body. A value term inside `when`/`match` targets the nearest enclosing item.
+- `term;` — the BARE term. P-gated by the same rule: P met ⇒ stop (returning void / stopping the firing); P unmet ⇒ continue into the rest of the body. With no enclosing contract it is an unconditional stop.
+- A final bare expression (no `;`) — the **tail** — is a defn body's implicit value, an UNconditional return: `defn double(x: Int) { x * 2 }`. A final `match` is the tail too (the json-shaped body). Tails are defn-only: txn/node convergence bodies spell `term` explicitly, and `when` bodies are execution blocks (a missing `;` there stays a syntax error). A VALUE tail in a `-> Void` body is a type error; a Void tail is fine.
+
+**Arrowless output inference (2026-10-16).** A defn/txn with no `-> T` is not untyped: the body's FIRST value site (`term <e>;` or the tail) gives the callable its output type, recorded at typecheck so call sites and the backend see one effective type. An arrowless body with no value site is void. Nodes are always void.
+
 A body-less internal signature uses `defn` with its contracts/effects and is staged until an implementation is supplied. There is no `sig` declaration.
 
 **2026-08-14 (generic `defn f<T>`):** a definition may declare type
@@ -1726,6 +1776,8 @@ transactions must express their postconditions without prior-state reads.
 
 A transaction is atomic with respect to its declared state transition. `rollback;` or `rollback reason;` aborts and reverts the current transaction/reactive firing.
 
+A txn body's `term` follows the term rule (§9.1, 2026-10-16): P met ⇒ the txn commits and the firing stops; P unmet ⇒ control continues into the rest of the body. A txn's output (if any) may be declared with `-> T` or inferred from its first value term.
+
 ```briev
 when invalid_input {
     rollback InvalidInput;
@@ -1757,6 +1809,10 @@ the contracts (who enables whom) and refuses any reactive cycle whose
 nodes declare no completion — a cycle that cannot be shown to quiesce
 carries no liveness obligation and does not compile. `--explain-causality`
 prints the derived wiring ("what fires into what") for inspection.
+
+A node body's `term` follows the term rule (§9.1, 2026-10-16): P met ⇒
+the node stops firing; P unmet ⇒ control continues into the rest of the
+body. Nodes are always void — no output, no tails.
 
 #### 9.4.1 Chains (`chain` / `into`, 2026-09-22)
 
@@ -1825,6 +1881,27 @@ obj/type facts are scoped to the declaration (type-body laws are inherited
 per instance). Mutually-exclusive guards never conflict — the
 satisfiability probe understands unit literals, pin-access chains, and
 opposite comparisons on the same lhs.
+
+#### 9.4.3 Lifecycle laws (2026-10-15)
+
+A top-level `when` law whose single arm is a lifecycle command states the
+program's **termination policy** instead of a fact:
+
+- `when G { endprogram; };` — the law `G ⟹ ended`. The compiler lowers it
+  to a reactive monitor (a `__briev_lifecycle_N` txn: the reactor
+  evaluates `G` every tick and ends the process when it holds — the same
+  cost class as any reactive txn watching `G`).
+- `when G { reside; };` — open-ended residency intent. Compile-time only:
+  residency is already the equilibrium behavior; the law suppresses the
+  no-terminator warning while `G` is satisfiable.
+
+A lifecycle law carries exactly one lifecycle arm and no facts; fact laws
+are separate declarations. Programs with no reachable process terminator
+(`endprogram`, `halt`, `trap`) and no reside law trigger a warning — the
+program runs until the process is killed. Stalling remains legal; the
+warning names the fix (`when <done> { endprogram; };` or `when true
+{ reside; };`). Embedded targets use the same rule: one `when true
+{ reside; };` declares the always-on intent.
 
 ### 9.5 Objects
 
@@ -2371,12 +2448,17 @@ which only ends the current transaction, `endprogram` exits the process even
 when a node's precondition remains satisfiable. Abrupt termination is not
 currently a source-language feature.
 
+For the shapes of reactive programs that compile — the multi-node phase
+chain, counter-goal convergence, the `async` + distinct-phase classification
+— and the diagnostics each failure mode produces, see
+`docs/guides/reactive-recipes.md`.
+
 **The exit code is the expression's value.** `endprogram code;` evaluates
 `code` — its side effects run (a print, an FFI call) — and the process exits
 with the value the expression yields. A side-effect intrinsic like `Print#`
-returns the neutral `0` (defns cannot be void, so a side-effect-only call
-claims the success value, not a payload); `endprogram Print#(x)` therefore
-prints `x` as the swan song and exits `0`. `endprogram greet(1)` exits with
+returns the neutral `0` — a side-effect-only call claims the success value,
+not a payload (a `-> Void` callable's call site binds no result);
+`endprogram Print#(x)` therefore prints `x` as the swan song and exits `0`. `endprogram greet(1)` exits with
 `greet`'s return — a genuine value carries to the exit code. The same
 consumption rule as `term`: the value flows to whatever consumes it (the
 term postcondition, the process exit code), and a side-effect expression's

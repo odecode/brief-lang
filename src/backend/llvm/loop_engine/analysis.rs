@@ -13,7 +13,7 @@ use std::collections::HashSet;
 /// an expression — meaning the block always exits.
 pub fn terminating_guard(statements: &[Statement]) -> bool {
     statements.iter().any(|s| {
-        matches!(s, Statement::Term(Some(_)) | Statement::EndProgram(Some(_)))
+        matches!(s, Statement::Term(Some(_)) | Statement::EndProgram(Some(_)) | Statement::Tail(_))
     })
 }
 
@@ -264,7 +264,7 @@ pub fn is_output_call(expr: &Expr) -> bool {
     match expr {
         // 2026-09-08 (anti-pattern audit): Print#/Println# are the ONLY
         // canonical output intrinsics — print! / println! lower to them via
-        // the print plugin. The raw __print_* frgn names were a second
+        // the print plugin. The raw print-family names were a second
         // hardcoded copy; benchmark call sites migrated to println!().
         Expr::Call(name, _, _) if name == "Print#" || name == "Println#" => true,
         _ => false,
@@ -278,11 +278,11 @@ pub fn observable_field_refs(
 ) -> HashSet<String> {
     let mut result = HashSet::new();
     match stmt {
-        Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) => {
+        Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) | Statement::Tail(e) => {
             collect_expr_field_refs(e, &mut result, field_index_map);
         }
         // 2026-07-19: Detect output calls in Expression statements.
-        // These come from !Print/!PrintLn which resolve to __print_*
+        // These come from !Print/!PrintLn which resolve to the print family
         // frgn calls. The optimizer must not eliminate these.
         Statement::Expression(e) => {
             if contains_output_call(e) {
@@ -323,7 +323,7 @@ pub fn seed_observable_idents(
         live.insert(f.clone());
     }
     match stmt {
-        Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) => {
+        Statement::EndProgram(Some(e)) | Statement::Term(Some(e)) | Statement::Tail(e) => {
             seed_from_expr(e, let_fields, live);
         }
         // 2026-07-19: Output calls in Expression statements (from !Print/!PrintLn)

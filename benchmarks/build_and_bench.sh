@@ -38,6 +38,22 @@ done
 # ── RESULT COLLECTION ───────────────────────────────────────────
 # Collected as "name|briev|c|ratio|winner|correctness"
 declare -a RESULTS=()
+# 2026-10-17 (suite tolerance): one broken benchmark must never abort the
+# suite (the bridge_glue build failure silently ended every full run from
+# 2026-10-13 — nobody saw a complete suite until 10-17). Entries are
+# "name" (briev build failed → run skipped) or "name:C" (C reference
+# failed → run skipped so a stale C binary can never feed the comparison).
+# The suite still exits non-zero at the end so failures are loud.
+declare -a BUILD_FAILURES=()
+record_build_fail() { BUILD_FAILURES+=("$1"); }
+build_failed() {
+    local name="$1"
+    local e
+    for e in ${BUILD_FAILURES[@]+"${BUILD_FAILURES[@]}"}; do
+        [ "${e%%:*}" = "$name" ] && return 0
+    done
+    return 1
+}
 record_result() {
     RESULTS+=("$1|$2|$3|$4|$5|$6")
 }
@@ -99,7 +115,12 @@ TAG[stack_push_pop]=runtime
 TAG[interval_step]=runtime
 TAG[gpu/saxpy]=runtime
 TAG[iir_filter_runtime]=runtime
-TAG[UTF8_ops]=optimizer
+# 2026-10-17 (sweep): the UTF8_ops entry is RETIRED — `utf8_ops.bv` moved to
+# benchmarks/archive/legacy-stdlib/ in 80c89d4c when its dependencies
+# (std/core/ring_buffer, std/types/UTF8view) were deleted, so the entry can
+# never build again (adjudicated in benchmarks/results/2026-09-30-b1-rebaseline.md
+# §5). Every run recorded a false BUILD-FAIL/SKIP row for it. The C reference
+# (utf8_ops_c.c) stays for the archive.
 TAG[ring_buffer_runtime]=runtime
 TAG[precompute_sum_runtime]=runtime
 TAG[binary_trees]=runtime
@@ -122,6 +143,7 @@ TAG[linked_list]=runtime
 TAG[hash_ops]=runtime
 TAG[hash_ops_idio]=runtime
 TAG[enemy_swarm]=runtime
+TAG[recommender]=runtime
 # 2026-10-09 (T2b): hot-loop-over-slice — measures the contiguous-slice
 # zero-copy VIEW vs the copy path. Self-contained (Briev vs Briev A/B); no C
 # reference, so it is NOT in the BENCHMARKS timing list (would SKIP on the
@@ -133,7 +155,8 @@ BENCHMARKS=(
     "precompute_sum"
     "const_heavy"
     "async_counters_idio"
-    "UTF8_ops"
+    # "utf8_ops" retired 2026-10-17 — source archived in 80c89d4c, deps deleted
+    # (benchmarks/results/2026-09-30-b1-rebaseline.md §5).
     "ring_buffer"
     # "async_counters_sym"   # excluded from timing (40 min at 50M)
     "float_math"
@@ -177,6 +200,13 @@ BENCHMARKS=(
     #                     # structure (was a 256-ring, a different workload).
     #                     # Verified MATCH at BOUND=50M, ~1.05x parity.
     "enemy_swarm"       # SoA reactive swarm (array-state)
+    # 2026-10-16 (plan 2026-10-16-cpp-vs-briev-contributor-findings.md):
+    # neighborhood-CF recommender core, derived from Otto Westerlund's
+    # cpp-vs-briev corpus (attributed in the .bv header). Self-contained —
+    # the MovieLens inputs are synthesized in-program by a shared LCG, so
+    # the correctness gate is byte-stable. Multi-node async + defn-extracted
+    # hot kernel; compiles clean at -O2/-O3.
+    "recommender"
     "bridge_glue"
     "bridge_multi"
     # "gpu/saxpy"        # no .bv file exists
@@ -246,7 +276,8 @@ build_bench() {
     # name, not an env assignment, so the direct `BOUND=.. $EXP cmd` form
     # fails with "BODYCOUNT=2048: command not found". `env` handles it.
     env BOUND="$bound" ${BENCH_ENV[$name]:-} ./target/release/brievc build "benchmarks/${name}.bv" \
-        --out benchmarks --optimize-budget "$budget" $gpu_flag 2>&1
+        --out benchmarks --optimize-budget "$budget" $gpu_flag 2>&1 \
+        || return 1
 
     if [ ! -f "$bin" ]; then
         # 2026-07-26: One-step link with briev_rt.c (no pre-compiled .o files).
@@ -254,7 +285,8 @@ build_bench() {
         # and the harness's separate briev_rt.o.
         clang -O3 -flto -march=native -ffast-math -fdata-sections -ffunction-sections \
             -Wl,--gc-sections "benchmarks/${name}.ll" "lib/runtime/briev_rt.c" \
-            -o "$bin" -lm 2>&1
+            -o "$bin" -lm 2>&1 \
+            || return 1
     fi
     if [ -f "$bin" ]; then
         echo "  Briev binary ready."
@@ -314,9 +346,16 @@ build_c() {
         src="benchmarks/${name}_c.c"
     else
         # 2026-07-27: No direct C source — check for cross-reference.
+        # 2026-10-17: a cross-reference is NOT a build failure — the timing
+        # phase reads `benchmarks/${ref_name}_c`, built by the reference's own
+        # build_c call (builds run before any timing). Returning 1 here made
+        # the build-failure tolerance record a false `queue_drain_idio:C`
+        # BUILD-FAIL and skip its row. Only a missing cross-ref target (or a
+        # failed clang, guarded below) is a real failure.
         local ref_name="${BRIEV_CROSS_REF[$name]:-}"
-        if [ -n "$ref_name" ]; then
+        if [ -n "$ref_name" ] && [ -f "benchmarks/${ref_name}_c.c" ]; then
             echo "  No C source — uses ${ref_name}_c for cross-reference timing"
+            return 0
         fi
         return 1
     fi
@@ -324,7 +363,9 @@ build_c() {
     # Build C reference with -O3 -ffast-math
     echo "  Building C reference..."
     extra_flags=${extra_flags:-""}
-    clang -O3 -march=native -ffast-math -o "benchmarks/${name}_c" "$src" ${extra_flags} 2>&1
+    if ! clang -O3 -march=native -ffast-math -o "benchmarks/${name}_c" "$src" ${extra_flags} 2>&1; then
+        return 1
+    fi
     echo "  C binary ready."
 }
 
@@ -819,15 +860,29 @@ for name in "${BENCHMARKS[@]}"; do
     if [ "$CORRECTNESS_ONLY" = true ]; then
         continue  # skip build in correctness-only mode
     fi
-    build_bench "$name"
+    if ! build_bench "$name"; then
+        record_build_fail "$name"
+        echo "  BUILD-FAIL: $name (recorded — suite continues)"
+        continue
+    fi
     if [ "$name" = "bridge_glue" ]; then
         echo "  bridge_glue: building C + Briev .so files..."
-        make -C benchmarks/bridge PROJECT_ROOT="$PWD" BRIDGE_DIR="$PWD/target/bridge_bench" BRIEVC="$PWD/target/release/brievc" all 2>&1 | sed 's/^/    /'
+        if ! make -C benchmarks/bridge PROJECT_ROOT="$PWD" BRIDGE_DIR="$PWD/target/bridge_bench" BRIEVC="$PWD/target/release/brievc" all 2>&1 | sed 's/^/    /'; then
+            record_build_fail "$name"
+            echo "  BUILD-FAIL: bridge_glue make (recorded — suite continues)"
+        fi
     elif [ "$name" = "bridge_multi" ]; then
         echo "  bridge_multi: building Briev .so + protocol shim..."
-        make -C benchmarks/multi_lang PROJECT_ROOT="$PWD" BUILD_DIR="$PWD/target/multi_lang" BRIEVC="$PWD/target/release/brievc" all 2>&1 | sed 's/^/    /'
+        if ! make -C benchmarks/multi_lang PROJECT_ROOT="$PWD" BUILD_DIR="$PWD/target/multi_lang" BRIEVC="$PWD/target/release/brievc" all 2>&1 | sed 's/^/    /'; then
+            record_build_fail "$name"
+            echo "  BUILD-FAIL: bridge_multi make (recorded — suite continues)"
+        fi
     else
-        build_c "$name" || true
+        if ! build_c "$name"; then
+            # C reference missing/stale must never feed a Briev-vs-C ratio.
+            record_build_fail "$name:C"
+            echo "  BUILD-FAIL: ${name}_c (C reference — comparison skipped)"
+        fi
     fi
 done
 fi  # end of DERIVE_MODE=false gate
@@ -840,6 +895,12 @@ echo "================================================"
 if [ "$DERIVE_MODE" = false ]; then
 for name in "${BENCHMARKS[@]}"; do
     filter_name "$name" || continue
+    # 2026-10-17: a failed build (recorded above) must skip its run — a
+    # stale or absent binary in the run loop produces misleading numbers.
+    if build_failed "$name"; then
+        record_result "$name" "BUILD-FAIL" "" "" "" "SKIP"
+        continue
+    fi
     bench_self_term "$name"
 done
 fi  # end of DERIVE_MODE=false gate
@@ -865,7 +926,10 @@ if [ "$DERIVE_MODE" = true ]; then
     echo "================================================"
     for name in "${DERIVE_BENCHMARKS[@]}"; do
         filter_derive_name "$name" || continue
-        build_derive_bench "$name"
+        if ! build_derive_bench "$name"; then
+            record_build_fail "$name"
+            echo "  BUILD-FAIL: $name (derive — recorded, suite continues)"
+        fi
     done
 
     echo ""
@@ -874,6 +938,10 @@ if [ "$DERIVE_MODE" = true ]; then
     echo "================================================"
     for name in "${DERIVE_BENCHMARKS[@]}"; do
         filter_derive_name "$name" || continue
+        if build_failed "$name"; then
+            record_result "$name" "BUILD-FAIL" "" "" "" "SKIP"
+            continue
+        fi
         bench_derive_self_term "$name"
     done
 fi
@@ -889,4 +957,18 @@ echo "================================================"
 
 if [ ${#RESULTS[@]} -gt 0 ]; then
     print_summary_table
+fi
+
+# 2026-10-17 (suite tolerance): failures are loud AFTER the full suite has
+# run — record and continue during the loops, aggregate non-zero exit here.
+if [ ${#BUILD_FAILURES[@]} -gt 0 ]; then
+    echo ""
+    echo "================================================"
+    echo "  BUILD FAILURES (${#BUILD_FAILURES[@]})"
+    echo "================================================"
+    for e in "${BUILD_FAILURES[@]}"; do
+        echo "  - $e"
+    done
+    echo "  (runs skipped for failed builds; suite still completed.)"
+    exit 1
 fi

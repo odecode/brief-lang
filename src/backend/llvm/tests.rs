@@ -887,7 +887,7 @@ defn f() -> Int {
     }
 };
 let sink: Int[2];
-node report [true][true] {
+node report [beginprogram][true] {
     sink[0] = f();
     term;
 };
@@ -923,7 +923,7 @@ defn first(s: String) -> Int {
     term s[0];
 };
 let sink: Int[2];
-node report [true][true] {
+node report [beginprogram][true] {
     sink[0] = first("abc");
     term;
 };
@@ -944,6 +944,44 @@ node report [true][true] {
     );
 }
 
+/// 2026-10-17 (liveness fixpoint): a rooted defn whose lowering reaches an
+/// in-unit helper through a cast LANE (`s as Int` → str_to_int) used to trip
+/// the IR-scan net — the type-agnostic liveness pass cannot see lane SOURCES
+/// (a consuming-lane root was tried 2026-10-12 and reverted: the any-cast
+/// over-approximation rooted the parse family in every unit). Introduced
+/// live by `734a8dac` via `pp-types.bv` (bisect-verified parent PASS / commit
+/// FAIL). The net now DERIVES the missing roots from the emitted calls and
+/// re-emits (fixpoint): the helper's define must appear.
+#[test]
+fn test_liveness_fixpoint_roots_emitted_lane_helper() {
+    let src = r#"
+defn str_to_int(s: String) -> Int {
+    term 0;
+};
+export defn parse_one(s: String) -> Int {
+    term s as Int;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::backend::register_types::register_typedefs(&mut items, &mut universe, 64)
+        .expect("type registration failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    assert!(
+        ir.contains("define i64 @str_to_int("),
+        "fixpoint must root the emitted lane helper's define:\n{ir}"
+    );
+    // Round-2 structural invariants (2026-10-17 re-entrancy audit): the
+    // parallel field vectors stay paired through build_field_index's
+    // rebuild, and the fixpoint's derived roots don't leak warnings.
+    assert_eq!(
+        backend.ctx.field_briev_types.len(),
+        backend.ctx.field_types.len(),
+        "field_briev_types must stay parallel to field_types across rounds"
+    );
+}
+
 /// 2026-10-05 (callable-txn convergence): a `txn` must emit the convergence
 /// loop — the postcondition gates done/loop. The 2026-09-14 linear branch
 /// (`is_linear_defn = !txn.is_reactive`) made every callable txn run once and
@@ -961,7 +999,7 @@ txn sum_to(n: Int, i: Int, acc: Int)
     term acc;
 };
 let sink: Int[2];
-node report [true][true] {
+node report [beginprogram][true] {
     sink[0] = sum_to(5, 0, 0);
     term;
 };
@@ -984,6 +1022,43 @@ node report [true][true] {
     );
 }
 
+/// 2026-10-16 (stability S4, fifth path): callable-txn bodies had the same
+/// flaw-4 shape — `let b = 0;` + `when c { b = …; }` demoted the alloca into
+/// the guard block while post-guard reads landed outside its dominance. The
+/// shared prologue pre-declares the entry alloca here too.
+#[test]
+fn test_callable_txn_reassigned_let_gets_entry_alloca() {
+    let src = r#"
+txn gated(bound: Int, b: Int) [b < bound][true] -> Int {
+    let v: Int = 0;
+    when bound > 0 {
+        v = 7;
+    };
+    term v;
+};
+let sink: Int;
+node report [beginprogram][true] {
+    sink = gated(1, 0);
+    term;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::backend::register_types::register_typedefs(&mut items, &mut universe, 64)
+        .expect("type registration failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    let f = function_body(&ir, "@gated(");
+    let alloca = f.find("= alloca i64")
+        .unwrap_or_else(|| panic!("@gated: no alloca:\n{f}"));
+    let guard = f.find("guard.then")
+        .unwrap_or_else(|| panic!("@gated: no guard:\n{f}"));
+    assert!(
+        alloca < guard,
+        "@gated: reassigned-let alloca must precede the guard block (entry, not guard.then):\n{f}"
+    );
+}
+
 /// 2026-10-05 (json.bv): a Char LOCAL read from a native-i32 register must
 /// NOT be truncated (`trunc i64 <i32>` is invalid IR). The else-branch Char
 /// unbox is only for boxed i64 params (`ty == Int`); a local typed Char is
@@ -997,7 +1072,7 @@ defn widen() -> Int {
     term c as Int;
 };
 let sink: Int[2];
-node report [true][true] {
+node report [beginprogram][true] {
     sink[0] = widen();
     term;
 };
@@ -1038,7 +1113,7 @@ defn rewrap(r: Result<Int, String>) -> Result<Int, String> {
     }
 };
 let sink: Int[2];
-node report [true][true] {
+node report [beginprogram][true] {
     let r = rewrap(Ok(5));
     match r {
         Ok(n) => { sink[0] = n; },
@@ -2304,6 +2379,242 @@ fn test_inline_directive_absent_no_extra_attr() {
     assert!(output.contains("alwaysinline"), "cycle-free txn should have alwaysinline by default");
 }
 
+// ── 2026-10-16 (absolute-limit addendum part 1): frame-limit check ──────────
+
+#[test]
+fn test_llvm_type_bytes_sizes() {
+    use crate::backend::llvm::emit_toplevel::llvm_type_bytes;
+    assert_eq!(llvm_type_bytes("i64", None), Some(8));
+    assert_eq!(llvm_type_bytes("i1", None), Some(1));
+    assert_eq!(llvm_type_bytes("float", None), Some(4));
+    assert_eq!(llvm_type_bytes("[1586126 x float]", None), Some(6344504));
+    assert_eq!(llvm_type_bytes("[4 x [8 x i64]]", None), Some(256));
+    // Structs: align-8 conservative sum of members.
+    assert_eq!(llvm_type_bytes("{ i64, float }", None), Some(16));
+    assert_eq!(llvm_type_bytes("%State", Some(1024)), Some(1024));
+    assert_eq!(llvm_type_bytes("%OpaqueChunk", None), None);
+}
+
+#[test]
+fn test_frame_limit_breach_rejects_with_fix() {
+    // thumbv7m declares frame_limit_bytes = 262144 (Cortex-M RAM stack
+    // policy); a 400 KB state array breaches it → house-style rejection with
+    // what/why/fix, not a downstream LLVM/linker mystery.
+    let big_state = TopLevel::StateDecl(StateDecl {
+        name: "big".to_string(),
+        ty: Type::Vector(Box::new(Type::Custom("Float".to_string())), vec![crate::ast::Dimension::Anonymous(100000)]),
+        span: None,
+    });
+    let mut backend = LlvmBackend::new().with_target_triple("thumbv7m-none-eabi");
+    // The array must be LIVE (observability-as-liveness): an unobserved field
+    // is elided from %State and the frame never grows.
+    let touch = TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "touch".to_string(),
+        is_reactive: true,
+        is_async: false,
+        type_params: vec![],
+        parameters: vec![],
+        output_type: None,
+        outputs: vec![],
+        contract: default_contract(),
+        body: vec![
+            Statement::Assign(
+                Expr::Identifier("count".to_string()),
+                Expr::Index(Box::new(Expr::Identifier("big".to_string())), Box::new(Expr::Decimal(0))),
+            ),
+            Statement::Term(None),
+        ],
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        span: None,
+        doc: None,
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.generate(&vec![big_state, state_count(), touch], None)
+    }));
+    let err = result.expect_err("frame breach must reject");
+    let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(msg.contains("frame limit"), "message states what: {msg}");
+    assert!(msg.contains("400000") || msg.contains("409600") || msg.contains("bytes"),
+        "message states the measured frame: {msg}");
+    assert!(msg.contains("Malloc#") && msg.contains("frame_limit_bytes"),
+        "message supplies the concrete fix: {msg}");
+}
+
+#[test]
+fn test_frame_limit_silent_when_under() {
+    // Same array under the x86_64 ceiling (2 GiB): no rejection, module
+    // emitted untouched.
+    let big_state = TopLevel::StateDecl(StateDecl {
+        name: "big".to_string(),
+        ty: Type::Vector(Box::new(Type::Custom("Float".to_string())), vec![crate::ast::Dimension::Anonymous(100000)]),
+        span: None,
+    });
+    let mut backend = LlvmBackend::new();
+    let touch = TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "touch".to_string(),
+        is_reactive: true,
+        is_async: false,
+        type_params: vec![],
+        parameters: vec![],
+        output_type: None,
+        outputs: vec![],
+        contract: default_contract(),
+        body: vec![
+            Statement::Assign(
+                Expr::Identifier("count".to_string()),
+                Expr::Index(Box::new(Expr::Identifier("big".to_string())), Box::new(Expr::Decimal(0))),
+            ),
+            Statement::Term(None),
+        ],
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        span: None,
+        doc: None,
+    });
+    let output = backend.generate(&vec![big_state, state_count(), touch], None);
+    assert!(output.contains("define"), "module emitted");
+}
+
+#[test]
+fn test_aggregate_zero_init_memset_threshold() {    // 2026-10-16 (cpp-vs-briev P1, flaw 1): aggregate zero-init at/above
+    // `aggregate_zero_init_memset_bytes` (default 4096) lowers to
+    // llvm.memset instead of one multi-megabyte aggregate store (LLVM 17's
+    // X86 IS crashed on `store [1586126 x float] zeroinitializer`); below
+    // the threshold the emission is byte-identical to the old store.
+    let big_state = TopLevel::StateDecl(StateDecl {
+        name: "big".to_string(),
+        ty: Type::Vector(Box::new(Type::Custom("Float".to_string())), vec![crate::ast::Dimension::Anonymous(1586126)]),
+        span: None,
+    });
+    let small_state = TopLevel::StateDecl(StateDecl {
+        name: "small".to_string(),
+        ty: Type::Vector(Box::new(Type::Custom("Float".to_string())), vec![crate::ast::Dimension::Anonymous(16)]),
+        span: None,
+    });
+    let mut backend = LlvmBackend::new();
+    // A txn is required so the program takes the standard init-state emission
+    // path (a state-only program emits no init stores), and the arrays must
+    // be LIVE (observability-as-liveness: an unobserved field gets no init).
+    let touch = TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "touch".to_string(),
+        is_reactive: true,
+        is_async: false,
+        type_params: vec![],
+        parameters: vec![],
+        output_type: None,
+        outputs: vec![],
+        contract: default_contract(),
+        body: vec![
+            Statement::Assign(
+                Expr::Identifier("count".to_string()),
+                Expr::Index(Box::new(Expr::Identifier("big".to_string())), Box::new(Expr::Decimal(0))),
+            ),
+            Statement::Assign(
+                Expr::Index(Box::new(Expr::Identifier("small".to_string())), Box::new(Expr::Decimal(1))),
+                Expr::Index(Box::new(Expr::Identifier("small".to_string())), Box::new(Expr::Decimal(0))),
+            ),
+            Statement::Term(None),
+        ],
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        span: None,
+        doc: None,
+    });
+    let output = backend.generate(&vec![big_state, small_state, state_count(), touch], None);
+    assert!(
+        output.contains("call void @llvm.memset.p0.i64(ptr %state, i8 0, i64 6344504, i1 false)")
+            || output.contains("call void @llvm.memset.p0.i64("),
+        "big aggregate zero-init must lower to llvm.memset"
+    );
+    assert!(
+        !output.contains("store [1586126 x float] zeroinitializer"),
+        "the giant aggregate store must be gone"
+    );
+    assert!(
+        output.contains("store [16 x float] zeroinitializer"),
+        "small aggregate zero-init must keep the plain store"
+    );
+}
+
+#[test]
+fn test_reassigned_let_in_reactive_txn_gets_entry_alloca() {    // 2026-10-16 (cpp-vs-briev flaw 4, BUGS.md): a node-body let assigned
+    // inside a guard and read after it must have its alloca in the function
+    // ENTRY. The reactive `@txn_<name>` and `@async_body_<name>` emitters
+    // skipped the reassigned-let pre-declaration, demoting the alloca into
+    // guard.thenN while the post-guard reads landed in guard.endN —
+    // "Instruction does not dominate all uses!" at every clang -O level.
+    // Pins the entry-vs-guard position in BOTH emitted functions.
+    let mut backend = LlvmBackend::new();
+    let body = vec![
+        Statement::Let {
+            name: "b".to_string(),
+            names: vec![],
+            ty: Some(Type::int()),
+            expr: Some(Expr::Decimal(0)),
+            modifiers: vec![],
+        },
+        Statement::Guarded(
+            Expr::BinaryOp(
+                crate::ast::BinaryOpKind::Gt,
+                Box::new(Expr::Identifier("count".to_string())),
+                Box::new(Expr::Decimal(0)),
+            ),
+            vec![Statement::Assign(
+                Expr::Identifier("b".to_string()),
+                Expr::Decimal(1),
+            )],
+        ),
+        Statement::Assign(
+            Expr::Identifier("count".to_string()),
+            Expr::Identifier("b".to_string()),
+        ),
+        Statement::Term(None),
+    ];
+    let txn = TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "guarded_let".to_string(),
+        is_reactive: true,
+        is_async: true,
+        type_params: vec![],
+        parameters: vec![],
+        output_type: None,
+        outputs: vec![],
+        contract: default_contract(),
+        body,
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        span: None,
+        doc: None,
+    });
+    let program = vec![state_count(), txn];
+    let output = backend.generate(&program, None);
+    let slice = |fname: &str| -> String {
+        let start = output
+            .find(&format!("define void @{}(", fname))
+            .unwrap_or_else(|| panic!("missing function @{}", fname));
+        let end = output[start..].find("\n}").map(|e| start + e).unwrap_or(output.len());
+        output[start..end].to_string()
+    };
+    for fname in ["txn_guarded_let", "async_body_guarded_let"] {
+        let f = slice(fname);
+        let alloca = f.find("= alloca ").unwrap_or_else(|| panic!("@{}: no alloca", fname));
+        let guard = f.find("guard.then").unwrap_or_else(|| panic!("@{}: no guard", fname));
+        assert!(
+            alloca < guard,
+            "@{}: reassigned-let alloca must precede the guard block (entry, not guard.then)",
+            fname
+        );
+    }
+}
+
 
 #[test]
 fn test_atomic_add_at_lowers_to_element_atomicrmw() {
@@ -2692,6 +3003,61 @@ fn test_endprogram_emits_process_exit() {
     let output = backend.generate(&program, None);
     assert!(output.contains("declare void @__exit(i64)"), "exit declare: {output}");
     assert!(output.contains("call void @__exit(i64"), "exit call: {output}");
+    assert!(output.contains("unreachable"), "unreachable after exit: {output}");
+}
+
+#[test]
+fn test_endprogram_calls_exit_prog_when_defn_present() {
+    // 2026-10-15 (core-usable purge): with the stdlib exit_prog defn in the
+    // unit, `endprogram` calls the stateful Briev defn (i64, %state) — the
+    // void @__exit C wrapper is the fallback only (emit_stmt endprogram
+    // branch). Sibling of test_endprogram_emits_process_exit.
+    let mut backend = LlvmBackend::new().with_force_emit_all(true);
+    let program = vec![
+        state_count(),
+        TopLevel::Definition(crate::ast::Definition {
+            variadic_param: None,
+            name: "exit_prog".to_string(),
+            type_params: vec![],
+            parameters: vec![("code".to_string(), Type::int())],
+            outputs: vec![Type::int()],
+            output_type: None,
+            contract: default_contract(),
+            body: vec![Statement::Term(Some(Expr::Identifier("code".into())))],
+            modifiers: vec![],
+            metadata: HashMap::new(),
+            derivation: None,
+            annotations: vec![],
+            span: None,
+            doc: None,
+        }),
+        TopLevel::Transaction(Transaction {
+            variadic_param: None,
+            name: "report".to_string(),
+            is_reactive: true,
+            is_async: false,
+            type_params: vec![],
+            parameters: vec![],
+            output_type: None,
+            outputs: vec![],
+            contract: default_contract(),
+            body: vec![Statement::EndProgram(Some(Expr::Decimal(7)))],
+            metadata: HashMap::new(),
+            derivation: None,
+            modifiers: vec![],
+            span: None,
+            doc: None,
+        }),
+    ];
+    let output = backend.generate(&program, None);
+    assert!(
+        output.contains("call i64 @exit_prog(ptr %state, i64 "),
+        "stateful exit_prog call when the defn is present: {output}"
+    );
+    assert!(
+        !output.contains("call void @__exit(i64"),
+        "C-fallback exit must not fire when exit_prog is present: {output}"
+    );
     assert!(output.contains("unreachable"), "unreachable after exit: {output}");
 }
 
@@ -3798,6 +4164,169 @@ fn library_mode_silences_undispatched_txn_warning() {
     );
 }
 
+// ── 2026-10-17 (reactive-only dispatch) ──────────────────────────────────
+// A dead callable `txn` declared in an imported stdlib module (the native
+// prelude imports std/iterator.bv, which ships `txn iter_take_loop<T>(...)`)
+// rides in the transition graph but is never a reactor step. Raw-count
+// dispatch gates counted it, knocking the single reactive node off the
+// per-field-phi fold — the only engine that emits the contract watchdog —
+// onto the direct-SSA loop, silently dropping the `-> handler` action
+// (series_converge printed nothing). Dispatch gates count REACTIVE
+// txns/nodes only.
+fn make_node_plus_dead_callable_program() -> Vec<TopLevel> {
+    let mut items: Vec<TopLevel> = vec![
+        TopLevel::StateDecl(StateDecl {
+            name: "i".to_string(),
+            ty: Type::int(),
+            span: None,
+        }),
+        TopLevel::StateDecl(StateDecl {
+            name: "x".to_string(),
+            ty: Type::float(),
+            span: None,
+        }),
+        // Runtime bound (`get_env_int!`) — a const bound + pure body would
+        // legitimately precompute instead of folding to the phi loop.
+        TopLevel::Statement(Box::new(Statement::Let {
+            name: "N".to_string(),
+            names: vec![],
+            ty: Some(Type::int()),
+            expr: Some(Expr::Call("get_env_int!".to_string(), vec![Expr::Quoted(b"BOUND".to_vec())], None)),
+            modifiers: vec![],
+        })),
+        TopLevel::Definition(Definition {
+            variadic_param: None,
+            name: "report".to_string(),
+            type_params: vec![],
+            parameters: vec![("v".to_string(), Type::float())],
+            outputs: vec![],
+            output_type: Some(OutputType::Single(Type::float())),
+            contract: default_contract(),
+            body: vec![Statement::Term(Some(Expr::Identifier("v".to_string())))],
+            modifiers: vec![],
+            metadata: HashMap::new(),
+            derivation: None,
+            annotations: vec![],
+            span: None,
+            doc: None,
+        }),
+    ];
+    items.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "run".to_string(),
+        is_reactive: true,
+        is_async: false,
+        type_params: vec![],
+        parameters: vec![],
+        output_type: None,
+        outputs: vec![],
+        contract: Contract {
+            pre_condition: Expr::BinaryOp(
+                BinaryOpKind::Lt,
+                Box::new(Expr::Identifier("i".to_string())),
+                Box::new(Expr::Identifier("N".to_string())),
+            ),
+            post_condition: Expr::Bool(true),
+            watchdog: Some(crate::ast::top::WatchdogSpec {
+                condition: Expr::BinaryOp(
+                    BinaryOpKind::Gt,
+                    Box::new(Expr::BinaryOp(
+                        BinaryOpKind::Mul,
+                        Box::new(Expr::Identifier("x".to_string())),
+                        Box::new(Expr::Identifier("x".to_string())),
+                    )),
+                    Box::new(Expr::Float(0.25)),
+                ),
+                is_required: false,
+                cycles_bound: None,
+                seconds_bound: None,
+                deadline_ns: None,
+                is_proven: true,
+                retries: 0,
+                fallback: None,
+                on_fire: Some(crate::ast::top::WatchdogOnFire {
+                    handler: "report".to_string(),
+                    arg: Some("x".to_string()),
+                }),
+            }),
+            explicit: true,
+            span: None,
+            post_authority: false,
+        },
+        body: vec![
+            Statement::Assign(
+                Expr::Identifier("i".to_string()),
+                Expr::BinaryOp(
+                    BinaryOpKind::Add,
+                    Box::new(Expr::Identifier("i".to_string())),
+                    Box::new(Expr::Decimal(1)),
+                ),
+            ),
+            // A non-counter write — this is what routes series_converge to the
+            // per-field-phi engine (counter-only write sets take the InlineSsa
+            // engine, which is part of the filed watchdog-emission gap).
+            Statement::Assign(
+                Expr::Identifier("x".to_string()),
+                Expr::BinaryOp(
+                    BinaryOpKind::Add,
+                    Box::new(Expr::Identifier("x".to_string())),
+                    Box::new(Expr::Float(0.5)),
+                ),
+            ),
+        ],
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        doc: None,
+        span: None,
+    }));
+    // The iter_take_loop shape: a generic parameterized callable txn, never
+    // referenced — exactly what std/iterator.bv contributes via the prelude.
+    items.push(TopLevel::Transaction(Transaction {
+        variadic_param: None,
+        name: "iter_take_loop".to_string(),
+        is_reactive: false,
+        is_async: false,
+        type_params: vec![crate::ast::top::TypeParam { name: "T".to_string(), bound: None }],
+        parameters: vec![("n".to_string(), Type::int()), ("i".to_string(), Type::int())],
+        output_type: None,
+        outputs: vec![],
+        contract: default_contract(),
+        body: vec![Statement::Term(None)],
+        metadata: HashMap::new(),
+        derivation: None,
+        modifiers: vec![],
+        doc: None,
+        span: None,
+    }));
+    items
+}
+
+#[test]
+fn dead_callable_txn_does_not_break_single_node_fold() {
+    let program = make_node_plus_dead_callable_program();
+    let mut backend = LlvmBackend::new();
+    let ir = backend.generate(&program, None);
+    assert!(
+        backend.warnings().iter().any(|w| w.contains("dispatched via per-field phi")),
+        "the single reactive node must keep the per-field-phi fold despite the \
+         dead callable txn, got: {:?}",
+        backend.warnings()
+    );
+    // The counter engine is the only watchdog emitter: the `.cmwd_` check and
+    // the on-fire call must both be present in main.
+    assert!(ir.contains(".cmwd_"), "watchdog check missing from the folded loop:\n{ir}");
+    assert!(
+        ir.contains("call i64 @report"),
+        "watchdog on-fire call missing from the folded loop:\n{ir}"
+    );
+    assert!(
+        !backend.warnings().iter().any(|w| w.contains("direct SSA loop")),
+        "the dead callable must not knock dispatch onto the SSA loop: {:?}",
+        backend.warnings()
+    );
+}
+
 // ── SLP Hazard Detection Tests ────────────────────────────
 
 fn make_slp_float_program(n_floats: usize, cross_body: Vec<Statement>, precondition: Option<Expr>) -> Vec<TopLevel> {
@@ -3995,8 +4524,19 @@ fn test_no_schema_import_no_validation() {
         }),
     ];
     let _output = backend.generate(&program, None);
-    assert!(backend.warnings().is_empty(),
-        "No schema import should produce no warnings");
+    // 2026-10-15 (lifecycle laws): the termination warning now fires for a
+    // program with no reachable terminator — this test's program is a bare
+    // StateDecl (a zombie by the new rule), so assert the SCHEMA contract
+    // specifically: no schema-validation warnings, not an empty warning
+    // list.
+    assert!(
+        backend
+            .warnings()
+            .iter()
+            .all(|w| w.contains("no path ends this program")),
+        "no schema import should produce no schema warnings: {:?}",
+        backend.warnings()
+    );
 }
 
 #[test]
@@ -5824,7 +6364,7 @@ fn test_batch_loop_dispatch_post_increment() {
                 Box::new(Expr::Identifier("count".into())),
                 Box::new(Expr::Decimal(100)))),
             Box::new(Expr::Decimal(0))),
-        vec![Statement::Expression(Expr::Call("__print_float".into(), vec![Expr::Identifier("f0".into())], None))]));
+        vec![Statement::Expression(Expr::Call("print_float".into(), vec![Expr::Identifier("f0".into())], None))]));
     body.push(Statement::Term(None));
     program.push(TopLevel::Transaction(Transaction {
         variadic_param: None,
@@ -5891,7 +6431,7 @@ fn test_countdown_field_backedge_copies_are_fast() {
                     Box::new(Expr::Identifier("count".into())),
                     Box::new(Expr::Decimal(100)))),
                 Box::new(Expr::Decimal(0))),
-            vec![Statement::Expression(Expr::Call("__print_float".into(), vec![Expr::Identifier("f0".into())], None))]),
+            vec![Statement::Expression(Expr::Call("print_float".into(), vec![Expr::Identifier("f0".into())], None))]),
         Statement::Term(None),
     ];
     program.push(TopLevel::Transaction(Transaction {
@@ -5961,7 +6501,7 @@ fn test_batch_loop_rejects_pre_increment() {
                             Box::new(Expr::Identifier("count".into())),
                             Box::new(Expr::Decimal(100)))),
                         Box::new(Expr::Decimal(0))),
-                    vec![Statement::Expression(Expr::Call("__print_int".into(), vec![Expr::Identifier("acc".into())], None))]),
+                    vec![Statement::Expression(Expr::Call("print_int".into(), vec![Expr::Identifier("acc".into())], None))]),
                 Statement::Assign(Expr::Identifier("acc".into()),
                     Expr::BinaryOp(BinaryOpKind::Add,
                         Box::new(Expr::Identifier("acc".into())),
@@ -5982,23 +6522,83 @@ fn test_batch_loop_rejects_pre_increment() {
 
 // ── FFI regression guard (2026-08-01, Phase 0-1 of the plugin/macro rework) ──
 // print!/println! rewrite to the generic Print# intrinsic, which the
-// backend emits as `call i64 @__print_*` (dispatch by the argument's type).
+// backend emits as a direct `call i64 @print_*(...)` (dispatch by the
+// argument's type) when the stdlib helpers are present, or the C-fallback
+// `@__print_*` symbols in a bare unit (core-usable purge, 2026-10-15).
 // The syntax renames in the plugin/macro rework (PrintLn! -> println!,
 // GetEnvInt! -> get_env_int!) must never introduce an indirection layer (GLUE
 // bridge shims, protocol chains) between the macro and the C runtime call.
-// This test pins that contract: if a future rewrite stops emitting the direct
-// call, it fails here.
+// These tests pin that contract: if a future rewrite stops emitting the direct
+// call, they fail here.
 
 /// Lex + parse a .bv source string into an AST (test helper).
 fn parse_bv_source(src: &str) -> Vec<TopLevel> {
     let tokens = crate::lexer::tokenize(src).expect("tokenize failed");
     let mut parser = crate::parser::Parser::new(tokens, src);
-    parser.parse_program().expect("parse failed")
+    let items = parser.parse_program().expect("parse failed");
+    // 2026-10-16 (stability): the backend test path bypasses the compile
+    // pipeline's analysis gates — six fixtures carried explicitly-written
+    // `[true][true]` contracts (rejected by prove_contract in every real
+    // `brievc build`) because nothing in THIS pipeline ever looked. The
+    // parse helper is the choke point every fixture flows through, so the
+    // proof-engine gate runs here: an illegal fixture fails the test that
+    // uses it, at the same site the pipeline would reject the source.
+    // Scope = contract legality (tautologies); the other pipeline gates
+    // (purity, concurrency classification) stay compile-side until a
+    // fixture needs them. Undo: delete this block.
+    for item in &items {
+        if let TopLevel::Transaction(t) = item {
+            if t.contract.explicit {
+                crate::proof_engine::prove_contract(
+                    &t.contract.pre_condition,
+                    &t.contract.post_condition,
+                    &t.parameters,
+                    true,
+                )
+                .unwrap_or_else(|errs| {
+                    panic!(
+                        "fixture contract rejected by the proof engine (this source \
+                         would not compile via `brievc build`): {} — {}",
+                        t.name,
+                        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+                    );
+                });
+            }
+        }
+    }
+    items
+}
+
+/// 2026-10-16 (stability): the fixture-legality gate in `parse_bv_source`
+/// must FIRE — an explicitly-written tautology contract is rejected here
+/// exactly as `brievc build` would reject it, instead of silently flowing
+/// into emission (the `[true][true]` escape that survived six fixtures).
+#[test]
+fn test_fixture_gate_rejects_tautology_contract() {
+    let src = r#"
+let sink: Int;
+node report [true][true] {
+    sink = 1;
+    term;
+};
+"#;
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_bv_source(src)
+    }))
+    .expect_err("tautology fixture must be rejected at the choke point");
+    let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(msg.contains("proof engine"), "names the gate: {msg}");
+    // The ProofError layer's canonical wording (the friendlier "true ⇒ true
+    // is trivial" render is added by the compile pipeline on top of it).
+    assert!(
+        msg.contains("unreachable precondition") || msg.contains("trivial"),
+        "carries the proof reason: {msg}"
+    );
+    assert!(msg.contains("report"), "names the txn: {msg}");
 }
 
 #[test]
-fn test_print_plugin_emits_direct_ffi_calls() {
-    let src = r#"
+fn test_print_plugin_emits_direct_ffi_calls() {    let src = r#"
         let x: Int = 5;
         defn show(v: Int) -> Int {
             println!(v);
@@ -6019,11 +6619,52 @@ fn test_print_plugin_emits_direct_ffi_calls() {
     let ir = backend.generate(&items, None);
     assert!(
         ir.contains("call i64 @__print_int("),
-        "expected direct @__print_int call after plugin rewrite; got:\n{ir}"
+        "bare unit: expected direct C-fallback @__print_int call; got:\n{ir}"
     );
     assert!(
         ir.contains("call i64 @__print_char("),
-        "expected direct @__print_char newline call after plugin rewrite; got:\n{ir}"
+        "bare unit: expected direct C-fallback @__print_char newline call; got:\n{ir}"
+    );
+    assert!(
+        !ir.contains("bridge_"),
+        "print rewrite must not route through the GLUE bridge; got:\n{ir}"
+    );
+}
+
+#[test]
+fn test_print_plugin_dispatches_to_plain_helpers_when_present() {
+    // 2026-10-15 (core-usable purge): with the stdlib print defns in the
+    // unit (the real prelude pipeline), Print# resolves to the PLAIN helper
+    // names and passes %state — the C symbols are the --no-stdlib fallback
+    // only. Mirrors test_print_plugin_emits_direct_ffi_calls (bare unit).
+    let src = r#"
+        out defn print_int(n: Int) [true][term >= 0] -> Int { term 0; };
+        out defn put_char(c: Int) [true][term >= 0] -> Int { term 0; };
+        let x: Int = 5;
+        defn show(v: Int) -> Int {
+            println!(v);
+            term v;
+        };
+
+        let done: Bool = false;
+        node __test_go [done == false][done == true] { done = true; show(0); };
+    "#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.register(Box::new(crate::plugin::print_plugin::PrintPlugin));
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("print plugin stage failed");
+
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    assert!(
+        ir.contains("call i64 @print_int("),
+        "expected direct @print_int call when the defn is present; got:\n{ir}"
+    );
+    assert!(
+        ir.contains("call i64 @put_char("),
+        "expected direct @put_char newline call when the defn is present; got:\n{ir}"
     );
     assert!(
         !ir.contains("bridge_"),
@@ -6783,9 +7424,23 @@ fn test_consumptive_op_on_const_let_in_txn() {
         .expect("plugin stage failed");
     let mut backend = LlvmBackend::new().with_type_universe(universe);
     let ir = backend.generate(&items, None);
+    // 2026-10-17 (plain storage): a/b are bare lets no contract references —
+    // they classify PLAIN and lower to module-scope globals with the
+    // LITERAL folded into the declaration (a runtime zero-seed store would
+    // defeat %State promotion in the loop; measured 879ms→457ms). The old
+    // failure mode was an UNDEFINED @b; the plain path must never
+    // reproduce it.
     assert!(
-        !ir.contains("load i64, ptr @b"),
-        "a consumed const-let must resolve as a %State field, not an undefined @b global; got:\n{ir}"
+        ir.contains("@b = global i64 3"),
+        "a consumed const-let must lower to a DEFINED plain global with its literal folded in; got:\n{ir}"
+    );
+    assert!(
+        ir.contains("load i64, ptr @b"),
+        "the consumptive read must load the plain global; got:\n{ir}"
+    );
+    assert!(
+        ir.contains("load i64, ptr @b"),
+        "the consumptive read must load the seeded plain global; got:\n{ir}"
     );
     assert!(
         ir.contains("add nsw i64") || ir.contains("add i64"),
@@ -6832,7 +7487,7 @@ fn test_arrow_only_collection_is_kept_in_state() {
 // ── Coll grow-on-full (2026-08-15) ────────────────────────────────────
 
 /// A `coll obj` push past the default cap (16) must emit the grow-on-full
-/// guard: `if len == cap { __briev_coll_resize(h, cap * 2) }` BEFORE the
+/// guard: `if len == cap { coll_resize(h, cap * 2) }` BEFORE the
 /// store, and re-read `data` from the slot after the join (the runtime
 /// mutates the `[data, cap, len]` block in place — no register merge).
 /// Pre-fix the scaffolded push had no guard and wrote OOB past the 16-slot
@@ -8544,7 +9199,7 @@ node start [true][false] {
 fn test_loop_txn_last_consumer_emits_free_after_loop() {
     // A countable-loop txn (the benchmark's countdown shape, with a periodic
     // `when` guard) that is a heap-backed field's last consumer must emit
-    // __briev_free AFTER the loop exits (never inside the iterating body).
+    // rt_free AFTER the loop exits (never inside the iterating body).
     let src = r#"
 let N: Int = GetEnvInt#("BOUND");
 let buf: Ptr<Int> = Malloc#(64) as Ptr<Int>;
@@ -10148,6 +10803,35 @@ fn test_riscv_isr_full_context_scaffold() {
 }
 
 #[test]
+fn test_trap_frame_survives_fixpoint_round() {
+    // 2026-10-17 (liveness fixpoint re-entrancy): @__briev_trap_frame is
+    // written into the emitting round's `out` behind a dedup flag; when the
+    // net discards round 1 and re-emits, the flag must reset or the final
+    // module references an undeclared global. Fixture = the scaffold
+    // program + a net-missing cast lane so generate genuinely re-enters.
+    let src = "isr<riscv_machine> handler @ 7: tick() [true][n >= 0] { n = n; };\n\
+               defn str_to_int(s: String) -> Int {\n    term 0;\n};\n\
+               export defn parse_one(s: String) -> Int {\n    term s as Int;\n};\n\
+               let n: Int = 0;\n";
+    let mut program = parse_isr_program(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::backend::register_types::register_typedefs(&mut program, &mut universe, 64)
+        .expect("type registration failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&program, None);
+    // The net actually fired (round 2 produced this output).
+    assert!(
+        ir.contains("define i64 @str_to_int("),
+        "fixture must exercise the fixpoint re-entry:\n{ir}"
+    );
+    assert!(
+        ir.contains("@__briev_trap_frame = global [32 x i64] zeroinitializer"),
+        "trap frame global must be re-emitted in the surviving round:\n{ir}"
+    );
+    assert!(ir.contains("define void @tick()"), "scaffold still emitted:\n{ir}");
+}
+
+#[test]
 fn test_embedded_equilibrium_parks_in_wfi() {
     // On ARM/RISC-V embedded targets the reactor parks in wfi when no node
     // can fire (equilibrium), with the ~{memory} clobber that keeps
@@ -10581,7 +11265,9 @@ node go [done == false][done == true] {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let ll = out.with_extension("ll");
-    let prelude = "declare i64 @__print_int(i64)\ndeclare i64 @__print_char(i64)\n";
+    // wait_for_trigger/watchdog_fail are emitted by the SSA loop's equilibrium
+    // path — declare them for the standalone link (compile.rs normally does).
+    let prelude = "declare i64 @__print_int(i64)\ndeclare i64 @__print_char(i64)\ndeclare void @wait_for_trigger(ptr)\ndeclare i64 @watchdog_fail(ptr)\n";
     if let Some(pos) = ir.find("target triple") {
         let end = ir[pos..].find('\n').map(|e| pos + e + 1).unwrap_or(ir.len());
         ir.insert_str(end, prelude);
@@ -10745,5 +11431,283 @@ node run [i < 1][i == 1] {
     assert!(
         !ir.contains("load ptr, ptr"),
         "the flowed single-concrete dyn must be Inline (no thunk-table indirect call):\n{ir}"
+    );
+}
+
+// ── 2026-10-17 (plain storage, SPEC §8.1) ────────────────────────────────
+// The buffered-stdout regression: library state fields put `ptr %state` on
+// the whole print chain; any loop containing a print made the %State alloca
+// escape and SROA refused promotion (interval_step 848ms → 414ms/500M in
+// the counterfactual). Plain storage makes plumbing non-state: the print
+// chain drops %state, the alloca never escapes, clang promotes.
+
+#[test]
+fn plain_stdlib_plumbing_print_chain_has_no_state_param() {
+    // A defn touching only plain lets must NOT take %state, and a node loop
+    // with a guarded println must compile to a print chain WITHOUT a state
+    // parameter — the exact counterfactual shape.
+    let src = r#"
+plain let stdout_buf: Int = 0;
+plain let stdout_fill: Int = 0;
+let count: Int = 0;
+defn put_byte(b: Int) -> Int [b >= 0][term >= 0] {
+    stdout_fill = stdout_fill + 1;
+    term 0;
+};
+node work [count < 3][count == 3] {
+    when count % 1 == 0 {
+        let _r: Int = put_byte(count);
+    };
+    count = count + 1;
+    term;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    assert!(
+        ir.contains("@stdout_buf = global i64 0") && ir.contains("@stdout_fill = global i64 0"),
+        "plain lets must lower to module-scope globals:\n{ir}"
+    );
+    assert!(
+        !ir.contains("@stdout_buf, ptr %state") && !ir.contains("%State, ptr %state, i32 0, i32 0, ptr @stdout"),
+        "plain storage must not alias into %State:\n{ir}"
+    );
+    // The needs-state verdict for the plumbing defn: its function signature
+    // must carry NO %state pointer.
+    assert!(
+        ir.contains("define i64 @put_byte(i64 %arg0)"),
+        "a plain-only defn must be emitted WITHOUT the %state param:\n{ir}"
+    );
+}
+
+#[test]
+fn state_declared_but_unreferenced_is_an_error() {
+    let src = r#"
+state let orphan: Int = 0;
+let count: Int = 0;
+node work [count < 3][count == 3] {
+    count = count + 1;
+    term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let errors = crate::analysis::storage_class::storage_assertion_errors(
+        &items,
+        None,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("'orphan' is declared `state`")),
+        "a `state` declaration nothing proves over must error: {errors:?}"
+    );
+}
+
+#[test]
+fn plain_declared_but_contracted_is_an_error() {
+    let src = r#"
+plain let tracked: Int = 0;
+let count: Int = 0;
+node work [count < 3][count == 3 && tracked >= 0] {
+    count = count + 1;
+    term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let errors = crate::analysis::storage_class::storage_assertion_errors(
+        &items,
+        None,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("'tracked' is declared `plain`")),
+        "a `plain` declaration the proof surface references must error: {errors:?}"
+    );
+}
+
+#[test]
+fn bare_let_contracted_infers_state_not_plain() {
+    // The contract makes `acc` machine state even though no body-writes and
+    // the init is scalar — the proof surface wins (R3: never demote a
+    // contracted field).
+    let src = r#"
+let acc: Int = 0;
+let count: Int = 0;
+node work [count < 3][count == 3 && acc >= 0] {
+    count = count + 1;
+    term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let plain = crate::analysis::storage_class::classify_plain_lets(
+        &items,
+        None,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        !plain.contains("acc"),
+        "a contracted bare let must infer state, never plain: {plain:?}"
+    );
+    assert!(
+        plain.contains("acc") == false && plain.is_empty() || !plain.contains("acc"),
+        "sanity"
+    );
+}
+
+#[test]
+fn bare_plumbing_let_infers_plain() {
+    // Written only by a defn, referenced by no contract — the exact
+    // stdout_buf/stdout_fill/rand_state shape — must infer plain WITHOUT an
+    // annotation (inference-first; the info: line discloses it).
+    let src = r#"
+let fill: Int = 0;
+let count: Int = 0;
+defn bump() -> Int [true][term >= 0] {
+    fill = fill + 1;
+    term fill;
+};
+node work [count < 3][count == 3] {
+    let _r: Int = bump();
+    count = count + 1;
+    term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let plain = crate::analysis::storage_class::classify_plain_lets(
+        &items,
+        None,
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        plain.contains("fill"),
+        "a defn-only-written bare let must infer plain: {plain:?}"
+    );
+    assert!(
+        !plain.contains("count"),
+        "a node-written let must stay state: {plain:?}"
+    );
+}
+
+// ── 2026-10-17 (readiness gate 1): watchdog honor-or-refuse ─────────────
+// The watchdog `?[cond] -> handler(arg)` was emitted only on counter-engine
+// dispatches; InlineSsa, version-DAG, and the direct-SSA loop dropped it
+// silently (the reactor still refuses — its fire must latch across ticks).
+// Each test drives a program whose watchdog-carrying node dispatches to one
+// of the previously-dropping engines and asserts the handler FIRES (the
+// C-stub prints the fired value) and the program terminates.
+
+fn run_with_print_stub(src: &str, test_tag: &str) -> String {
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    use std::process::Command;
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let rt = std::env::temp_dir().join(format!("briev_wd_stub_{}.c", test_tag));
+    std::fs::write(&rt, "#include <stdio.h>\n#include <stdint.h>\nint64_t __print_int(int64_t n) { printf(\"%ld\", (long)n); return 0; }\nint64_t __print_char(int64_t c) { putchar((int)c); return 0; }\nint64_t wait_for_trigger(void* s) { (void)s; return 0; }\nint64_t watchdog_fail(void* s) { (void)s; return -1; }\n").expect("write stub");
+    let out = std::env::temp_dir().join(format!("briev_wd_{}_{}", test_tag, std::process::id()));
+    let ll = out.with_extension("ll");
+    let prelude = "declare i64 @__print_int(i64)\ndeclare i64 @__print_char(i64)\ndeclare void @wait_for_trigger(ptr)\ndeclare i64 @watchdog_fail(ptr)\n";
+    let ir = if let Some(pos) = ir.find("target triple") {
+        let end = ir[pos..].find('\n').map(|e| pos + e + 1).unwrap_or(ir.len());
+        format!("{}{}{}", &ir[..end], prelude, &ir[end..])
+    } else {
+        format!("{prelude}{ir}")
+    };
+    // The freestanding linux entry (@_start, naked asm) collides with the
+    // crt's _start under this plain clang link — strip it and let the crt
+    // call main (same convention as the printf-stub tests above).
+    let ir = match ir.find("define void @_start()") {
+        Some(pos) => {
+            let end = ir[pos..].find("\n}\n").map(|e| pos + e + 3).unwrap_or(ir.len());
+            format!("{}{}", &ir[..pos], &ir[end..])
+        }
+        None => ir,
+    };
+    std::fs::write(&ll, &ir).expect("write .ll");
+    let compile = Command::new("clang").arg("-O0").arg(&ll).arg(&rt).arg("-lm").arg("-o").arg(&out).output().unwrap();
+    assert!(
+        compile.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&rt);
+    assert!(
+        run.status.success(),
+        "program crashed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    stdout
+}
+
+#[test]
+fn watchdog_fires_on_direct_ssa_dispatch() {
+    // Two reactive nodes → direct-SSA loop (the biggest dropper: every
+    // prelude-importing multi-node program since 2026-10-06). `watch`'s
+    // liveness gate holds while count < 4; at count == 4 the handler fires
+    // with the live count and the dispatch loop exits.
+    let src = r#"
+let count: Int = 0;
+defn report(v: Int) -> Int [v >= 0][term >= 0] { term Print#(v); };
+node tick [count < 9][count == 9] { count = count + 1; term; };
+node watch [count >= 0][count >= 0] ?[count < 4] -> report(count) { term; };
+"#;
+    let out = run_with_print_stub(src, "ssa");
+    assert_eq!(
+        out.trim(),
+        "4",
+        "the SSA-dispatched watchdog must fire report(4) when the gate goes false; got:\n{out:?}"
+    );
+}
+
+#[test]
+fn watchdog_fires_on_inline_ssa_dispatch() {
+    // Single node, counter-only writes → InlineSsa (emit_folded_main) — the
+    // counter-only shape that previously dropped the watchdog entirely.
+    let src = r#"
+let count: Int = 0;
+defn report(v: Int) -> Int [v >= 0][term >= 0] { term Print#(v); };
+node tick [count < 9][count == 9] ?[count < 4] -> report(count) {
+    count = count + 1;
+    term;
+};
+"#;
+    let out = run_with_print_stub(src, "inline");
+    assert_eq!(
+        out.trim(),
+        "4",
+        "the InlineSsa-dispatched watchdog must fire report(4); got:\n{out:?}"
+    );
+}
+
+#[test]
+fn watchdog_fires_on_version_dag_dispatch() {
+    // Single node with a runtime `when` guard → version-DAG fold.
+    let src = r#"
+let count: Int = 0;
+let x: Int = 0;
+defn report(v: Int) -> Int [v >= 0][term >= 0] { term Print#(v); };
+node tick [count < 9][count == 9] ?[count < 4] -> report(count) {
+    when count > 2 { x = 5; };
+    count = count + 1;
+    term;
+};
+"#;
+    let out = run_with_print_stub(src, "vdag");
+    assert_eq!(
+        out.trim(),
+        "4",
+        "the version-DAG-dispatched watchdog must fire report(4); got:\n{out:?}"
     );
 }

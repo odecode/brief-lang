@@ -35,6 +35,12 @@ pub struct TargetSettings {
     /// the inference source for mechanism-less `node @ vector` declarations.
     /// None = the target declares no machine-entry convention (hosted).
     pub isr_mechanism: Option<String>,
+    /// 2026-10-16 (absolute-limit addendum part 1): the target's per-function
+    /// frame ceiling in bytes — a machine fact (x86-64: displacement-cliff
+    /// territory; embedded: declared RAM stack). The backend sums every
+    /// emitted function's `alloca` sizes exactly and rejects a breach. None =
+    /// no declared ceiling (hosted targets without a row field).
+    pub frame_limit_bytes: Option<u64>,
 }
 
 /// Global (target-independent) IR lowering tuning (plan §8.2).
@@ -53,6 +59,26 @@ pub struct IrLoweringSettings {
     /// SVO small-vector inline element cap.
     /// Weighted body-cost threshold for callable-txn auto-inline.
     pub callable_inline_weight_threshold: u32,
+    /// 2026-10-16 (cpp-vs-briev P1, flaw 1): aggregate zero-init at or above
+    /// this byte size lowers to `llvm.memset` instead of a single
+    /// `store [N x T] zeroinitializer` — multi-megabyte aggregate stores
+    /// crashed LLVM 17's X86 instruction selector (Otto Westerlund's
+    /// global-Float-array probe) and are pathological at any LLVM version.
+    pub aggregate_zero_init_memset_bytes: usize,
+    /// 2026-10-16 (cpp-vs-briev P2, flaw 2): weighted body-cost threshold for
+    /// the reactive node-txn auto-inline. Bodies above it lose the
+    /// unconditional `alwaysinline` (the whole-program-inlined-into-one-
+    /// function shape LLVM 17's greedy regalloc segfaults on); LLVM's own
+    /// inliner still inlines where profitable. Measured derivation
+    /// (2026-10-16, results file "absolute-limit instrumentation"): the
+    /// largest known-healthy node weighs ~510 (bisected; stays alwaysinline,
+    /// emission byte-identical); the lowest known-crashing shape ~1460
+    /// (LLVM 17 greedy-RA defect, BUGS.md ledger). 600 = 1460/2.4 safety,
+    /// inside the healthy/crashing gap. The RA-knee sweep
+    /// (benchmarks/ra_knee_sweep.sh) shows clang 23 compile cost is linear
+    /// through 51k weight — this valve guards only the ledgered defect and
+    /// retires with it (floor toolchain > 17).
+    pub node_inline_weight_threshold: u32,
     /// Accel auto-tuning probe: full-map runs per lane (Phase 7).
     pub accel_probe_k: u64,
     /// Accel probe output-equality tolerance (relative per element).
@@ -370,6 +396,7 @@ pub const DEFAULT_TARGET_SETTINGS: TargetSettings = TargetSettings {
     dense_compute_density: 4.0,
     vector_min_width: 4,
     isr_mechanism: None,
+    frame_limit_bytes: None,
 };
 
 const DEFAULT_IR_LOWERING: IrLoweringSettings = IrLoweringSettings {
@@ -379,6 +406,8 @@ const DEFAULT_IR_LOWERING: IrLoweringSettings = IrLoweringSettings {
     max_fields_per_alloca: 15,
     sso_max_bytes: 6,
     callable_inline_weight_threshold: 40,
+    aggregate_zero_init_memset_bytes: 4096,
+    node_inline_weight_threshold: 600,
     accel_probe_k: 2,
     accel_probe_tolerance: 0.0001,
     accel_probe_margin: 0.05,
@@ -521,6 +550,8 @@ const IR_LOWERING_KEYS: &[(&str, bool)] = &[
     ("max_fields_per_alloca", false),
     ("sso_max_bytes", false),
     ("callable_inline_weight_threshold", false),
+    ("aggregate_zero_init_memset_bytes", false),
+    ("node_inline_weight_threshold", false),
     ("accel_probe_k", false),
     ("accel_probe_tolerance", true),
     ("accel_probe_margin", true),
@@ -584,6 +615,14 @@ fn render_ir_lowering(s: &IrLoweringSettings, skip: &[String]) -> String {
     push(
         "callable_inline_weight_threshold",
         s.callable_inline_weight_threshold.to_string(),
+    );
+    push(
+        "aggregate_zero_init_memset_bytes",
+        s.aggregate_zero_init_memset_bytes.to_string(),
+    );
+    push(
+        "node_inline_weight_threshold",
+        s.node_inline_weight_threshold.to_string(),
     );
     push("accel_probe_k", s.accel_probe_k.to_string());
     push("accel_probe_tolerance", s.accel_probe_tolerance.to_string());
@@ -781,6 +820,11 @@ fn load_target_settings() -> HashMap<String, TargetSettings> {
         // 2026-09-14 (machine-entry plan): field 3 — the target's ISR
         // mechanism row (inference source for `node @ vector`).
         let isr_mechanism = db.field_string(&key, 3).map(|v| v.to_string());
+        // 2026-10-16 (absolute-limit addendum part 1): field 4 — the
+        // per-function frame ceiling in bytes. Absent = no declared ceiling.
+        let frame_limit_bytes = db
+            .field_int(&key, 4)
+            .map(|v| v as u64);
         out.insert(
             prefix.to_string(),
             TargetSettings {
@@ -788,6 +832,7 @@ fn load_target_settings() -> HashMap<String, TargetSettings> {
                 dense_compute_density,
                 vector_min_width,
                 isr_mechanism,
+                frame_limit_bytes,
             },
         );
     }
@@ -839,6 +884,13 @@ fn parse_ir_lowering(content: &str) -> IrLoweringSettings {
         callable_inline_weight_threshold: db
             .field_int("callable_inline_weight_threshold", 0)
             .unwrap_or(DEFAULT_IR_LOWERING.callable_inline_weight_threshold as i64) as u32,
+        aggregate_zero_init_memset_bytes: db
+            .field_int("aggregate_zero_init_memset_bytes", 0)
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_IR_LOWERING.aggregate_zero_init_memset_bytes),
+        node_inline_weight_threshold: db
+            .field_int("node_inline_weight_threshold", 0)
+            .unwrap_or(DEFAULT_IR_LOWERING.node_inline_weight_threshold as i64) as u32,
         accel_probe_k: db
             .field_int("accel_probe_k", 0)
             .map(|v| v.max(1) as u64)

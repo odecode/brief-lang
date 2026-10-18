@@ -116,6 +116,14 @@ pub struct CompilerContext {
     /// a clean C ABI. Previously every regular defn carried state, forcing
     /// all callers to too.
     pub defn_needs_state: HashMap<String, bool>,
+    /// 2026-10-15 (type-dependent member statefulness): concrete type names
+    /// with at least one state-taking member (export_abi::type_stateful_members).
+    /// A monomorphized trait default/generic specialized to such a type must
+    /// take `%state` even when the base (type-agnostic) verdict is stateless —
+    /// `put_cstr$GrowBuf` reaches `Malloc#` through `GrowBuf.put_u8`, while
+    /// `put_cstr$ByteBuf` does not. Consumed at the specialization site
+    /// (emit_expr.rs) to OR into the mono copy's `defn_needs_state`.
+    pub type_stateful_members: HashSet<String>,
     /// 2026-07-27: Reverse index from state field position to field name.
     /// Used by load_field_type() to look up !range metadata by field index.
     pub idx_to_field_name: HashMap<usize, String>,
@@ -131,6 +139,25 @@ pub struct CompilerContext {
     /// pruned by dead-field elimination. Frontend-computed (ViewCompiler
     /// root signals) and copied here before generate().
     pub view_bound_fields: std::collections::HashSet<String>,
+    /// 2026-10-17 (plain storage, SPEC §8.1): top-level lets classified
+    /// PLAIN — declared `plain`, or bare and unreferenced by the proof
+    /// surface (contracts, watchdogs, `#!exit`, `endprogram` output, view
+    /// bindings). Lowered to module-scope `@name` globals, NOT `%State`
+    /// fields: defns touching only plain lets carry no `%state`, so the
+    /// state alloca never escapes through them (the buffered-stdout
+    /// regression). Computed in generate_with_analysis before build_field_
+    /// index; the classification's check (declared-vs-inferred) fires there.
+    pub plain_lets: std::collections::HashSet<String>,
+    /// Plain-let lowering table: type + initializer expr for module-scope
+    /// `@name = global <ty> 0` emission and (when the init is non-trivial)
+    /// pre-reactor seeding beside the `init` invariants.
+    pub plain_global_types:
+        std::collections::HashMap<String, (crate::ast::Type, Option<crate::ast::Expr>)>,
+    /// 2026-10-17 (readiness gate 1): async-dispatched nodes' watchdog specs
+    /// for emit_async_phase's gate (name, spec) — populated from the txn list
+    /// right before main emission; the phase needs &mut self, so the contracts
+    /// ride in ctx.
+    pub async_phase_watchdogs: Vec<(String, Option<crate::ast::top::WatchdogSpec>)>,
     /// 2026-08-12 (Iterable protocol, slice 4): the `b-each` iterable fields
     /// that are generic collections — the backend emits a
     /// `__view_items_<field>()` snapshot materializer for each (driving the
@@ -400,6 +427,9 @@ pub atomic_fields: std::collections::HashMap<String, String>,
     /// `modulo_partition` (modulo-switch dispatch).
     pub density: HashMap<String, crate::analysis::density::ComputeDensity>,
     pub inline_decisions: HashMap<String, crate::analysis::inline_cost::InlineDecision>,
+    /// 2026-10-16 (cpp-vs-briev P2, flaw 2): reactive node-txn auto-inline
+    /// decision (weighted cost) — the alwaysinline fallback consumes it.
+    pub node_inline_decisions: HashMap<String, crate::analysis::inline_cost::InlineDecision>,
     pub modulo_partition: Option<crate::analysis::modulo_partition::ModuloPartition>,
     /// 2026-07-28: Per-transaction iteration bounds from RegionAnalyzer.
     /// Maps txn_name → iteration_count. Used with bounded_pre + increments for !prof.
@@ -561,6 +591,7 @@ impl CompilerContext {
             internal_fold_txns: std::collections::HashSet::new(),
             export_needs_state: HashMap::new(),
             defn_needs_state: HashMap::new(),
+            type_stateful_members: HashSet::new(),
             idx_to_field_name: HashMap::new(),
             collection_iterables: std::collections::HashSet::new(),
             has_reactor_tick: false,
@@ -570,6 +601,9 @@ impl CompilerContext {
             exit_condition: None,
             has_natural_exit: false,
             view_bound_fields: std::collections::HashSet::new(),
+            plain_lets: std::collections::HashSet::new(),
+            plain_global_types: std::collections::HashMap::new(),
+            async_phase_watchdogs: Vec::new(),
             mmio_fields: HashMap::new(),
             mmio_initializers: HashMap::new(),
             mmio_prepopulated: false,
@@ -643,6 +677,7 @@ impl CompilerContext {
             // of re-walking bodies. Set once in generate() from AnalysisResults.
             density: std::collections::HashMap::new(),
             inline_decisions: std::collections::HashMap::new(),
+            node_inline_decisions: std::collections::HashMap::new(),
             modulo_partition: None,
             iter_bounds: HashMap::new(),
             state_ptr_param: "ptr noundef noalias nocapture align 8 %state".to_string(),
@@ -830,7 +865,7 @@ fn collect_free_stmts(
                 }
                 bound.insert(name.clone());
             }
-            crate::ast::Statement::Term(Some(v)) | crate::ast::Statement::EndProgram(Some(v)) => {
+            crate::ast::Statement::Term(Some(v)) | crate::ast::Statement::EndProgram(Some(v)) | crate::ast::Statement::Tail(v) => {
                 collect_free_expr(v, bound, free)
             }
             crate::ast::Statement::Expression(v) | crate::ast::Statement::Gate(v) => {
@@ -1020,6 +1055,12 @@ pub struct FunctionContext {    // SSA register counters — NEVER rewound (prev
     /// there the term emits `ret void`. A bare `term;` / `term!;` is a
     /// convergence checkpoint and never uses this.
     pub void_txn_abort_label: Option<String>,
+    /// 2026-10-16 (term-semantics plan §1): the ENCLOSING item's
+    /// postcondition — bare `term;` is P-gated: evaluated at the term site,
+    /// met → stop (defn: ret void; txn: br post/abort), unmet → continue.
+    /// Set alongside `txn_name` at each body entry; `None`/`Bool(true)` =
+    /// no P → unconditional stop.
+    pub item_post: Option<crate::ast::Expr>,
 
     // SSA state
     pub ssa_state_reg: Option<String>,
@@ -1290,6 +1331,7 @@ impl FunctionContext {
             convergence_target: None,
             defer_bodies: Vec::new(),
             void_txn_abort_label: None,
+            item_post: None,
             ssa_state_reg: None,
             param_slots: HashMap::new(),
             state_reg_name: "%state".to_string(),
@@ -1397,6 +1439,7 @@ impl FunctionContext {
         self.callable_txn_post_label = None;
         self.convergence_target = None;
         self.void_txn_abort_label = None;
+        self.item_post = None;
         self.loop_exit_label = None;
         self.phi_induction_reg = None;
         self.arena_slots = None;

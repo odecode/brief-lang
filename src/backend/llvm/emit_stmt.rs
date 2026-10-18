@@ -316,6 +316,27 @@ fn guard_cond_i1(backend: &mut LlvmBackend, out: &mut String, indent: &str, cond
     }
 }
 
+/// 2026-10-16 (term-semantics plan §1): the STOP half of a P-gated bare
+/// `term;` — the firing completes here (flush webstack batch + deferred
+/// cleanup, then branch/return), mirroring the `term <val>` exit paths.
+/// Reactive SSA txns unwind to the current txn's abort label (skip the rest
+/// of THIS body without returning from the reactor); callable txns branch to
+/// the post gate; per-txn void functions and members return.
+fn emit_bare_term_stop(backend: &mut LlvmBackend, out: &mut String, indent: &str) {
+    if backend.ctx.webstack_enabled {
+        emit_web_flush_batch(backend, out, indent);
+    }
+    backend.flush_defer_cleanup(out, indent);
+    if let Some(ref abort) = backend.fun.void_txn_abort_label {
+        writeln!(out, "{}br label %{}", indent, abort).ok();
+    } else if let Some(ref post) = backend.fun.callable_txn_post_label {
+        writeln!(out, "{}br label %{}", indent, post).ok();
+    } else {
+        writeln!(out, "{}ret void", indent).ok();
+    }
+    backend.fun.terminated = true;
+}
+
 pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statement, indent: &str) -> TypedRegister {
     match stmt {
         Statement::Let { name, names, ty, expr, modifiers, .. } => {
@@ -981,6 +1002,17 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // through and the assignment was silently DROPPED (the web
                     // counter's increment never moved the count; the volatile
                     // swan-song store to ptr 0 was all that remained).
+                    // 2026-10-17 (plain storage): a plain let stores to its
+                    // @global — BEFORE the field gate (this is exactly the
+                    // site whose `contains_key` gate silently DROPPED the
+                    // `stdout_buf = Alloc#(...)` seed in the first plain run;
+                    // R1 in the protocol's risk register).
+                    if backend.ctx.plain_lets.contains(name) {
+                        backend.emit_state_store_i64(out, indent, name, &val.name.clone());
+                        backend.fun.last_val_temps.insert(name.clone(), val.name.clone());
+                        backend.fun.last_val_types.insert(name.clone(), val.ty.clone());
+                        return TypedRegister { name: val.name, ty: Type::void() };
+                    }
                     if backend.ctx.field_index_map.contains_key(name) {
                         // 2026-08-22 (Phase 3b): a structural-sum FIELD stores
                         // the tagged handle — box a member value at the seam.
@@ -1435,12 +1467,18 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         } else {
                             let v = backend.emit_expr(out, value, indent);
                             let reg = backend.fun.gen_reg();
-                            // 2026-09-08 (anti-pattern audit): resolve the
-                            // stderr printer symbol via frgn_map; fallback is
-                            // the C symbol (io.bv declares frgn__eprint_str).
-                            let sym = backend.ctx.frgn_map.get("frgn__eprint_str")
-                                .map(|sig| sig.name.clone())
-                                .unwrap_or_else(|| "__eprint_str".to_string());
+                            // 2026-09-08 (anti-pattern audit): stderr printer
+                            // resolves to the pure-Briev `eprint_str` defn
+                            // when present (stateful call below), else the
+                            // frgn_map/C fallback (frgn__eprint_str → C).
+                            // 2026-10-15 (core-usable purge): plain helper name.
+                            let sym = if backend.ctx.defn_params.contains_key("eprint_str") {
+                                "eprint_str".to_string()
+                            } else {
+                                backend.ctx.frgn_map.get("frgn__eprint_str")
+                                    .map(|sig| sig.name.clone())
+                                    .unwrap_or_else(|| "__eprint_str".to_string())
+                            };
                             let st = if backend.ctx.defn_takes_state(&sym) { "ptr %state, " } else { "" };
                             writeln!(out, "{}{} = call i64 @{}({}ptr {})", indent, reg, sym, st, v.name).ok();
                         }
@@ -1639,6 +1677,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             }
             TypedRegister { name: backend.fun.gen_reg(), ty: Type::void() }
         }
+        // 2026-10-16 (tails plan §2): a defn-body tail is an
+        // UNCONDITIONAL value return — `term <value>` emission (the P-gate
+        // lives only on BARE `term;`). The parser scopes Tail to defn
+        // bodies, so the callable-txn convergence path is unreachable here.
+        Statement::Tail(e) => {
+            return emit_statement(backend, out, &Statement::Term(Some(e.clone())), indent);
+        }
         Statement::Term(val) => {
             // 2026-07-26: Phase 4 — webstack flush at term.
             // 2026-08-10: real update batch — each field the transaction wrote
@@ -1776,14 +1821,37 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     backend.fun.terminated = true;
                 }
             } else {
-                // 2026-08-04 (term-termination-diagnostics): bare `term;` /
-                // `term!;` is a convergence checkpoint, NOT a terminator — the
-                // interpreter returns Ok(Void) and continues to the next
-                // statement (src/interpreter/eval.rs:646-657, 707-709). Setting
-                // terminated=true here made the async/callable/pre void paths
-                // stop the body mid-way, diverging from the interpreter. It now
-                // stays false so the body keeps emitting; the enclosing
-                // epilogue still terminates the function.
+                // 2026-10-16 (term-semantics plan §1): bare `term;` is
+                // P-gated — evaluate the enclosing item's post AT the term
+                // site: met → stop (emit_bare_term_stop), unmet → continue
+                // (no branch; the body keeps emitting). No post → trivially
+                // met → unconditional stop. Mirrors the interpreter's
+                // lower_bare_terms + TermReturn (Rule 5). (The 2026-08-04
+                // "bare term is a no-op" behaviour is superseded — it
+                // livelocked txns whose post only the skipped tail could
+                // satisfy, and the backend/interpreter disagreed on defn
+                // guards; BUGS.md divergence entry.)
+                let post_trivial = match &backend.fun.item_post {
+                    None | Some(Expr::Bool(true)) => true,
+                    Some(_) => false,
+                };
+                if post_trivial {
+                    emit_bare_term_stop(backend, out, indent);
+                } else {
+                    let post = backend.fun.item_post.clone().expect("post");
+                    let reg = backend.emit_expr(out, &post, indent);
+                    let pi1 = guard_cond_i1(backend, out, indent, &reg);
+                    let n = backend.fun.txn_counter;
+                    backend.fun.txn_counter += 1;
+                    let met = format!("term.met{}", n);
+                    let cont = format!("term.cont{}", n);
+                    writeln!(out, "{}br i1 {}, label %{}, label %{}", indent, pi1, met, cont).ok();
+                    writeln!(out, "{}{}:", indent, met).ok();
+                    backend.fun.terminated = false;
+                    emit_bare_term_stop(backend, out, indent);
+                    writeln!(out, "{}{}:", indent, cont).ok();
+                    backend.fun.terminated = false;
+                }
             }
             TypedRegister { name: backend.fun.gen_reg(), ty: Type::void() }
         }
@@ -1791,7 +1859,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // 2026-08-06 (endprogram plan): `endprogram` genuinely exits the
             // process (SPEC §11.5) — unlike `term`, which ends the transaction.
             // Emit the value's side effects (the print), then call the
-            // runtime's `__exit` (briev_rt.c, runs atexit cleanup) with the
+            // runtime's `__exit` C fallback (briev_rt.c, runs atexit cleanup) or the
             // value's i64 result as the exit code (adapt_to_i64); the bare
             // form exits 0.
             if backend.ctx.webstack_enabled {
@@ -1803,11 +1871,11 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             } else {
                 "0".to_string()
             };
-            // 2026-09-09 (Family B): a pure-Briev __exit defn takes the hidden
+            // 2026-09-09 (Family B): a pure-Briev exit_prog defn takes the hidden
             // %state param and returns i64 (defns cannot be void); the C
             // wrapper was void. Adapt the call to whichever provider exists.
-            if backend.ctx.defn_params.contains_key("__exit") {
-                writeln!(out, "{}call i64 @__exit(ptr %state, i64 {})", indent, code).ok();
+            if backend.ctx.defn_params.contains_key("exit_prog") {
+                writeln!(out, "{}call i64 @exit_prog(ptr %state, i64 {})", indent, code).ok();
             } else {
                 writeln!(out, "{}call void @__exit(i64 {})", indent, code).ok();
             }

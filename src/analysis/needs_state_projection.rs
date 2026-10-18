@@ -82,7 +82,7 @@ pub fn serialize_needs_state_projection(items: &[TopLevel]) -> String {
     // Computed from the SAME items the Rust analysis uses (single source of
     // truth: src/analysis/export_abi.rs), so the projection carries the
     // verdict and the Briev pass stays a faithful single-pass mirror.
-    let needs = crate::analysis::export_abi::compute_defn_needs_state(items);
+    let needs = crate::analysis::export_abi::compute_defn_needs_state(items, &crate::analysis::storage_class::classify_plain_lets(items, None, &std::collections::HashSet::new()));
     let mut stateless: Vec<String> = needs.iter()
         .filter(|(_, v)| !**v)
         .map(|(k, _)| k.clone())
@@ -121,6 +121,7 @@ fn emit_names(out: &mut String, key: &str, names: &[String]) {
 fn emit_stmt_flat(out: &mut Vec<String>, stmt: &Statement) {
     match stmt {
         Statement::Term(opt) => { out.push("t:".into()); emit_opt_expr_flat(out, opt); }
+        Statement::Tail(e) => { out.push("t:".into()); emit_opt_expr_flat(out, &Some(e.clone())); }
         Statement::EndProgram(opt) => { out.push("b:".into()); emit_opt_expr_flat(out, opt); }
         Statement::Rollback(opt) => { out.push("e:".into()); emit_opt_expr_flat(out, opt); }
         Statement::Expression(expr) => { out.push("x:".into()); emit_expr_flat(out, expr); }

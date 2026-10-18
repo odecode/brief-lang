@@ -13,7 +13,7 @@
 //       __entry_build_done = true;
 //   };
 //
-// `args!("--flag")` becomes a snapshot state field bound from __argv_has
+// `args!("--flag")` becomes a snapshot state field bound from argv_has
 // (read-only: the enclosing node's one-shot guard governs firing).
 //
 // Rules:
@@ -150,7 +150,7 @@ fn resolve_entries(program: &mut Vec<TopLevel>) -> Result<(), String> {
                 field
             ));
         }
-        // Snapshot initializer: __argv_has("--flag") for Bool, __argv_value
+        // Snapshot initializer: argv_has("--flag") for Bool, argv_value
         // for String; Int/Float wrap the String value with the cli.bv parse
         // (arg_int/arg_float — the plugin targets stdlib, never Rust string
         // matches; Rule 3).
@@ -174,10 +174,10 @@ fn resolve_entries(program: &mut Vec<TopLevel>) -> Result<(), String> {
             None => Type::bool_(),
         };
         let init = match ty.as_deref() {
-            None | Some("Bool") => call("__argv_has"),
-            Some("String") => call("__argv_value"),
-            Some("Int") => wrap1("arg_int", call("__argv_value")),
-            Some("Float") => wrap1("arg_float", call("__argv_value")),
+            None | Some("Bool") => call("argv_has"),
+            Some("String") => call("argv_value"),
+            Some("Int") => wrap1("arg_int", call("argv_value")),
+            Some("Float") => wrap1("arg_float", call("argv_value")),
             Some(_) => unreachable!("field_ty match already rejected other types"),
         };
         extra_state.push(top_level_let(field, field_ty, init));
@@ -238,6 +238,7 @@ fn collect_from_stmt(
         | Statement::Assign(_, e)
         | Statement::Expression(e)
         | Statement::Term(Some(e))
+        | Statement::Tail(e)
         | Statement::EndProgram(Some(e)) => collect_from_expr(e, entry_commands, arg_flags),
         // 2026-10-12 (daily-driver quick wins): args! in an arrow-push
         // (`x <- args!("--flag")`) was never collected nor rewritten — the
@@ -523,6 +524,7 @@ fn rewrite_stmt(
         ),
         Statement::Expression(e) => Statement::Expression(rewrite_expr(e, entries, arg_flags)?),
         Statement::Term(Some(e)) => Statement::Term(Some(rewrite_expr(e, entries, arg_flags)?)),
+        Statement::Tail(e) => Statement::Tail(rewrite_expr(e, entries, arg_flags)?),
         Statement::EndProgram(Some(e)) => Statement::EndProgram(Some(rewrite_expr(e, entries, arg_flags)?)),
         // 2026-10-12 (daily-driver quick wins): the arrow-push arm — see
         // the collect-side note.

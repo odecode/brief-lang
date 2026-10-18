@@ -405,6 +405,14 @@ pub enum Statement {
     },
     /// term; or term expr;
     Term(Option<Expr>),
+    /// 2026-10-16 (tails plan §2): a defn-body tail — the final bare
+    /// expression of a defn body (no `;`), the block's implicit value. An
+    /// UNCONDITIONAL value return — NOT P-gated (distinct from
+    /// `Term(Some)`, which is P-gated in txn/node bodies; a tail must not
+    /// be). Parser sugar only: never user-spelled, no keyword. Produced
+    /// exclusively by the defn-body parser (match-arm block tails ride the
+    /// existing Expr::Block trailing-statement value machinery).
+    Tail(Expr),
     /// 2026-08-17 (foreach break): `break;` — exit the innermost enclosing
     /// `foreach` immediately (search-until-found early exit). Valid only
     /// lexically inside a `foreach` body. `foreach` stays exhaustive by
@@ -1318,7 +1326,29 @@ pub struct ParticipationDecl {
 pub struct WhenLawDecl {
     pub guard: Expr,
     pub facts: Vec<Statement>,
+    /// 2026-10-15 (lifecycle laws, plan
+    /// docs/plans/2026-10-15-lifecycle-laws-termination-warning.md): a
+    /// lifecycle arm — `when G { endprogram; }` or `when G { reside; }` —
+    /// instead of facts. A lifecycle law carries EXACTLY ONE lifecycle arm
+    /// and no facts (fact laws are separate); the parser strips the arm out
+    /// of `facts` into this field so every existing fact consumer (the
+    /// when-law pass, electronics participation) sees an empty fact list and
+    /// needs no changes. `EndProgram` lowers to a monitor txn (the reactor
+    /// evaluates `G` every tick and ends the process when it holds);
+    /// `Reside` is compile-time only — open-ended residency intent that
+    /// suppresses the no-terminator warning while `G` is satisfiable.
+    pub lifecycle: Option<LifeCycleArm>,
     pub span: Option<Span>,
+}
+
+/// The lifecycle arm of a top-level when-law (see `WhenLawDecl::lifecycle`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LifeCycleArm {
+    /// `when G { endprogram; }` — the law `G ⟹ ended`, enforced by a
+    /// reactor monitor.
+    EndProgram,
+    /// `when G { reside; }` — open-ended residency intent; compile-time.
+    Reside,
 }
 
 #[derive(Debug, Clone)]

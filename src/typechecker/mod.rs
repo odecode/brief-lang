@@ -10,6 +10,7 @@
 // - Literals → validate formatting compatibility
 // - Variables → look up in scope
 
+mod output_inference;
 mod validate;
 pub use validate::*;
 
@@ -2788,6 +2789,7 @@ fn elaborate_stmt(stmt: &mut Statement, ctx: &mut TypecheckContext, errors: &mut
         }
         Statement::ArrowAssign { value, .. } => elaborate_expr(value, ctx, errors),
         Statement::Term(Some(e))
+        | Statement::Tail(e)
         | Statement::EndProgram(Some(e))
         | Statement::Rollback(Some(e)) => elaborate_expr(e, ctx, errors),
         Statement::Expression(e) | Statement::Gate(e) => elaborate_expr(e, ctx, errors),
@@ -3980,6 +3982,21 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
             }
             Ok(())
         }
+        // 2026-10-16 (tails plan §2): a defn-body tail — value checked
+        // against the declared output exactly like `term <value>`.
+        Statement::Tail(val) => {
+            let vty = infer_type_only(val, ctx)?;
+            if let Some(out) = &ctx.current_output_type {
+                if !types_compatible(out, &vty, ctx) {
+                    return Err(TypeError::TypeMismatch {
+                        expected: format!("{}", out),
+                        found: format!("{}", vty),
+                        context: "tail value vs declared return type".into(),
+                    });
+                }
+            }
+            Ok(())
+        }
         Statement::Expression(expr) => {
             // 2026-09-23 (E14b slice 1): a declarative voltage obligation —
             // `inst.pin.voltage >= 3.3V;` in a node body is a physics fact
@@ -4521,6 +4538,16 @@ pub fn check_program_with_target(
             }
         }
     }
+    // 2026-10-16 (term-semantics plan step 6): arrowless output inference —
+    // a defn/txn with NO `-> T` whose body's first value `term <e>;` or
+    // tail resolves to type T records T on the item, so every downstream
+    // consumer (the fn_return_types call table below, the Spawn Task<R>
+    // registration in the state pre-collect, the body's own output check,
+    // the backend's signature emission) sees one effective type. No value
+    // site, or one the minimal inference context cannot resolve, leaves
+    // the item arrowless = Void — the pre-existing behaviour, never an
+    // error. Runs BEFORE the pre-collects; fixpoint over forward refs.
+    output_inference::infer_arrowless_outputs(items, universe);
     // 2026-07-14: Pre-collect state variable bindings from top-level `let`
     // so they are visible to all transactions and definitions.
     let mut state_bindings: std::collections::HashMap<String, Type> = items
@@ -6342,7 +6369,7 @@ fn collect_body_exprs(stmts: &[Statement]) -> Vec<&Expr> {
                 Statement::Let { expr: Some(e), .. } => out.push(e),
                 Statement::Expression(e) => out.push(e),
                 Statement::Term(Some(e)) | Statement::EndProgram(Some(e))
-                | Statement::Rollback(Some(e)) | Statement::Check(e) | Statement::Gate(e) => out.push(e),
+                | Statement::Tail(e) | Statement::Rollback(Some(e)) | Statement::Check(e) | Statement::Gate(e) => out.push(e),
                 Statement::Guarded(g, body) => { out.push(g); walk(body, out); }
                 Statement::Block(body)
                 | Statement::Defer(body)
@@ -6375,7 +6402,7 @@ fn isr_body_exprs(stmts: &[Statement]) -> Vec<&Expr> {
                 Statement::Let { expr: Some(e), .. } => out.push(e),
                 Statement::Expression(e) => out.push(e),
                 Statement::Term(Some(e)) | Statement::EndProgram(Some(e))
-                | Statement::Rollback(Some(e)) | Statement::Check(e) | Statement::Gate(e) => out.push(e),
+                | Statement::Tail(e) | Statement::Rollback(Some(e)) | Statement::Check(e) | Statement::Gate(e) => out.push(e),
                 Statement::Guarded(g, body) => { out.push(g); walk(body, out); }
                 Statement::Block(body)
                 | Statement::Defer(body)
@@ -7458,6 +7485,7 @@ pub(crate) fn substitute_stmt_types(stmt: &mut Statement, subst: &HashMap<String
                 substitute_expr_types(e, subst);
             }
         }
+        Statement::Tail(e) => substitute_expr_types(e, subst),
         Statement::Check(e) | Statement::Gate(e) | Statement::Expression(e) => {
             substitute_expr_types(e, subst);
         }
@@ -7668,6 +7696,45 @@ mod tests {
         let mut items = p.parse_program().unwrap();
         let universe = crate::type_universe::TypeUniverse::new();
         check_program(&mut items, &universe)
+    }
+
+    // ── 2026-10-16 (tails plan §2): tail typecheck ─────────────────────────
+
+    /// A tail matching the declared output type is fine.
+    #[test]
+    fn tail_matching_declared_type_ok() {
+        check("defn f(x: Int) -> Int { x * 2 };").expect("tail typechecks");
+    }
+
+    /// A VALUE tail in a `-> Void` defn is an error (Rust `()` discipline).
+    #[test]
+    fn value_tail_in_void_defn_is_error() {
+        let errs = check("defn f(x: Int) -> Void { x * 2 };")
+            .expect_err("value tail in a Void body must be rejected");
+        let text: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
+        assert!(
+            text.iter().any(|t| t.contains("tail value vs declared return type")),
+            "got: {text:?}"
+        );
+    }
+
+    /// A tail of the wrong type is an error against the declared output.
+    #[test]
+    fn tail_type_mismatch_is_error() {
+        let errs = check(r#"defn f() -> Int { "hi" };"#)
+            .expect_err("mismatched tail must be rejected");
+        let text: Vec<String> = errs.iter().map(|e| format!("{e:?}")).collect();
+        assert!(
+            text.iter().any(|t| t.contains("tail value vs declared return type")),
+            "got: {text:?}"
+        );
+    }
+
+    /// A Void call as a Void tail is legal (the call is the body value).
+    #[test]
+    fn void_call_as_void_tail_ok() {
+        check("defn inner() -> Void { term; }\ndefn outer() -> Void { inner() };")
+            .expect("void tail typechecks");
     }
 
     /// 2026-10-05 (three-surfaces plan Phase 0.3, intrinsic-coverage audit):
