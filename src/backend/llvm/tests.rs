@@ -3009,9 +3009,13 @@ fn test_endprogram_emits_process_exit() {
 #[test]
 fn test_endprogram_calls_exit_prog_when_defn_present() {
     // 2026-10-15 (core-usable purge): with the stdlib exit_prog defn in the
-    // unit, `endprogram` calls the stateful Briev defn (i64, %state) — the
-    // void @__exit C wrapper is the fallback only (emit_stmt endprogram
-    // branch). Sibling of test_endprogram_emits_process_exit.
+    // unit, `endprogram` calls the Briev defn (i64) — the void @__exit C
+    // wrapper is the fallback only (emit_stmt endprogram branch).
+    // 2026-10-18 (state/plain inference fallout): a PLAIN exit_prog (body
+    // touches no state globals — the real cast_lanes.bv shape) is called
+    // WITHOUT %state; blanket-passing it shifted the status arg into the
+    // pointer slot and every `endprogram` exited with (state_ptr & 0xFF).
+    // The stateful form is pinned by the sibling test below.
     let mut backend = LlvmBackend::new().with_force_emit_all(true);
     let program = vec![
         state_count(),
@@ -3051,14 +3055,64 @@ fn test_endprogram_calls_exit_prog_when_defn_present() {
     ];
     let output = backend.generate(&program, None);
     assert!(
-        output.contains("call i64 @exit_prog(ptr %state, i64 "),
-        "stateful exit_prog call when the defn is present: {output}"
+        output.contains("call i64 @exit_prog(i64 "),
+        "plain exit_prog call must NOT pass %state: {output}"
     );
     assert!(
         !output.contains("call void @__exit(i64"),
         "C-fallback exit must not fire when exit_prog is present: {output}"
     );
     assert!(output.contains("unreachable"), "unreachable after exit: {output}");
+}
+
+#[test]
+fn test_endprogram_passes_state_to_stateful_exit_prog() {
+    // 2026-10-18: the mirror pin — an exit_prog whose body references a
+    // state global needs %state, and the endprogram call site must pass it
+    // (defn_takes_state gate). Sibling of
+    // test_endprogram_calls_exit_prog_when_defn_present.
+    let mut backend = LlvmBackend::new().with_force_emit_all(true);
+    let program = vec![
+        state_count(),
+        TopLevel::Definition(crate::ast::Definition {
+            variadic_param: None,
+            name: "exit_prog".to_string(),
+            type_params: vec![],
+            parameters: vec![("code".to_string(), Type::int())],
+            outputs: vec![Type::int()],
+            output_type: None,
+            contract: default_contract(),
+            body: vec![Statement::Term(Some(Expr::Identifier("count".into())))],
+            modifiers: vec![],
+            metadata: HashMap::new(),
+            derivation: None,
+            annotations: vec![],
+            span: None,
+            doc: None,
+        }),
+        TopLevel::Transaction(Transaction {
+            variadic_param: None,
+            name: "report".to_string(),
+            is_reactive: true,
+            is_async: false,
+            type_params: vec![],
+            parameters: vec![],
+            output_type: None,
+            outputs: vec![],
+            contract: default_contract(),
+            body: vec![Statement::EndProgram(Some(Expr::Decimal(7)))],
+            metadata: HashMap::new(),
+            derivation: None,
+            modifiers: vec![],
+            span: None,
+            doc: None,
+        }),
+    ];
+    let output = backend.generate(&program, None);
+    assert!(
+        output.contains("call i64 @exit_prog(ptr %state, i64 "),
+        "stateful exit_prog call must pass %state: {output}"
+    );
 }
 
 #[test]
@@ -3130,7 +3184,7 @@ fn test_beginprogram_entry_loop_emits_flag_and_goal_clear() {
 }
 
 #[test]
-fn test_escape_non_ASCII_string() {
+fn test_escape_non_ascii_string() {
     let output = escape_llvm_string("héllo");
     assert!(output.contains("\\c3"), "Should hex-escape byte C3");
     assert!(output.contains("\\a9"), "Should hex-escape byte A9");
@@ -11589,6 +11643,59 @@ node work [count < 3][count == 3] {
     assert!(
         !plain.contains("count"),
         "a node-written let must stay state: {plain:?}"
+    );
+}
+
+#[test]
+fn plain_let_read_loads_native_type() {
+    // 2026-10-18 (plain-storage read path): an identifier read of a plain
+    // let must load from its module-scope @global with the NATIVE LLVM
+    // type. Without the emit_expr plain arm the read falls through every
+    // resolver (field map / constants / inits — plain lets are in none) to
+    // the generic `load i64, ptr @name` fallback — correct for Int only;
+    // a Float64 plain let then loads i64 from a `double` global (invalid
+    // IR, clang type error) and the register arrives typed Int at every
+    // use. Non-vacuous: drop the arm and the `load double, ptr @scale`
+    // assertion fails (fallback emits `load i64, ptr @scale`).
+    let src = r#"
+plain let scale: Float64 = 1.5;
+plain let acc: Int = 0;
+defn bump(k: Int) -> Int [k >= 0][term >= 0] {
+    acc = acc + k;
+    term acc;
+};
+defn scaled() -> Float64 {
+    term scale * 2.0;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new()
+        .with_type_universe(universe)
+        .with_force_emit_all(true);
+    let ir = backend.generate(&items, None);
+    assert!(
+        ir.contains("load double, ptr @scale"),
+        "a Float64 plain let read must load double natively:\n{ir}"
+    );
+    assert!(
+        !ir.contains("load i64, ptr @scale"),
+        "a Float64 plain let must never load as i64 (fallback fallthrough):\n{ir}"
+    );
+    assert!(
+        ir.contains("load i64, ptr @acc"),
+        "an Int plain let read must load from its @global:\n{ir}"
+    );
+    assert!(
+        ir.contains("@scale = global double"),
+        "the Float64 plain let must declare a double global:\n{ir}"
+    );
+    assert!(
+        ir.contains("define i64 @bump(i64 %arg0)"),
+        "a plain-only defn must stay stateless:\n{ir}"
     );
 }
 
