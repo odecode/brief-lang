@@ -33,6 +33,14 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## Float-tuple destructure loaded elements as i64 -> clang float/i64 clash -- FIXED 2026-10-20
+
+**Symptom:** a defn returning (Float, Float[,Float]) destructured via `let (a, b) = ...` failed to compile: `%tN defined with type i64 but expected float` (clang). Found building examples/recommender/reference.bv (recommender-app Task 5.2, the AutAI-Fusion oracle), isolated in scratch/ftuple.bv.
+
+**Root cause:** the tuple heap block stores every element as its raw i64 BIT PATTERN (emit_tuple_materialize via adapt_to_i64: bitcast double->i64 for Float64, bitcast float->i32->zext for Float). The destructure (emit_stmt.rs `let (a,b)=t`) loaded each slot as `load i64` and bound the name to that i64 register unconditionally, ignoring the declared Float element type - so a downstream float use received an i64-defined register.
+
+**Fix:** after the `load i64`, reinterpret a Float64 element with `bitcast i64 -> double` and a Float (f32) element with `trunc i64 -> i32; bitcast i32 -> float`, cache the native register in reg_float_cache, and bind the name to it. This is the exact inverse of the adapt_to_i64 store side and mirrors the state-field float load in emit_expr.rs. Regression test float_tuple_destructure_reinterprets_elements (src/backend/llvm/emit_toplevel.rs).
+
 ## Malloc#-wrapping defn emitted memory(read) -> two identical calls CSE-aliased -> double-free -- FIXED 2026-10-19
 
 **Symptom:** two identical-argument calls to a defn whose body only allocates via Malloc# (e.g. ivec_new(n) = Malloc#(n*8) as Int) returned the SAME pointer, so freeing both double-freed (SIGABRT). Found building lib/std/rating_population.bv (recommender-app Task 5).

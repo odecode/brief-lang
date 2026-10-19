@@ -700,11 +700,36 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     .ok();
                     let elem = backend.fun.gen_reg();
                     writeln!(out, "{}{} = load i64, ptr {}", indent, elem, slot).ok();
-                    backend.fun.let_bindings.insert(n.clone(), elem.clone());
-                    backend.fun.let_binding_types
-                        .insert(n.clone(), elem_tys.get(i).cloned().unwrap_or_else(Type::int));
-                    backend.fun.let_original_types
-                        .insert(n.clone(), elem_tys.get(i).cloned().unwrap_or_else(Type::int));
+                    let elem_ty = elem_tys.get(i).cloned().unwrap_or_else(Type::int);
+                    // 2026-10-20 (fix: Float-tuple destructure loaded as i64,
+                    // BUGS.md): the tuple heap block stores every element as raw
+                    // i64 bits, so a Float element must be reinterpreted to its
+                    // native float register (not left as the i64 the slot
+                    // holds) — else a downstream float use clashes
+                    // (`%t defined with type 'i64' but expected 'float'`). This
+                    // mirrors the state-field float load in emit_expr.rs: bitcast
+                    // i64->double for Float64, trunc+bitcast for Float (f32), and
+                    // cache the native register so reads resolve the float.
+                    let bound = if elem_ty == Type::float64() {
+                        let d = backend.fun.gen_reg();
+                        writeln!(out, "{}{} = bitcast i64 {} to double", indent, d, elem).ok();
+                        backend.fun.reg_float_cache.insert(elem.clone(), d.clone());
+                        backend.fun.reg_float_cache.insert(d.clone(), d.clone());
+                        d
+                    } else if elem_ty == Type::float() {
+                        let tr = backend.fun.gen_reg();
+                        writeln!(out, "{}{} = trunc i64 {} to i32", indent, tr, elem).ok();
+                        let f = backend.fun.gen_reg();
+                        writeln!(out, "{}{} = bitcast i32 {} to float", indent, f, tr).ok();
+                        backend.fun.reg_float_cache.insert(elem.clone(), f.clone());
+                        backend.fun.reg_float_cache.insert(f.clone(), f.clone());
+                        f
+                    } else {
+                        elem.clone()
+                    };
+                    backend.fun.let_bindings.insert(n.clone(), bound.clone());
+                    backend.fun.let_binding_types.insert(n.clone(), elem_ty.clone());
+                    backend.fun.let_original_types.insert(n.clone(), elem_ty);
                 }
                 return TypedRegister { name: val.name, ty: Type::void() };
             }

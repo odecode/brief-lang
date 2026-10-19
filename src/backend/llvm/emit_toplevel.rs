@@ -7038,6 +7038,45 @@ mod tests {
              LLVM CSE two distinct allocations: {def_line}"
         );
     }
+
+    #[test]
+    fn float_tuple_destructure_reinterprets_elements() {
+        // 2026-10-20 (fix: Float-tuple destructure loaded elements as i64):
+        // a defn returning (Float, Float) destructured via `let (a, b) = ...`
+        // emitted `load i64` for each element and bound the name to that i64
+        // register, while the tuple heap block stores each Float as its i64
+        // BIT PATTERN (adapt_to_i64: bitcast double->i64). A downstream float
+        // use then clashed — `call ... @print_float(float %<i64 load>)`, which
+        // clang rejects ("defined with type 'i64' but expected 'float'").
+        // The destructure must reinterpret a Float64 element back to double
+        // (bitcast i64 -> double), the exact inverse of the store side.
+        let src = r#"
+            defn two() -> (Float, Float) {
+                term (1.5, 2.5);
+            };
+            node entry [beginprogram][true] {
+                let (a, b): (Float, Float) = two();
+                endprogram Print#(a + b);
+            };
+        "#;
+        let program = parse(src);
+        let mut backend = LlvmBackend::new();
+        let ir = backend.generate(&program, None);
+        assert!(
+            ir.contains("bitcast i64") && ir.contains("to double"),
+            "a Float64 tuple element must be reinterpreted from its i64 slot \
+             bits to a native double: {ir}"
+        );
+        // No float/double-typed use may receive a raw `load i64` register. The
+        // precise failure was `float %tN` where %tN was defined by `load i64`;
+        // after the fix the float arithmetic consumes the bitcast double, so
+        // the fadd operates on double, never on an i64-defined register.
+        assert!(
+            ir.contains("fadd double") || ir.contains("fadd float"),
+            "the destructured Float elements must feed float arithmetic at \
+             float width (not an i64 add): {ir}"
+        );
+    }
 }
 
 /// 2026-10-20 (BUGS.md "string concat miscompiles at -O2"): free-function
