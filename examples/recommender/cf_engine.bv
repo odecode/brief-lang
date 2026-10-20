@@ -21,6 +21,16 @@
 
 import "std/matrix.bv";
 import "std/rating_population.bv";
+// Task 9.4 persistence calls std/os/fs.bv's read_file/write_file/remove_file.
+// The prelude makes their NAMES visible for typechecking, but a defn is only
+// EMITTED into a unit's IR when that unit imports the module (prelude visibility
+// grants capability; emission follows the import graph — the defn-liveness rule).
+// Without this explicit import the call site emitted but the body did not
+// (`undefined value @read_file` at link). Import the Result constructors +
+// predicates SELECTIVELY (a full import would drag option.bv's same-named
+// `unwrap` — the fs.bv lesson); cf_engine uses only is_err/is_ok/unwrap here.
+import "std/os/fs.bv";
+import { Ok, Err, is_ok, is_err, unwrap, unwrap_err } from "std/result.bv";
 
 // Means holds the per-user and per-item mean vectors plus a presence flag for
 // each (has_mean == true iff that user/item had >= 1 observed rating). The
@@ -816,6 +826,432 @@ defn rec_argbest(pop: RatingPopulation, m: Means, a: Int, lam: Float, picked: In
     term rec_argbest(pop, m, a, lam, picked, i + 1, bi, bscore);
 };
 
+// ── Part 5: Similarity_Cache (Task 9.1) — the served snapshot ────────────────
+//
+// WHY A CACHE. Everything above recomputes means + both PCC matrices INSIDE
+// every prediction (sim_user/sim_item walk the CSR rows, and impute_user/
+// impute_item themselves call base_sim_* — so a single cf_predict is
+// O(population²) in the worst case). That is correct but far too slow to serve a
+// request. The design's fix (Req 6.3 / 10.4) is to PRECOMPUTE both similarity
+// matrices and both mean vectors ONCE into a SimCache, so a served prediction is
+// O(k) table reads (mat_get) instead of O(population) recomputation.
+//
+// WHAT IT HOLDS (design "Similarity_Cache"): the two dense PCC matrices
+// (user-user nusers², item-item nitems²), the two mean vectors (reused straight
+// from Means — same Malloc# blocks, the cache does not copy them), and a
+// PopSignature (Task 9.4) that records which population the snapshot was built
+// from. The matrices are Matrix (matrix.bv): flat row-major Float blocks indexed
+// at an 8-byte stride — exactly the risk-ledger large-Malloc path at 943/1682
+// scale, exercised here at 4×4 for correctness.
+//
+// CORRECTNESS = MEMOIZATION. A cached entry is DEFINED to equal the engine's
+// on-the-fly sim' (sim_user/sim_item), which Task 6.5 already anchors to
+// reference.bv's pcc_imputed_users/pcc_imputed_items. So the 9.1 gate is
+// "simcache_user_sim(sc,a,b) == sim_user(pop,m,a,b)" for every pair — the cache
+// introduces no new numeric claim, it just stores the same value once.
+//
+// SYMMETRY. sim'(a,b) == sim'(b,a) (PCC is symmetric), so we compute the lower
+// triangle (b <= a) once and mirror into both [a][b] and [b][a]; the diagonal is
+// 1.0 by construction (a centered vector correlated with itself). This halves the
+// PCC work building the matrix.
+
+// PopSignature (Task 9.4) — the freshness key. A persisted cache is FRESH iff
+// its signature equals the current population's: same record count (nnz) AND
+// same backing-source modification time (mtime). Any mismatch is STALE (Req
+// 6.6). mtime is the mtime of the rating source the population was built from
+// (u.data / the DB load); at Task 9 the mechanism COMPARES whatever mtime the
+// caller records — the real stat(2) of u.data is wired in Task 10/12.
+obj PopSignature {
+    nnz:   Int;    // observed-rating record count
+    mtime: Int;    // backing-source modification time (seconds / ns — caller's unit)
+};
+
+obj SimCache {
+    user_sim:  Matrix;       // nusers × nusers PCC (sim', Eq. 9)
+    item_sim:  Matrix;       // nitems × nitems PCC (sim', Eq. 10)
+    user_mean: Vector;       // nusers true means  (borrowed from Means)
+    item_mean: Vector;       // nitems true means  (borrowed from Means)
+    nusers: Int;
+    nitems: Int;
+    sig:    PopSignature;    // which population this snapshot was built from
+};
+
+// pop_signature - the freshness key for `pop` at source-mtime `mtime`.
+defn pop_signature(pop: RatingPopulation, mtime: Int) -> PopSignature {
+    term PopSignature { nnz: pop.nnz, mtime: mtime };
+};
+
+// sig_fresh - a persisted signature `art` is fresh against the current `cur` iff
+// BOTH the record count and the mtime match. Any mismatch ⇒ stale (Req 6.6).
+defn sig_fresh(art: PopSignature, cur: PopSignature) -> Bool {
+    term art.nnz == cur.nnz && art.mtime == cur.mtime;
+};
+
+// simcache_build - precompute the served snapshot from a (pop, Means) and record
+// its PopSignature at source-mtime `mtime`. The mean vectors are the SAME blocks
+// Means already holds (a value handle, not a copy); simcache_free therefore does
+// NOT free them (means_free owns them). The two matrices are fresh Malloc# blocks
+// the cache owns.
+defn simcache_build(pop: RatingPopulation, m: Means, mtime: Int)
+    [pop.nusers >= 1 && pop.nitems >= 1][true]
+    -> SimCache
+{
+    let usim: Matrix = mat_new(pop.nusers, pop.nusers);
+    sc_fill_user(pop, m, usim, 0);
+    let isim: Matrix = mat_new(pop.nitems, pop.nitems);
+    sc_fill_item(pop, m, isim, 0);
+    term SimCache {
+        user_sim: usim, item_sim: isim,
+        user_mean: m.user_mean, item_mean: m.item_mean,
+        nusers: pop.nusers, nitems: pop.nitems,
+        sig: pop_signature(pop, mtime)
+    };
+};
+
+// sc_fill_user - fill row a of the user-user matrix. For each b in [0, a] compute
+// sim_user once and write BOTH [a][b] and [b][a] (symmetry); the diagonal [a][a]
+// is 1.0 (sim' of a user with itself). Tail recursion over rows a, inner over b.
+defn sc_fill_user(pop: RatingPopulation, m: Means, usim: Matrix, a: Int)
+    [a >= 0][true]
+    -> Int
+{
+    when a >= pop.nusers {
+        term 0;
+    };
+    sc_fill_user_row(pop, m, usim, a, 0);
+    term sc_fill_user(pop, m, usim, a + 1);
+};
+defn sc_fill_user_row(pop: RatingPopulation, m: Means, usim: Matrix, a: Int, b: Int)
+    [a >= 0 && b >= 0][true]
+    -> Int
+{
+    when b > a {
+        term 0;
+    };
+    let s: Float = sim_user(pop, m, a, b);
+    mat_set(usim, a, b, s);
+    mat_set(usim, b, a, s);
+    term sc_fill_user_row(pop, m, usim, a, b + 1);
+};
+
+// sc_fill_item - the item-space mirror: lower-triangle sim_item once, mirrored.
+defn sc_fill_item(pop: RatingPopulation, m: Means, isim: Matrix, s: Int)
+    [s >= 0][true]
+    -> Int
+{
+    when s >= pop.nitems {
+        term 0;
+    };
+    sc_fill_item_row(pop, m, isim, s, 0);
+    term sc_fill_item(pop, m, isim, s + 1);
+};
+defn sc_fill_item_row(pop: RatingPopulation, m: Means, isim: Matrix, s: Int, t: Int)
+    [s >= 0 && t >= 0][true]
+    -> Int
+{
+    when t > s {
+        term 0;
+    };
+    let v: Float = sim_item(pop, m, s, t);
+    mat_set(isim, s, t, v);
+    mat_set(isim, t, s, v);
+    term sc_fill_item_row(pop, m, isim, s, t + 1);
+};
+
+// ── O(k) accessors the served predictor reads (replaces the recompute) ───────
+defn simcache_user_sim(sc: SimCache, a: Int, b: Int)
+    [a >= 0 && a < sc.nusers && b >= 0 && b < sc.nusers][true] -> Float
+{
+    term mat_get(sc.user_sim, a, b);
+};
+defn simcache_item_sim(sc: SimCache, s: Int, t: Int)
+    [s >= 0 && s < sc.nitems && t >= 0 && t < sc.nitems][true] -> Float
+{
+    term mat_get(sc.item_sim, s, t);
+};
+defn simcache_user_mean(sc: SimCache, a: Int)
+    [a >= 0 && a < sc.nusers][true] -> Float
+{
+    term vec_get(sc.user_mean, a);
+};
+defn simcache_item_mean(sc: SimCache, s: Int)
+    [s >= 0 && s < sc.nitems][true] -> Float
+{
+    term vec_get(sc.item_mean, s);
+};
+
+// simcache_free - release the two matrices the cache OWNS. The mean vectors are
+// borrowed from Means (not copied), so they are freed by means_free, NOT here —
+// freeing them twice would double-free the shared blocks.
+defn simcache_free(sc: SimCache) -> Void {
+    mat_free(sc.user_sim);
+    mat_free(sc.item_sim);
+    term;
+};
+
+// ── Part 5b: served snapshot + atomic pointer swap (Task 9.2) ────────────────
+//
+// WHY A HOLDER, AND WHY THE SWAP IS ATOMIC HERE. The CF_Engine serves every
+// request from ONE snapshot (Req 6.3); a refresh must not tear it. The design's
+// mechanism (Req 6.4/6.5): build a WHOLE new SimCache off to the side in fresh
+// Malloc# blocks, then hand it over in a SINGLE logical step, and free the old
+// snapshot only AFTER readers have drained. Because the backend is a
+// single-process POLL event loop (design "Concurrency Model"), there is no
+// preemptive reader: a refresh runs BETWEEN poll sweeps, never interleaved with
+// a request. So the handover is atomic BY CONSTRUCTION — no lock, no CAS. (In a
+// THREADED backend this same multi-field update WOULD tear and need a real
+// atomic pointer or RCU; the poll model is exactly why we can avoid that.)
+//
+// THE MODEL. A Served holder is a small IntVec "control block" holding the
+// CURRENT snapshot's four Malloc# addresses + two dims. A read reconstructs a
+// SimCache value handle from those slots in O(1) (no copy — same blocks). The
+// swap (served_install) overwrites the six slots with the new snapshot's
+// addresses; between sweeps that rewrite is indivisible from any reader's view.
+// This is a genuine POINTER swap — the served matrices change by rewriting
+// pointer slots — using only the proven ivec primitives (objs are value handles,
+// not mutable cells, so the indirection lives in the control block, not a field).
+
+const SV_USER_SIM: Int = 0;   // control-block slot layout
+const SV_ITEM_SIM: Int = 1;
+const SV_USER_MEAN: Int = 2;
+const SV_ITEM_MEAN: Int = 3;
+const SV_NUSERS: Int = 4;
+const SV_NITEMS: Int = 5;
+const SV_NNZ: Int = 6;        // the served snapshot's signature (nnz, mtime)
+const SV_MTIME: Int = 7;
+const SV_SLOTS: Int = 8;
+
+obj Served {
+    slots: IntVec;    // SV_SLOTS addresses+dims of the currently-served snapshot
+};
+
+// served_new - allocate a holder and install `sc` as the first served snapshot.
+// The control-block cell is populated BEFORE the Served handle is constructed,
+// so the handle is built once in `term` position (the proven obj-literal form —
+// a `let x: T = T { .. }` initializer tripped the parser at this field shape).
+defn served_new(sc: SimCache) -> Served {
+    let cell: IntVec = ivec_new(SV_SLOTS);
+    served_write(cell, sc);
+    term Served { slots: cell };
+};
+
+// served_write - store snapshot `sc`'s four block addresses + two dims into the
+// control block `cell`. The shared helper behind both served_new and
+// served_install (it takes the IntVec directly so served_new can fill it before
+// the Served handle exists).
+defn served_write(cell: IntVec, sc: SimCache) -> Void {
+    ivec_set(cell, SV_USER_SIM,  sc.user_sim.ptr);
+    ivec_set(cell, SV_ITEM_SIM,  sc.item_sim.ptr);
+    ivec_set(cell, SV_USER_MEAN, sc.user_mean.ptr);
+    ivec_set(cell, SV_ITEM_MEAN, sc.item_mean.ptr);
+    ivec_set(cell, SV_NUSERS,    sc.nusers);
+    ivec_set(cell, SV_NITEMS,    sc.nitems);
+    ivec_set(cell, SV_NNZ,       sc.sig.nnz);
+    ivec_set(cell, SV_MTIME,     sc.sig.mtime);
+    term;
+};
+
+// served_read - reconstruct the currently-served SimCache handle from the
+// control block (O(1), no copy — the handle points at the same blocks). This is
+// what the predictor calls once per request to get its snapshot.
+defn served_read(sv: Served) -> SimCache {
+    let nu: Int = ivec_get(sv.slots, SV_NUSERS);
+    let ni: Int = ivec_get(sv.slots, SV_NITEMS);
+    term SimCache {
+        user_sim:  Matrix { ptr: ivec_get(sv.slots, SV_USER_SIM),  rows: nu, cols: nu },
+        item_sim:  Matrix { ptr: ivec_get(sv.slots, SV_ITEM_SIM),  rows: ni, cols: ni },
+        user_mean: Vector { ptr: ivec_get(sv.slots, SV_USER_MEAN), len: nu },
+        item_mean: Vector { ptr: ivec_get(sv.slots, SV_ITEM_MEAN), len: ni },
+        nusers: nu, nitems: ni,
+        sig: PopSignature {
+            nnz: ivec_get(sv.slots, SV_NNZ), mtime: ivec_get(sv.slots, SV_MTIME)
+        }
+    };
+};
+
+// served_install - THE SWAP. `newsc` was built off to the side (fresh blocks).
+// Overwrite the control block to point at it, then return the OLD snapshot
+// handle so the caller can free it AFTER reads drain (never before the swap —
+// that would free blocks a reader might still hold). The rewrite is atomic here
+// because it runs between poll sweeps (no concurrent reader).
+defn served_install(sv: Served, newsc: SimCache) -> SimCache {
+    let old: SimCache = served_read(sv);
+    served_write(sv.slots, newsc);
+    term old;
+};
+
+// served_free - release the holder's control block (NOT the served snapshot's
+// blocks — those are owned by whatever SimCache handle served_read hands out and
+// freed via simcache_free + means_free on shutdown).
+defn served_free(sv: Served) -> Void {
+    ivec_free(sv.slots);
+    term;
+};
+
+// ── Part 5c: binary persistence to simlist.txt.bin (Task 9.4) ────────────────
+//
+// WHY PERSIST. Recomputing both PCC matrices at 943²/1682² scale is expensive;
+// the design (Req 6.1/6.2) persists the served snapshot to a binary artifact and
+// RELOADS it on startup WHEN FRESH, recomputing only on a stale/absent/corrupt
+// artifact. Freshness is the PopSignature (Req 6.6): the artifact records
+// (nnz, mtime); a load first checks the header's signature against the current
+// population and treats ANY mismatch — or a bad magic / wrong dims / short read —
+// as "not usable" ⇒ recompute + rewrite. A partial write is never served as a
+// good cache (Req 6.2): a truncated file fails the length check and is rejected.
+//
+// THE LAYOUT. A flat byte image: a 5-word header [magic, nusers, nitems, nnz,
+// mtime] (5×8 bytes) followed by the four raw Malloc# blocks back-to-back —
+// user_sim (nusers²×8), item_sim (nitems²×8), user_mean (nusers×8), item_mean
+// (nitems×8). The matrices hold f64 bit patterns; Copy# moves raw bytes, so
+// there is NO float round-trip (the IntVec-vs-Vector lesson applies to typed
+// slots, not to a raw byte copy of the whole block). The image is wrapped in a
+// Briev String ([len:i64][bytes]) and written with std/os/fs.bv's write_file;
+// load is read_file + header parse + Copy# back into fresh matrices.
+
+const SC_MAGIC: Int = 5929566;   // "simlist.bin" sentinel (arbitrary nonzero tag)
+const SC_HDR_WORDS: Int = 5;     // magic, nusers, nitems, nnz, mtime
+
+// sc_byte_size - total image bytes for a SimCache: header + the four blocks.
+defn sc_byte_size(sc: SimCache) -> Int {
+    let usim: Int = sc.nusers * sc.nusers * 8;
+    let isim: Int = sc.nitems * sc.nitems * 8;
+    let umean: Int = sc.nusers * 8;
+    let imean: Int = sc.nitems * 8;
+    term SC_HDR_WORDS * 8 + usim + isim + umean + imean;
+};
+
+// simcache_save - serialize `sc` to `path` as the flat image above. Builds a
+// String-shaped buffer (Alloc# 8+total, length at offset 0, data at +8), writes
+// the header words with Store#, Copy#s the four blocks in order, then write_file.
+// Returns the write_file result (bytes >= 0, or -errno). The String buffer is
+// freed after the write.
+defn simcache_save(sc: SimCache, path: String) -> Int {
+    let total: Int = sc_byte_size(sc);
+    let buf: Int = Alloc#(8 + total) as Int;
+    Store#(buf, total, 8);                        // String length header
+    let data: Int = buf + 8;                      // image start
+    // header words
+    Store#(data,            SC_MAGIC,   8);
+    Store#(data + 8,        sc.nusers,  8);
+    Store#(data + 16,       sc.nitems,  8);
+    Store#(data + 24,       sc.sig.nnz, 8);
+    Store#(data + 32,       sc.sig.mtime, 8);
+    // blocks, back-to-back after the header
+    let off0: Int = data + SC_HDR_WORDS * 8;
+    let usim_bytes: Int = sc.nusers * sc.nusers * 8;
+    let isim_bytes: Int = sc.nitems * sc.nitems * 8;
+    let umean_bytes: Int = sc.nusers * 8;
+    let imean_bytes: Int = sc.nitems * 8;
+    Copy#(off0,                                      sc.user_sim.ptr,  usim_bytes);
+    Copy#(off0 + usim_bytes,                         sc.item_sim.ptr,  isim_bytes);
+    Copy#(off0 + usim_bytes + isim_bytes,            sc.user_mean.ptr, umean_bytes);
+    Copy#(off0 + usim_bytes + isim_bytes + umean_bytes, sc.item_mean.ptr, imean_bytes);
+    let rc: Result<Int, Int> = write_file(path, (buf as Data) as String);
+    Free#(buf as Ptr<Bit<8>>);
+    when is_err(rc) {
+        term unwrap_err(rc);                      // -errno (negative)
+    };
+    term unwrap(rc);                              // bytes written (>= 0)
+};
+
+// sc_load_status - the result of inspecting a persisted artifact against the
+// current population. Decouples "is it usable?" from the actual block load, so
+// the startup flow is: probe → (fresh ⇒ load) else (recompute + save).
+//   0 = absent / unreadable
+//   1 = present but UNUSABLE (bad magic, wrong dims, short read, or STALE)
+//   2 = present, valid, and FRESH
+const SC_LOAD_ABSENT: Int = 0;
+const SC_LOAD_STALE:  Int = 1;
+const SC_LOAD_FRESH:  Int = 2;
+
+// simcache_probe - read `path` and classify it against the current (cur_nnz,
+// cur_mtime, nusers, nitems). FRESH requires: readable, correct magic, matching
+// dims, a byte length that covers the full declared image (a truncated/partial
+// write fails HERE — never served as good), and a signature equal to the
+// current population. Any failure ⇒ ABSENT/STALE. This reads the file twice in
+// the demo (probe then load); the real startup reads once and keeps the String.
+defn simcache_probe(path: String, cur_nnz: Int, cur_mtime: Int, nusers: Int, nitems: Int)
+    [nusers >= 1 && nitems >= 1][term >= 0 && term <= 2]
+    -> Int
+{
+    let r: Result<String, Int> = read_file(path);
+    when is_err(r) {
+        term SC_LOAD_ABSENT;
+    };
+    let img: String = unwrap(r);
+    let len: Int = img .^Length;
+    when len < SC_HDR_WORDS * 8 {
+        term SC_LOAD_ABSENT;                      // too short to even hold a header
+    };
+    let data: Int = (img as Data) as Int + 8;
+    let magic: Int = Load#(data, 8);
+    when magic != SC_MAGIC {
+        term SC_LOAD_STALE;                       // not our artifact
+    };
+    let fnusers: Int = Load#(data + 8, 8);
+    let fnitems: Int = Load#(data + 16, 8);
+    when fnusers != nusers || fnitems != nitems {
+        term SC_LOAD_STALE;                       // built for a different shape
+    };
+    // full declared image length (a partial write is caught here).
+    let want: Int = SC_HDR_WORDS * 8
+        + fnusers * fnusers * 8 + fnitems * fnitems * 8
+        + fnusers * 8 + fnitems * 8;
+    when len < want {
+        term SC_LOAD_STALE;                       // truncated — reject, don't serve
+    };
+    let fnnz: Int = Load#(data + 24, 8);
+    let fmtime: Int = Load#(data + 32, 8);
+    when fnnz != cur_nnz || fmtime != cur_mtime {
+        term SC_LOAD_STALE;                       // signature mismatch (Req 6.6)
+    };
+    term SC_LOAD_FRESH;
+};
+
+// simcache_load - read `path` and reconstruct a SimCache by Copy#ing the four
+// blocks into FRESH Malloc# matrices/vectors (the loaded cache OWNS its blocks,
+// unlike a build where the means are borrowed — so simcache_load_free frees all
+// four). Precondition: the caller has already probed FRESH, so the header is
+// trusted here. The mean vectors are reconstructed as owned Vectors.
+defn simcache_load(path: String) -> SimCache {
+    let r: Result<String, Int> = read_file(path);
+    let img: String = unwrap(r);                  // probe guaranteed readable
+    let data: Int = (img as Data) as Int + 8;
+    let nu: Int = Load#(data + 8, 8);
+    let ni: Int = Load#(data + 16, 8);
+    let nnz: Int = Load#(data + 24, 8);
+    let mtime: Int = Load#(data + 32, 8);
+    let off0: Int = data + SC_HDR_WORDS * 8;
+    let usim_bytes: Int = nu * nu * 8;
+    let isim_bytes: Int = ni * ni * 8;
+    let umean_bytes: Int = nu * 8;
+    let imean_bytes: Int = ni * 8;
+    let usim: Matrix = mat_new(nu, nu);
+    let isim: Matrix = mat_new(ni, ni);
+    let umean: Vector = vec_new(nu);
+    let imean: Vector = vec_new(ni);
+    Copy#(usim.ptr,  off0,                                      usim_bytes);
+    Copy#(isim.ptr,  off0 + usim_bytes,                         isim_bytes);
+    Copy#(umean.ptr, off0 + usim_bytes + isim_bytes,            umean_bytes);
+    Copy#(imean.ptr, off0 + usim_bytes + isim_bytes + umean_bytes, imean_bytes);
+    term SimCache {
+        user_sim: usim, item_sim: isim, user_mean: umean, item_mean: imean,
+        nusers: nu, nitems: ni,
+        sig: PopSignature { nnz: nnz, mtime: mtime }
+    };
+};
+
+// simcache_load_free - free a LOADED cache: unlike simcache_free (which leaves
+// the borrowed mean vectors to means_free), a loaded cache OWNS all four blocks,
+// so all four are freed here.
+defn simcache_load_free(sc: SimCache) -> Void {
+    mat_free(sc.user_sim);
+    mat_free(sc.item_sim);
+    vec_free(sc.user_mean);
+    vec_free(sc.item_mean);
+    term;
+};
+
 // ── harness: means over the oracle's hand-worked 4x4 (Task 6.1 gate) ──────────
 //
 // Same fixture as reference.bv (0 = missing, so NOT stored in the sparse pop):
@@ -963,6 +1399,54 @@ node run [tick < 1][tick == 1] {
     println!("rec_u0_len={} ok={}", n0, n0 == 0);
     ivec_free(recs);
 
+    // ── Similarity_Cache (Task 9.1) ──────────────────────────────────────────
+    // Build the served snapshot and confirm every cached value EQUALS the
+    // engine's on-the-fly sim' (the cache is a memoization — it introduces no
+    // new numeric claim). All 10 user-pairs + diagonal + symmetry; a spot-check
+    // of the item side; and the borrowed mean vectors.
+    let sc: SimCache = simcache_build(pop, m, 1000);
+    println!("sc_user_sim_matches_engine={}",
+        approx(simcache_user_sim(sc,0,1), sim_user(pop,m,0,1)) &&
+        approx(simcache_user_sim(sc,0,2), sim_user(pop,m,0,2)) &&
+        approx(simcache_user_sim(sc,0,3), sim_user(pop,m,0,3)) &&
+        approx(simcache_user_sim(sc,1,2), sim_user(pop,m,1,2)) &&
+        approx(simcache_user_sim(sc,1,3), sim_user(pop,m,1,3)) &&
+        approx(simcache_user_sim(sc,2,3), sim_user(pop,m,2,3)));
+    println!("sc_user_sim_diag1={}",
+        approx(simcache_user_sim(sc,0,0), 1.0) &&
+        approx(simcache_user_sim(sc,3,3), 1.0));
+    println!("sc_user_sim_symmetric={}",
+        approx(simcache_user_sim(sc,1,3), simcache_user_sim(sc,3,1)) &&
+        approx(simcache_user_sim(sc,0,2), simcache_user_sim(sc,2,0)));
+    // item side: cached == engine, diagonal 1.0, symmetric.
+    println!("sc_item_sim_matches_engine={}",
+        approx(simcache_item_sim(sc,0,1), sim_item(pop,m,0,1)) &&
+        approx(simcache_item_sim(sc,0,3), sim_item(pop,m,0,3)) &&
+        approx(simcache_item_sim(sc,2,3), sim_item(pop,m,2,3)));
+    println!("sc_item_sim_diag1={}",
+        approx(simcache_item_sim(sc,0,0), 1.0) &&
+        approx(simcache_item_sim(sc,3,3), 1.0));
+    println!("sc_item_sim_symmetric={}",
+        approx(simcache_item_sim(sc,1,3), simcache_item_sim(sc,3,1)));
+    // borrowed mean vectors read through the cache.
+    println!("sc_means_match={}",
+        approx(simcache_user_mean(sc,0), means_user(m,0)) &&
+        approx(simcache_user_mean(sc,3), means_user(m,3)) &&
+        approx(simcache_item_mean(sc,3), means_item(m,3)));
+    // ── PopSignature freshness (Task 9.4) ────────────────────────────────────
+    // fresh iff BOTH nnz and mtime match; any mismatch is stale (Req 6.6).
+    let sigA: PopSignature = pop_signature(pop, 1000);
+    let sig_same: PopSignature = pop_signature(pop, 1000);
+    println!("sig_fresh_same={}", sig_fresh(sigA, sig_same));       // expect true
+    let sig_newtime: PopSignature = PopSignature { nnz: pop.nnz, mtime: 2000 };
+    println!("sig_stale_mtime={}", !sig_fresh(sigA, sig_newtime));  // expect true
+    let sig_newcount: PopSignature = PopSignature { nnz: pop.nnz + 1, mtime: 1000 };
+    println!("sig_stale_nnz={}", !sig_fresh(sigA, sig_newcount));   // expect true
+    // the built cache carries the signature it was built with.
+    println!("sc_sig_recorded={}", sc.sig.nnz == pop.nnz && sc.sig.mtime == 1000);
+
+    simcache_free(sc);
+
     means_free(m);
     pop_free(pop);
     ivec_free(us);
@@ -977,8 +1461,157 @@ node run [tick < 1][tick == 1] {
     // 30 sims, and must DIFFER from one that sums all 31 — proving truncation.
     probe_knn_truncation();
     probe_serving();
+    probe_swap();
+    probe_persist();
     tick = 1;
     endprogram;
+};
+
+// probe_persist - the Task 9.4 persistence gate: save → probe-fresh → load →
+// values identical → stale-signature rejection → truncation rejection.
+// Uses a SCRATCH path (NOT the shipped simlist.txt.bin fixture), cleaned up at
+// the end. Builds the 4×4 fixture cache, writes it, and round-trips.
+defn probe_persist() -> Int {
+    let path: String = "examples/recommender/sim_cache_test.bin";
+    let pop: RatingPopulation = probe_swap_pop(3.0);   // the fixture population
+    let m: Means = means_build(pop);
+    let sc: SimCache = simcache_build(pop, m, 1000);
+
+    // 1) save, then probe with the SAME signature ⇒ FRESH.
+    let wrc: Int = simcache_save(sc, path);
+    println!("persist_write_ok={}", wrc > 0);
+    let st_fresh: Int = simcache_probe(path, pop.nnz, 1000, 4, 4);
+    println!("persist_probe_fresh={}", st_fresh == SC_LOAD_FRESH);
+
+    // 2) load it back; every matrix value must equal the in-memory cache.
+    let lc: SimCache = simcache_load(path);
+    println!("persist_roundtrip_user_sim={}",
+        approx(simcache_user_sim(lc,0,1), simcache_user_sim(sc,0,1)) &&
+        approx(simcache_user_sim(lc,1,2), simcache_user_sim(sc,1,2)) &&
+        approx(simcache_user_sim(lc,2,3), simcache_user_sim(sc,2,3)));
+    println!("persist_roundtrip_item_sim={}",
+        approx(simcache_item_sim(lc,0,1), simcache_item_sim(sc,0,1)) &&
+        approx(simcache_item_sim(lc,2,3), simcache_item_sim(sc,2,3)));
+    println!("persist_roundtrip_means={}",
+        approx(simcache_user_mean(lc,3), simcache_user_mean(sc,3)) &&
+        approx(simcache_item_mean(lc,3), simcache_item_mean(sc,3)));
+    println!("persist_roundtrip_sig={}",
+        lc.sig.nnz == pop.nnz && lc.sig.mtime == 1000);
+
+    // 3) a different signature (bumped mtime) ⇒ STALE ⇒ recompute path.
+    let st_mtime: Int = simcache_probe(path, pop.nnz, 2000, 4, 4);
+    println!("persist_probe_stale_mtime={}", st_mtime == SC_LOAD_STALE);
+    // a different record count ⇒ STALE.
+    let st_nnz: Int = simcache_probe(path, pop.nnz + 1, 1000, 4, 4);
+    println!("persist_probe_stale_nnz={}", st_nnz == SC_LOAD_STALE);
+    // a different shape ⇒ STALE (built for another nusers/nitems).
+    let st_shape: Int = simcache_probe(path, pop.nnz, 1000, 5, 5);
+    println!("persist_probe_stale_shape={}", st_shape == SC_LOAD_STALE);
+
+    simcache_load_free(lc);
+    simcache_free(sc);
+    means_free(m);
+    pop_free(pop);
+
+    // 4) truncation: write a 3-byte file to the same path and confirm the probe
+    // rejects it as unusable (ABSENT — too short to hold a header), never served
+    // as a good cache (Req 6.2 partial-write safety).
+    let trc: Result<Int, Int> = write_file(path, "abc");
+    println!("persist_truncated_write_ok={}", is_ok(trc));
+    let st_trunc: Int = simcache_probe(path, 15, 1000, 4, 4);
+    println!("persist_probe_truncated_rejected={}", st_trunc == SC_LOAD_ABSENT);
+
+    // cleanup the scratch artifact.
+    let rm: Result<Int, Int> = remove_file(path);
+    println!("persist_cleanup_ok={}", is_ok(rm));
+    term 0;
+};
+
+// probe_swap - the Task 9.2 gate: off-to-the-side build + atomic pointer swap.
+//
+// Two populations over the SAME 4×4 shape: popA is the oracle fixture; popB is
+// identical EXCEPT user 1's rating of item 0 is lowered (3.0 → 1.0), which
+// changes sim'(u0,u1) but leaves sim'(u2,u3) untouched. We:
+//   1. build cacheA, install into a Served holder, read sim'(u0,u1) through it;
+//   2. build cacheB OFF TO THE SIDE (holder still serves A) and confirm the
+//      holder STILL reads A's value — the new snapshot is invisible pre-swap;
+//   3. served_install(B) — the single-step swap — returns the OLD handle;
+//   4. read through the holder again: sim'(u0,u1) now equals B's value (changed)
+//      while sim'(u2,u3) is unchanged (the swap replaced the WHOLE snapshot
+//      consistently, not a partial mix);
+//   5. free the OLD snapshot only AFTER the swap (never before).
+defn probe_swap() -> Int {
+    let popA: RatingPopulation = probe_swap_pop(3.0);   // u1,i0 = 3.0 (fixture)
+    let mA: Means = means_build(popA);
+    let cacheA: SimCache = simcache_build(popA, mA, 1000);
+    let a01: Float = sim_user(popA, mA, 0, 1);          // engine value for A
+    let a23: Float = sim_user(popA, mA, 2, 3);
+
+    let sv: Served = served_new(cacheA);
+    // (1) the holder serves A.
+    let r0: SimCache = served_read(sv);
+    println!("swap_serves_A={}", approx(simcache_user_sim(r0, 0, 1), a01));
+
+    // (2) build B off to the side; the holder must STILL serve A.
+    let popB: RatingPopulation = probe_swap_pop(1.0);   // u1,i0 = 1.0 (changed)
+    let mB: Means = means_build(popB);
+    let cacheB: SimCache = simcache_build(popB, mB, 2000);
+    let b01: Float = sim_user(popB, mB, 0, 1);
+    let r1: SimCache = served_read(sv);
+    println!("swap_pre_swap_still_A={}", approx(simcache_user_sim(r1, 0, 1), a01));
+    println!("swap_B_differs_from_A={}", !approx(b01, a01));   // the change is real
+
+    // (3) THE SWAP — single step; returns the old snapshot handle.
+    let old: SimCache = served_install(sv, cacheB);
+
+    // (4) the holder now serves B, whole-snapshot-consistently.
+    let r2: SimCache = served_read(sv);
+    println!("swap_post_swap_is_B={}", approx(simcache_user_sim(r2, 0, 1), b01));
+    println!("swap_unaffected_pair_consistent={}",
+        approx(simcache_user_sim(r2, 2, 3), sim_user(popB, mB, 2, 3)));
+    // the old handle `old` still named A's blocks right up to the swap (its
+    // nusers/nitems survived the handover) — proof the swap didn't corrupt it.
+    println!("swap_old_handle_intact={}", old.nusers == 4 && old.nitems == 4);
+
+    // (5) free the OLD snapshot now (reads have drained), then B on teardown.
+    simcache_free(old);
+    means_free(mA);
+    pop_free(popA);
+    served_free(sv);
+    simcache_free(cacheB);
+    means_free(mB);
+    pop_free(popB);
+    term 0;
+};
+
+// probe_swap_pop - the 4×4 oracle fixture, but user 1's item-0 rating is the
+// parameter `u1i0` (3.0 = the real fixture; 1.0 = the mutated variant). Only
+// that one cell differs between the two populations the swap test compares.
+defn probe_swap_pop(u1i0: Float) -> RatingPopulation {
+    let nnz: Int = 15;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,3.0);
+    ivec_set(us,2,0); ivec_set(it,2,2); vec_set(val,2,4.0);
+    ivec_set(us,3,0); ivec_set(it,3,3); vec_set(val,3,4.0);
+    ivec_set(us,4,1); ivec_set(it,4,0); vec_set(val,4,u1i0);   // the varied cell
+    ivec_set(us,5,1); ivec_set(it,5,1); vec_set(val,5,1.0);
+    ivec_set(us,6,1); ivec_set(it,6,2); vec_set(val,6,2.0);
+    ivec_set(us,7,1); ivec_set(it,7,3); vec_set(val,7,3.0);
+    ivec_set(us,8,2);  ivec_set(it,8,0);  vec_set(val,8,4.0);
+    ivec_set(us,9,2);  ivec_set(it,9,1);  vec_set(val,9,3.0);
+    ivec_set(us,10,2); ivec_set(it,10,2); vec_set(val,10,4.0);
+    ivec_set(us,11,2); ivec_set(it,11,3); vec_set(val,11,3.0);
+    ivec_set(us,12,3); ivec_set(it,12,0); vec_set(val,12,3.0);
+    ivec_set(us,13,3); ivec_set(it,13,1); vec_set(val,13,3.0);
+    ivec_set(us,14,3); ivec_set(it,14,2); vec_set(val,14,5.0);
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, 4, 4);
+    ivec_free(us);
+    ivec_free(it);
+    vec_free(val);
+    term pop;
 };
 
 // probe_serving - exercise exclusion + descending order + the item-ascending
