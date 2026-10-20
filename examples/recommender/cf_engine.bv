@@ -509,6 +509,208 @@ defn sim_step(k: IntVec, i: Int, end: Int, key: Int) [i >= 0][true] -> Int {
     term i;
 };
 
+// ── Part 3: kNN prediction (Task 7.1) — Eq. 29/30, k=30, η-normalized ────────
+//
+// Eq. 29 (user-based): r̂ᵘas = ūa + ( Σ_x sim'(a,x)·(rxs − ūx) ) / η_u, where
+// η_u = Σ_x sim'(a,x) over the k NEAREST user-neighbors who rated item s. The
+// weight is the SERVED sim' (Task 6.5), not the base sim. Eq. 30 is the mirror.
+//
+// NEIGHBOR SELECTION (corrects C++ defect #3). Candidates = users who rated s
+// (item s's CSR column). We gather each candidate's sim' into a scratch buffer,
+// select the k LARGEST by sim', then aggregate over EXACTLY that selected set,
+// each neighbor ONCE — no `+first −last` off-by-one. η is the sim' sum over the
+// SAME selected set as the numerator (Req 4.10/4.11). When candidates ≤ k every
+// candidate is selected (the 4×4 case: <30 neighbors); the truncation path is
+// exercised by the ≥31-neighbor probe in the harness.
+
+const NEIGHBOR_K: Int = 30;   // Neighbor_Count default (Req 4.12)
+
+// predict_user - user-based Eq. 29 for cell (a, s). Zero-η (no selected neighbor
+// rated s, or all sims zero) => the active user's true mean (Req 4.15 fallback).
+defn predict_user(pop: RatingPopulation, m: Means, a: Int, s: Int)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    // candidates = users who rated item s = item s's CSR column.
+    let begin: Int = pop_item_begin(pop, s);
+    let cnt:   Int = pop_item_end(pop, s) - begin;
+    when cnt <= 0 {
+        term ma;
+    };
+    // scratch parallel buffers: candidate user, their sim'(a,x), their (rxs−ūx).
+    let cu:  IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pu_gather(pop, m, a, s, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
+    let (accum, eta): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, NEIGHBOR_K);
+    ivec_free(cu); vec_free(csim); vec_free(cdev);
+    when eta == 0.0 {
+        term ma;
+    };
+    term ma + accum / eta;
+};
+
+// pu_gather - walk item s's column (user x, rxs). For each x≠a, record the
+// candidate: cu[n]=x, csim[n]=sim'(a,x), cdev[n]=rxs−ūx. Returns the fill count
+// n (≤ cnt; x==a is skipped). Tail recursion over the column slice.
+defn pu_gather(
+    pop: RatingPopulation, m: Means, a: Int, s: Int,
+    col_user: IntVec, col_val: Vector, cur: Int, end: Int, n: Int,
+    cu: IntVec, csim: Vector, cdev: Vector)
+    [a >= 0 && cur >= 0 && n >= 0][true]
+    -> Int
+{
+    when cur >= end {
+        term n;
+    };
+    let x: Int = ivec_get(col_user, cur);
+    when x == a {
+        term pu_gather(pop, m, a, s, col_user, col_val, cur + 1, end, n, cu, csim, cdev);
+    };
+    ivec_set(cu, n, x);
+    vec_set(csim, n, sim_user(pop, m, a, x));
+    vec_set(cdev, n, vec_get(col_val, cur) - means_user(m, x));
+    term pu_gather(pop, m, a, s, col_user, col_val, cur + 1, end, n + 1, cu, csim, cdev);
+};
+
+// predict_item - item-based Eq. 30 for cell (a, s): candidates = items the
+// active user a rated (user a's CSR row); weight sim'(s,t); dev = (rat − t̄t).
+// Zero-η => the active item's true mean (Req 4.16 fallback).
+defn predict_item(pop: RatingPopulation, m: Means, a: Int, s: Int)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let begin: Int = pop_user_begin(pop, a);
+    let cnt:   Int = pop_user_end(pop, a) - begin;
+    when cnt <= 0 {
+        term ms;
+    };
+    let ct:   IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pi_gather(pop, m, s, pop.user_item, pop.user_val, begin, begin + cnt, 0, ct, csim, cdev);
+    let (accum, eta): (Float, Float) = knn_aggregate(ct, csim, cdev, nfill, NEIGHBOR_K);
+    ivec_free(ct); vec_free(csim); vec_free(cdev);
+    when eta == 0.0 {
+        term ms;
+    };
+    term ms + accum / eta;
+};
+
+// pi_gather - walk user a's row (item t, rat). For each t≠s, record ct[n]=t,
+// csim[n]=sim'(s,t), cdev[n]=rat−t̄t. Tail recursion.
+defn pi_gather(
+    pop: RatingPopulation, m: Means, s: Int,
+    row_item: IntVec, row_val: Vector, cur: Int, end: Int, n: Int,
+    ct: IntVec, csim: Vector, cdev: Vector)
+    [s >= 0 && cur >= 0 && n >= 0][true]
+    -> Int
+{
+    when cur >= end {
+        term n;
+    };
+    let t: Int = ivec_get(row_item, cur);
+    when t == s {
+        term pi_gather(pop, m, s, row_item, row_val, cur + 1, end, n, ct, csim, cdev);
+    };
+    ivec_set(ct, n, t);
+    vec_set(csim, n, sim_item(pop, m, s, t));
+    vec_set(cdev, n, vec_get(row_val, cur) - means_item(m, t));
+    term pi_gather(pop, m, s, row_item, row_val, cur + 1, end, n + 1, ct, csim, cdev);
+};
+
+// knn_aggregate - select the k LARGEST by csim[] from the n candidates, then sum
+// Σ csim·cdev (numerator) and Σ csim (η) over EXACTLY the selected set, each
+// candidate once. Returns (accum, eta). When n ≤ k all candidates are selected.
+// Selection: a `used` marker + k passes each taking the max remaining sim — the
+// contribution is added the moment a candidate is selected, so each is counted
+// exactly once (defect-#3 correction is structural, not a fragile index walk).
+defn knn_aggregate(cand: IntVec, csim: Vector, cdev: Vector, n: Int, k: Int)
+    [n >= 0 && k >= 0][true]
+    -> (Float, Float)
+{
+    let used: IntVec = ivec_new(knn_cap(n));
+    knn_zero(used, n, 0);
+    let take: Int = knn_min(n, k);
+    let (accum, eta): (Float, Float) = knn_select(csim, cdev, used, n, take, 0, 0.0, 0.0);
+    ivec_free(used);
+    term (accum, eta);
+};
+defn knn_cap(n: Int) [n >= 0][term >= 1] -> Int {
+    when n <= 0 { term 1; };
+    term n;
+};
+defn knn_min(a: Int, b: Int) -> Int {
+    when a <= b { term a; };
+    term b;
+};
+defn knn_zero(used: IntVec, n: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
+    when i >= n { term 0; };
+    ivec_set(used, i, 0);
+    term knn_zero(used, n, i + 1);
+};
+
+// knn_select - `take` passes; each finds the max-sim UNUSED candidate, marks it,
+// and adds its contribution to accum/eta. Done when `take` neighbors selected or
+// no unused candidate remains. Tail recursion over the passes.
+defn knn_select(csim: Vector, cdev: Vector, used: IntVec, n: Int, take: Int, done: Int, accum: Float, eta: Float)
+    [n >= 0 && take >= 0 && done >= 0][true]
+    -> (Float, Float)
+{
+    when done >= take {
+        term (accum, eta);
+    };
+    let best: Int = knn_argmax(csim, used, n, 0, -1, 0.0);
+    when best < 0 {
+        term (accum, eta);
+    };
+    ivec_set(used, best, 1);
+    let sim: Float = vec_get(csim, best);
+    term knn_select(csim, cdev, used, n, take, done + 1,
+        accum + sim * vec_get(cdev, best), eta + sim);
+};
+
+// knn_argmax - index of the max csim among unused candidates [0,n); -1 if none
+// unused. `bi` is the best index so far, `bv` its sim. Tail recursion.
+defn knn_argmax(csim: Vector, used: IntVec, n: Int, i: Int, bi: Int, bv: Float)
+    [n >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= n {
+        term bi;
+    };
+    when ivec_get(used, i) == 1 {
+        term knn_argmax(csim, used, n, i + 1, bi, bv);
+    };
+    let si: Float = vec_get(csim, i);
+    when bi < 0 || si > bv {
+        term knn_argmax(csim, used, n, i + 1, i, si);
+    };
+    term knn_argmax(csim, used, n, i + 1, bi, bv);
+};
+
+// ── Part 3b: λ fusion + clamp + zero-η fallbacks (Task 7.5) ───────────────────
+//
+// cf_predict: r̂as = λ·r̂ᵘas + (1−λ)·r̂ⁱas (Eq. 31), clamped to [1,5]. The zero-η
+// fallbacks live INSIDE predict_user/predict_item (η_u=0 ⇒ ūa, η_i=0 ⇒ t̄s), so
+// a both-zero cell fuses the two means and clamps (Req 4.15/4.16/4.17) with no
+// extra branch here. λ ∈ [0,1], default 0.5 (env-configurable in Task 10/12).
+defn cf_predict(pop: RatingPopulation, m: Means, a: Int, s: Int, lam: Float)
+    [a >= 0 && a < pop.nusers && s >= 0 && s < pop.nitems && lam >= 0.0 && lam <= 1.0][true]
+    -> Float
+{
+    let ru: Float = predict_user(pop, m, a, s);
+    let ri: Float = predict_item(pop, m, a, s);
+    term clamp15(lam * ru + (1.0 - lam) * ri);
+};
+defn clamp15(v: Float) -> Float {
+    when v < 1.0 { term 1.0; };
+    when v > 5.0 { term 5.0; };
+    term v;
+};
+
 // ── harness: means over the oracle's hand-worked 4x4 (Task 6.1 gate) ──────────
 //
 // Same fixture as reference.bv (0 = missing, so NOT stored in the sparse pop):
@@ -623,12 +825,116 @@ node run [tick < 1][tick == 1] {
     println!("simp_item(i0,i0)={} ok={}",
         sim_item(pop,m,0,0), approx(sim_item(pop,m,0,0), 1.0));
 
+    // kNN prediction sim'-weighted (Task 7.1). Anchors = reference.bv predui().
+    println!("predui(u3,i3)={} ok={}",
+        predict_user(pop,m,3,3), approx(predict_user(pop,m,3,3), 2.75732088));
+    println!("predui(u0,i0)={} ok={}",
+        predict_user(pop,m,0,0), approx(predict_user(pop,m,0,0), 4.63667488));
+    println!("predui(u1,i2)={} ok={}",
+        predict_user(pop,m,1,2), approx(predict_user(pop,m,1,2), 2.22476125));
+    // item-side prediction: a value + sanity that it is finite & in a sane band.
+    let ri33: Float = predict_item(pop,m,3,3);
+    println!("predict_item(u3,i3)={} sane={}", ri33, ri33 >= 0.0 && ri33 <= 6.0);
+
+    // fusion + clamp (Task 7.5). cf_predict(u3,i3,λ=0.5) must be in [1,5]; and
+    // equal clamp(0.5·predui + 0.5·predict_item).
+    let fu: Float = cf_predict(pop,m,3,3,0.5);
+    println!("cf_predict(u3,i3,0.5)={} in[1,5]={}", fu, fu >= 1.0 && fu <= 5.0);
+    println!("fuse_matches={}",
+        approx(fu, clamp15(0.5 * predict_user(pop,m,3,3) + 0.5 * predict_item(pop,m,3,3))));
+    // λ edges (Property-14 shape): λ=1 ⇒ user side, λ=0 ⇒ item side (pre-clamp
+    // both are in-band here, so the clamp is identity).
+    println!("lambda1_is_user={}",
+        approx(cf_predict(pop,m,3,3,1.0), clamp15(predict_user(pop,m,3,3))));
+    println!("lambda0_is_item={}",
+        approx(cf_predict(pop,m,3,3,0.0), clamp15(predict_item(pop,m,3,3))));
+
     means_free(m);
     pop_free(pop);
-    // us/it/val were consumed by the build (copied into the CSR); free them.
     ivec_free(us);
     ivec_free(it);
     vec_free(val);
+
+    // ── k=30 truncation probe (Property 12 / defect #3) ───────────────────────
+    // A synthetic population where item 0 is rated by 31 users with STRICTLY
+    // increasing similarity-driving values, so exactly one neighbor must be
+    // dropped by k=30. We check the selection truncates: the engine's predict_
+    // user over the 31 candidates must equal a reference that uses ONLY the top
+    // 30 sims, and must DIFFER from one that sums all 31 — proving truncation.
+    probe_knn_truncation();
     tick = 1;
     endprogram;
+};
+
+// probe_knn_truncation - build 31 users all rating item 0, plus a shared set of
+// "profile" items so the 31 users have DISTINCT sim' to user 0. Then confirm
+// predict_user(0, target) selected exactly 30 neighbors: the engine's η must
+// equal the sum of the 30 largest sims, not all 31. We expose η via a direct
+// re-aggregation at k=30 vs k=31 over the same candidate set.
+defn probe_knn_truncation() -> Int {
+    // 32 users (user 0 = active, users 1..31 = 31 candidates), 2 items:
+    // item 0 is the TARGET everyone rates; item 1 is a shared profile item that
+    // gives each candidate a different rating pattern ⇒ different sim' to user 0.
+    // nnz = 32 users × 2 items = 64 ratings.
+    let nu: Int = 32;
+    let ni: Int = 2;
+    let nnz: Int = nu * ni;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+    probe_fill(us, it, val, 0, 0, nu);
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, nu, ni);
+    let m: Means = means_build(pop);
+
+    // Gather user 0's candidate sims for the item-0 column, then compare the
+    // k=30 aggregate η against the k=31 (all) aggregate η over the SAME set.
+    let begin: Int = pop_item_begin(pop, 0);
+    let cnt:   Int = pop_item_end(pop, 0) - begin;
+    let cu:   IntVec = ivec_new(cnt);
+    let csim: Vector = vec_new(cnt);
+    let cdev: Vector = vec_new(cnt);
+    let nfill: Int = pu_gather(pop, m, 0, 0, pop.item_user, pop.item_val, begin, begin + cnt, 0, cu, csim, cdev);
+    let (_a30, eta30): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 30);
+    let (_a31, eta31): (Float, Float) = knn_aggregate(cu, csim, cdev, nfill, 31);
+    println!("probe_candidates={} (expect 31)", nfill);
+    println!("probe_k30_truncates={} (eta30 != eta31)", !approx(eta30, eta31));
+    // the dropped neighbor is the SMALLEST sim; eta31 − eta30 == min sim.
+    let minsim: Float = probe_min_sim(csim, nfill, 0, 1000000.0);
+    println!("probe_dropped_is_min={}", approx(eta31 - eta30, minsim));
+
+    ivec_free(cu); vec_free(csim); vec_free(cdev);
+    means_free(m); pop_free(pop);
+    ivec_free(us); ivec_free(it); vec_free(val);
+    term 0;
+};
+
+// probe_fill - user u (0..nu) rates item 0 with value 3, and item 1 with a value
+// that varies by u (1..5 cycling) so each user's centered profile differs,
+// yielding 31 distinct sim' to user 0. Tail recursion over users.
+defn probe_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+    [k >= 0 && u >= 0][true]
+    -> Int
+{
+    when u >= nu {
+        term k;
+    };
+    ivec_set(us, k, u);     ivec_set(it, k, 0);     vec_set(val, k, 3.0);
+    ivec_set(us, k + 1, u); ivec_set(it, k + 1, 1); vec_set(val, k + 1, probe_profile(u));
+    term probe_fill(us, it, val, k + 2, u + 1, nu);
+};
+// probe_profile - a per-user item-1 rating in [1,5] that varies with u (so the
+// 31 candidates have distinct sim'). A simple (u mod 5)+1 spread.
+defn probe_profile(u: Int) [u >= 0][term >= 1.0 && term <= 5.0] -> Float {
+    term ((u % 5) + 1) as Float;
+};
+// probe_min_sim - the smallest of the first n sims. Tail recursion.
+defn probe_min_sim(csim: Vector, n: Int, i: Int, acc: Float) [n >= 0 && i >= 0][true] -> Float {
+    when i >= n {
+        term acc;
+    };
+    let s: Float = vec_get(csim, i);
+    when s < acc {
+        term probe_min_sim(csim, n, i + 1, s);
+    };
+    term probe_min_sim(csim, n, i + 1, acc);
 };

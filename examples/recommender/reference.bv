@@ -237,6 +237,44 @@ defn pcc_imp_acc(mat: Int, a: Int, b: Int, ma: Float, mb: Float, i: Int, num: Fl
     term pcc_imp_acc(mat, a, b, ma, mb, i + 1, num, da, db);
 };
 
+// ── sim'-based prediction (Eq. 29/30, the Task 7 oracle) ─────────────────────
+//
+// The ENGINE's kNN prediction (Task 7) weights neighbors by the SERVED
+// similarity sim' (= pcc_imputed_users), NOT the base raw-overlap sim. Eq. 29:
+//   r̂ᵘas = ūa + ( Σ_x sim'(a,x)·(rxs − ūx) ) / ( Σ_x sim'(a,x) )
+// over users x≠a who rated s. (predict_user above used the BASE sim and anchors
+// IMPUTATION; this sim'-weighted version anchors PREDICTION.) η==0 => ūa. This
+// dense oracle uses ALL neighbors who rated s — the kNN k=30 truncation is the
+// engine's optimization, inert on the 4×4 (<30 neighbors), probed separately.
+
+// predict_user_imputed - dense Eq. 29 weighted by sim' (pcc_imputed_users).
+defn predict_user_imputed(mat: Int, a: Int, s: Int) [a >= 0 && s >= 0][true] -> Float {
+    let ma: Float = user_mean(mat, a);
+    let (accum, eta): (Float, Float) = predui_acc(mat, a, s, ma, 0, 0.0, 0.0);
+    when eta == 0.0 {
+        term ma;
+    };
+    term ma + accum / eta;
+};
+defn predui_acc(mat: Int, a: Int, s: Int, ma: Float, x: Int, accum: Float, eta: Float)
+    [a >= 0 && s >= 0 && x >= 0][true]
+    -> (Float, Float)
+{
+    when x >= NR {
+        term (accum, eta);
+    };
+    when x == a {
+        term predui_acc(mat, a, s, ma, x + 1, accum, eta);
+    };
+    let rxs: Float = rget(mat, x, s);
+    when observed(rxs) {
+        let sim: Float = pcc_imputed_users(mat, a, x);
+        let mx: Float = user_mean(mat, x);
+        term predui_acc(mat, a, s, ma, x + 1, accum + sim * (rxs - mx), eta + sim);
+    };
+    term predui_acc(mat, a, s, ma, x + 1, accum, eta);
+};
+
 // ── fusion (Eq. 31) + clamp ───────────────────────────────────────────────────
 // fuse(ru, ri, lam): λ·ru + (1-λ)·ri, clamped to [1,5].
 defn fuse(ru: Float, ri: Float, lam: Float) [lam >= 0.0 && lam <= 1.0][true] -> Float {
@@ -297,14 +335,19 @@ node run [tick < 1][tick == 1] {
     println!("simp(u0,u0)={} ok={}",
         pcc_imputed_users(mat,0,0), approx(pcc_imputed_users(mat,0,0), 1.0));
 
-    // user-based prediction of u3's missing i3, then fuse with the item mean as
-    // the item side (a stand-in here; the full item-based Eq.30 is exercised in
-    // the engine). λ=0.5.
+    // BASE-sim prediction of u3's missing i3 (anchors IMPUTATION, Task 6.3).
     let ru: Float = predict_user(mat, 3, 3);
     println!("predict_user(u3,i3)={}", ru);
     let ri: Float = item_mean(mat, 3);
     let fused: Float = fuse(ru, ri, 0.5);
     println!("fused(λ=0.5)={} in[1,5]={}", fused, fused >= 1.0 && fused <= 5.0);
+
+    // sim'-WEIGHTED prediction (Eq. 29, the Task 7 anchor the engine must match).
+    // This differs from predict_user above: it weights by pcc_imputed_users, not
+    // the base pcc_users.
+    println!("predui(u3,i3)={}", predict_user_imputed(mat, 3, 3));
+    println!("predui(u0,i0)={}", predict_user_imputed(mat, 0, 0));
+    println!("predui(u1,i2)={}", predict_user_imputed(mat, 1, 2));
 
     // clamp edges
     println!("clamp(0.2)={} ok={}", clamp15(0.2), approx(clamp15(0.2), 1.0));
