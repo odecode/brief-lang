@@ -711,6 +711,111 @@ defn clamp15(v: Float) -> Float {
     term v;
 };
 
+// ── Part 4: top-N serving (Task 8.1) — exclude rated, desc, item-asc tie ─────
+//
+// cf_recommend: rank the items the active user has NOT rated by fused cf_predict
+// DESCENDING, ties broken by item index ASCENDING, take the top `topn`. Writes
+// the ordered item indices into out_items (an IntVec of length ≥ topn) and
+// returns the count = min(topn, eligible items) (Req 4.18, 4.19).
+//
+// EXCLUSION. An item the user already rated is in the user's CSR row; rec_rated
+// checks membership (the row is item-ascending, early-out). Excluded items are
+// never scored or emitted.
+//
+// SELECTION. Dense selection over all nitems: each pass picks the unpicked,
+// unrated item with the max fused score (ties → smaller index via strict `>`),
+// marks it picked, records it. O(topn · nitems · predict) — fine for serving a
+// single user (the design's O(k)-per-request lives in the cached matrices, Task
+// 9); here correctness first.
+
+const TOP_N: Int = 5;   // Top_N default (Req 4.19 / design)
+
+// cf_recommend - top-N for user `a`. out_items must have capacity ≥ topn.
+defn cf_recommend(pop: RatingPopulation, m: Means, a: Int, topn: Int, lam: Float, out_items: IntVec)
+    [a >= 0 && a < pop.nusers && topn >= 0 && lam >= 0.0 && lam <= 1.0][true]
+    -> Int
+{
+    let picked: IntVec = ivec_new(knn_cap(pop.nitems));
+    knn_zero(picked, pop.nitems, 0);
+    rec_init(pop, a, picked, 0);
+    let n: Int = rec_fill(pop, m, a, topn, lam, picked, out_items, 0);
+    ivec_free(picked);
+    term n;
+};
+// rec_init - picked[i] = 1 for every item user a already rated (so it is
+// excluded from serving). Runs AFTER knn_zero cleared the array, so unrated
+// items stay 0 (ivec_new memory is uninitialized — never rely on it being 0).
+// Walks all nitems. Tail recursion.
+defn rec_init(pop: RatingPopulation, a: Int, picked: IntVec, i: Int)
+    [a >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term 0;
+    };
+    when rec_rated(pop, a, i) {
+        ivec_set(picked, i, 1);
+    };
+    term rec_init(pop, a, picked, i + 1);
+};
+// rec_rated - true iff user a's CSR row contains item i (observed). Item-ascending
+// row, so early-out once we pass i.
+defn rec_rated(pop: RatingPopulation, a: Int, i: Int) [a >= 0 && i >= 0][true] -> Bool {
+    term rec_row_has(pop.user_item, i, pop_user_begin(pop, a), pop_user_end(pop, a));
+};
+defn rec_row_has(row_item: IntVec, target: Int, cur: Int, end: Int)
+    [cur >= 0 && end >= cur][true]
+    -> Bool
+{
+    when cur >= end {
+        term false;
+    };
+    let it: Int = ivec_get(row_item, cur);
+    when it == target {
+        term true;
+    };
+    when it > target {
+        term false;
+    };
+    term rec_row_has(row_item, target, cur + 1, end);
+};
+// rec_fill - emit up to `topn` items by descending fused score, item-ascending
+// tie-break. Each pass selects the best unpicked item, marks it, records it.
+defn rec_fill(pop: RatingPopulation, m: Means, a: Int, topn: Int, lam: Float, picked: IntVec, out_items: IntVec, done: Int)
+    [a >= 0 && topn >= 0 && done >= 0][true]
+    -> Int
+{
+    when done >= topn {
+        term done;
+    };
+    let best: Int = rec_argbest(pop, m, a, lam, picked, 0, -1, 0.0);
+    when best < 0 {
+        term done;
+    };
+    ivec_set(picked, best, 1);
+    ivec_set(out_items, done, best);
+    term rec_fill(pop, m, a, topn, lam, picked, out_items, done + 1);
+};
+// rec_argbest - index of the unpicked item with the max fused cf_predict; ties
+// broken by SMALLER index (strict `>` leaves the first/smaller on a tie). -1 if
+// none unpicked remain. Items scan ascending so the tie-break is automatic.
+defn rec_argbest(pop: RatingPopulation, m: Means, a: Int, lam: Float, picked: IntVec, i: Int, bi: Int, bscore: Float)
+    [a >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term bi;
+    };
+    when ivec_get(picked, i) == 1 {
+        term rec_argbest(pop, m, a, lam, picked, i + 1, bi, bscore);
+    };
+    let score: Float = cf_predict(pop, m, a, i, lam);
+    when bi < 0 || score > bscore {
+        term rec_argbest(pop, m, a, lam, picked, i + 1, i, score);
+    };
+    term rec_argbest(pop, m, a, lam, picked, i + 1, bi, bscore);
+};
+
 // ── harness: means over the oracle's hand-worked 4x4 (Task 6.1 gate) ──────────
 //
 // Same fixture as reference.bv (0 = missing, so NOT stored in the sparse pop):
@@ -849,6 +954,15 @@ node run [tick < 1][tick == 1] {
     println!("lambda0_is_item={}",
         approx(cf_predict(pop,m,3,3,0.0), clamp15(predict_item(pop,m,3,3))));
 
+    // top-N serving (Task 8). u3 has one unrated item (i3) ⇒ [i3]; u0 rated all
+    // ⇒ empty. Anchors reference.bv's recommend_user.
+    let recs: IntVec = ivec_new(TOP_N);
+    let n3: Int = cf_recommend(pop,m,3,TOP_N,0.5,recs);
+    println!("rec_u3_len={} first={} ok={}", n3, ivec_get(recs,0), n3 == 1 && ivec_get(recs,0) == 3);
+    let n0: Int = cf_recommend(pop,m,0,TOP_N,0.5,recs);
+    println!("rec_u0_len={} ok={}", n0, n0 == 0);
+    ivec_free(recs);
+
     means_free(m);
     pop_free(pop);
     ivec_free(us);
@@ -862,8 +976,90 @@ node run [tick < 1][tick == 1] {
     // user over the 31 candidates must equal a reference that uses ONLY the top
     // 30 sims, and must DIFFER from one that sums all 31 — proving truncation.
     probe_knn_truncation();
+    probe_serving();
     tick = 1;
     endprogram;
+};
+
+// probe_serving - exercise exclusion + descending order + the item-ascending
+// tie-break on a crafted 5×5 population. The active user u0 rated items 0,1
+// (excluded); items 2,3,4 are eligible. Items 3 and 4 are given IDENTICAL
+// rating columns, so they produce IDENTICAL fused scores — a forced tie the
+// serving must resolve by emitting the smaller index (3) before the larger (4).
+defn probe_serving() -> Int {
+    let nu: Int = 5;
+    let ni: Int = 5;
+    // ratings: build a list; count them as we go.
+    // u0 rates items 0,1 (the excluded set).
+    // users u1..u4 rate items 2,3,4 so those have neighbors; 3 and 4 share the
+    // EXACT same column (same users, same values) ⇒ tie. item 2 differs.
+    let cap: Int = 32;
+    let us:  IntVec = ivec_new(cap);
+    let it:  IntVec = ivec_new(cap);
+    let val: Vector = vec_new(cap);
+    // u0 profile (items 0,1) — also gives u0 a row so sim' is defined.
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,4.0);
+    // u1..u4 each rate items 0 and 1 too (so u0 has overlap ⇒ nonzero sim'),
+    // plus items 2,3,4. Items 3 and 4 get the SAME values as each other per user.
+    let k: Int = probe_serv_fill(us, it, val, 2, 1, nu);
+    let pop: RatingPopulation = pop_build(us, it, val, k, nu, ni);
+    let m: Means = means_build(pop);
+
+    let recs: IntVec = ivec_new(TOP_N);
+    let n: Int = cf_recommend(pop, m, 0, TOP_N, 0.5, recs);
+    let r0: Int = ivec_get(recs, 0);
+    let r1: Int = ivec_get(recs, 1);
+    let r2: Int = ivec_get(recs, 2);
+    println!("serv_len={} order=[{},{},{}] (expect 3 eligible: 2,3,4)", n, r0, r1, r2);
+    // exclusion: none of the emitted items is 0 or 1.
+    println!("serv_excludes_rated={}",
+        r0 != 0 && r0 != 1 && r1 != 0 && r1 != 1 && r2 != 0 && r2 != 1);
+    // descending score: score(r0) >= score(r1) >= score(r2).
+    let s0: Float = cf_predict(pop, m, 0, r0, 0.5);
+    let s1: Float = cf_predict(pop, m, 0, r1, 0.5);
+    let s2: Float = cf_predict(pop, m, 0, r2, 0.5);
+    println!("serv_descending={}", s0 >= s1 && s1 >= s2);
+    // tie-break: items 3 and 4 tie (identical columns) ⇒ 3 must precede 4.
+    println!("serv_tie_3_before_4={}", probe_pos(recs, n, 3) < probe_pos(recs, n, 4));
+    println!("serv_tie_scores_equal={}",
+        approx(cf_predict(pop,m,0,3,0.5), cf_predict(pop,m,0,4,0.5)));
+
+    ivec_free(recs);
+    means_free(m); pop_free(pop);
+    ivec_free(us); ivec_free(it); vec_free(val);
+    term 0;
+};
+// probe_serv_fill - users u1..(nu-1) each rate items 0,1 (overlap with u0) and
+// 2,3,4. Item 2's value differs from 3/4; items 3 and 4 share the SAME value per
+// user (the forced tie). `k` is the running write cursor. Tail recursion over u.
+defn probe_serv_fill(us: IntVec, it: IntVec, val: Vector, k: Int, u: Int, nu: Int)
+    [k >= 0 && u >= 1][true]
+    -> Int
+{
+    when u >= nu {
+        term k;
+    };
+    let base: Float = (u as Float);                 // varies the overlap profile
+    ivec_set(us,k,u);   ivec_set(it,k,0);   vec_set(val,k, base);
+    ivec_set(us,k+1,u); ivec_set(it,k+1,1); vec_set(val,k+1, base + 1.0);
+    ivec_set(us,k+2,u); ivec_set(it,k+2,2); vec_set(val,k+2, 2.0);       // item 2 distinct
+    ivec_set(us,k+3,u); ivec_set(it,k+3,3); vec_set(val,k+3, base);      // item 3 \ identical
+    ivec_set(us,k+4,u); ivec_set(it,k+4,4); vec_set(val,k+4, base);      // item 4 / columns ⇒ tie
+    term probe_serv_fill(us, it, val, k + 5, u + 1, nu);
+};
+// probe_pos - the position of item `want` in the first n of recs, or n if absent.
+defn probe_pos(recs: IntVec, n: Int, want: Int) [n >= 0][true] -> Int {
+    term probe_pos_go(recs, n, want, 0);
+};
+defn probe_pos_go(recs: IntVec, n: Int, want: Int, i: Int) [n >= 0 && i >= 0][true] -> Int {
+    when i >= n {
+        term n;
+    };
+    when ivec_get(recs, i) == want {
+        term i;
+    };
+    term probe_pos_go(recs, n, want, i + 1);
 };
 
 // probe_knn_truncation - build 31 users all rating item 0, plus a shared set of

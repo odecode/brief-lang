@@ -275,6 +275,222 @@ defn predui_acc(mat: Int, a: Int, s: Int, ma: Float, x: Int, accum: Float, eta: 
     term predui_acc(mat, a, s, ma, x + 1, accum, eta);
 };
 
+// ── item-side mirror: imputed-space item PCC + Eq. 30 + fused cf_predict ─────
+//
+// Everything above is user-oriented (rows = users). The item side transposes:
+// a column is an item, mean-centering uses item means, the key set is over
+// USERS. This mirror is what the engine's predict_item/cf_predict must match,
+// so the oracle computes the FULL fused prediction (Task 8 serving sorts these).
+
+// impute_cell_item - §3.2 dense estimate of cell (user u, item s): observed =>
+// real; missing => t̄s + Σ pcc_items(s,t)(rut−t̄t) / Σ|pcc_items(s,t)| over items
+// t≠s that user u rated. The base item PCC (over raw user overlap) drives it.
+defn impute_cell_item(mat: Int, u: Int, s: Int) [u >= 0 && s >= 0][true] -> Float {
+    let rus: Float = rget(mat, u, s);
+    when observed(rus) {
+        term rus;
+    };
+    let ms: Float = item_mean(mat, s);
+    let (accum, wsum): (Float, Float) = impute_item_cell_acc(mat, u, s, 0, 0.0, 0.0);
+    when wsum <= 0.0 {
+        term ms;
+    };
+    term ms + accum / wsum;
+};
+defn impute_item_cell_acc(mat: Int, u: Int, s: Int, t: Int, accum: Float, wsum: Float)
+    [u >= 0 && s >= 0 && t >= 0][true]
+    -> (Float, Float)
+{
+    when t >= NC {
+        term (accum, wsum);
+    };
+    when t == s {
+        term impute_item_cell_acc(mat, u, s, t + 1, accum, wsum);
+    };
+    let rut: Float = rget(mat, u, t);
+    when observed(rut) {
+        let sim: Float = pcc_items(mat, s, t);
+        let mt: Float = item_mean(mat, t);
+        term impute_item_cell_acc(mat, u, s, t + 1, accum + sim * (rut - mt), wsum + Fabs#(sim));
+    };
+    term impute_item_cell_acc(mat, u, s, t + 1, accum, wsum);
+};
+
+// pcc_items - BASE item PCC over the raw overlap of users who rated both s and t
+// (the item-space mirror of pcc_users). Drives impute_cell_item.
+defn pcc_items(mat: Int, s: Int, t: Int) [s >= 0 && t >= 0][true] -> Float {
+    let ms: Float = item_mean(mat, s);
+    let mt: Float = item_mean(mat, t);
+    let (num, da, db): (Float, Float, Float) = pcc_item_acc(mat, s, t, ms, mt, 0, 0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+defn pcc_item_acc(mat: Int, s: Int, t: Int, ms: Float, mt: Float, u: Int, num: Float, da: Float, db: Float)
+    [s >= 0 && t >= 0 && u >= 0][true]
+    -> (Float, Float, Float)
+{
+    when u >= NR {
+        term (num, da, db);
+    };
+    let rs: Float = rget(mat, u, s);
+    let rt: Float = rget(mat, u, t);
+    when observed(rs) && observed(rt) {
+        let cs: Float = rs - ms;
+        let ct: Float = rt - mt;
+        term pcc_item_acc(mat, s, t, ms, mt, u + 1, num + cs * ct, da + cs * cs, db + ct * ct);
+    };
+    term pcc_item_acc(mat, s, t, ms, mt, u + 1, num, da, db);
+};
+
+// pcc_imputed_items - sim'(s,t): item PCC over the UNION user key-set (users who
+// rated either item), each cell imputed (§3.2) and mean-centered by item means.
+defn pcc_imputed_items(mat: Int, s: Int, t: Int) [s >= 0 && t >= 0][true] -> Float {
+    let ms: Float = item_mean(mat, s);
+    let mt: Float = item_mean(mat, t);
+    let (num, da, db): (Float, Float, Float) = pcc_impi_acc(mat, s, t, ms, mt, 0, 0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+defn pcc_impi_acc(mat: Int, s: Int, t: Int, ms: Float, mt: Float, u: Int, num: Float, da: Float, db: Float)
+    [s >= 0 && t >= 0 && u >= 0][true]
+    -> (Float, Float, Float)
+{
+    when u >= NR {
+        term (num, da, db);
+    };
+    let rs: Float = rget(mat, u, s);
+    let rt: Float = rget(mat, u, t);
+    when observed(rs) || observed(rt) {
+        let vs: Float = impute_cell_item(mat, u, s) - ms;
+        let vt: Float = impute_cell_item(mat, u, t) - mt;
+        term pcc_impi_acc(mat, s, t, ms, mt, u + 1, num + vs * vt, da + vs * vs, db + vt * vt);
+    };
+    term pcc_impi_acc(mat, s, t, ms, mt, u + 1, num, da, db);
+};
+
+// predict_item_imputed - dense Eq. 30 weighted by sim' (pcc_imputed_items):
+// r̂ⁱas = t̄s + Σ_t sim'(s,t)(rat−t̄t) / Σ_t sim'(s,t) over items t≠s that user a
+// rated. η==0 => t̄s.
+defn predict_item_imputed(mat: Int, a: Int, s: Int) [a >= 0 && s >= 0][true] -> Float {
+    let ms: Float = item_mean(mat, s);
+    let (accum, eta): (Float, Float) = predii_acc(mat, a, s, ms, 0, 0.0, 0.0);
+    when eta == 0.0 {
+        term ms;
+    };
+    term ms + accum / eta;
+};
+defn predii_acc(mat: Int, a: Int, s: Int, ms: Float, t: Int, accum: Float, eta: Float)
+    [a >= 0 && s >= 0 && t >= 0][true]
+    -> (Float, Float)
+{
+    when t >= NC {
+        term (accum, eta);
+    };
+    when t == s {
+        term predii_acc(mat, a, s, ms, t + 1, accum, eta);
+    };
+    let rat: Float = rget(mat, a, t);
+    when observed(rat) {
+        let sim: Float = pcc_imputed_items(mat, s, t);
+        let mt: Float = item_mean(mat, t);
+        term predii_acc(mat, a, s, ms, t + 1, accum + sim * (rat - mt), eta + sim);
+    };
+    term predii_acc(mat, a, s, ms, t + 1, accum, eta);
+};
+
+// cf_predict_ref - the fused dense prediction (Eq. 31): clamp(λ·r̂ᵘ + (1−λ)·r̂ⁱ).
+// This is the oracle the engine's cf_predict must match, and the score the
+// serving sort ranks.
+defn cf_predict_ref(mat: Int, a: Int, s: Int, lam: Float)
+    [a >= 0 && s >= 0 && lam >= 0.0 && lam <= 1.0][true]
+    -> Float
+{
+    let ru: Float = predict_user_imputed(mat, a, s);
+    let ri: Float = predict_item_imputed(mat, a, s);
+    term clamp15(lam * ru + (1.0 - lam) * ri);
+};
+
+// ── top-N serving (Eq. 4.18/4.19, the Task 8 oracle) ─────────────────────────
+//
+// recommend_user: for the active user a, rank the items a has NOT rated by their
+// fused cf_predict_ref score DESCENDING, breaking ties by item index ASCENDING,
+// and take the top `topn`. Writes the ordered item indices into out_items
+// (length = min(topn, eligible)) and returns that length. Dense selection sort
+// over the NC items — obviously correct, the ordering oracle for the engine.
+defn recommend_user(mat: Int, a: Int, topn: Int, out_items: Int, lam: Float)
+    [a >= 0 && topn >= 0][true]
+    -> Int
+{
+    // picked[] marks items already placed (so each is emitted once); an already-
+    // rated item is marked picked up front so it is excluded (Req 4.18). Zero the
+    // whole array FIRST (Malloc# memory is uninitialized), then mark rated items.
+    let picked: Int = Malloc#(NC * 8) as Int;
+    rec_zero_picked(picked, 0);
+    rec_init_picked(mat, a, picked, 0);
+    let n: Int = rec_select(mat, a, topn, out_items, picked, lam, 0);
+    Free#(picked as Ptr<Bit<8>>);
+    term n;
+};
+// rec_zero_picked - clear all NC slots to 0. Tail recursion.
+defn rec_zero_picked(picked: Int, i: Int) [i >= 0][true] -> Int {
+    when i >= NC {
+        term 0;
+    };
+    let p: Ptr<Int> = picked as Ptr<Int>;
+    p[i] = 0;
+    term rec_zero_picked(picked, i + 1);
+};
+// rec_init_picked - picked[i] = 1 if a already rated item i (excluded). Runs
+// AFTER rec_zero_picked, so unrated items stay 0 (single-mark, mirrors the
+// engine's rec_init — the earlier double-`when` form was the bug).
+defn rec_init_picked(mat: Int, a: Int, picked: Int, i: Int) [a >= 0 && i >= 0][true] -> Int {
+    when i >= NC {
+        term 0;
+    };
+    when observed(rget(mat, a, i)) {
+        let p: Ptr<Int> = picked as Ptr<Int>;
+        p[i] = 1;
+    };
+    term rec_init_picked(mat, a, picked, i + 1);
+};
+// rec_select - emit up to `topn` items: each pass picks the unpicked item with
+// the highest fused score (ties → smaller item index), marks it, records it.
+// Stops when topn reached or no eligible item remains. Returns the count.
+defn rec_select(mat: Int, a: Int, topn: Int, out_items: Int, picked: Int, lam: Float, done: Int)
+    [a >= 0 && topn >= 0 && done >= 0][true]
+    -> Int
+{
+    when done >= topn {
+        term done;
+    };
+    let best: Int = rec_argbest(mat, a, picked, lam, 0, -1, 0.0);
+    when best < 0 {
+        term done;
+    };
+    let p: Ptr<Int> = picked as Ptr<Int>;
+    p[best] = 1;
+    let o: Ptr<Int> = out_items as Ptr<Int>;
+    o[done] = best;
+    term rec_select(mat, a, topn, out_items, picked, lam, done + 1);
+};
+// rec_argbest - index of the unpicked item with the max fused score; ties broken
+// by SMALLER index (strict > keeps the first/smaller index on a tie). -1 if none.
+defn rec_argbest(mat: Int, a: Int, picked: Int, lam: Float, i: Int, bi: Int, bscore: Float)
+    [a >= 0 && i >= 0][true]
+    -> Int
+{
+    when i >= NC {
+        term bi;
+    };
+    let p: Ptr<Int> = picked as Ptr<Int>;
+    when p[i] == 1 {
+        term rec_argbest(mat, a, picked, lam, i + 1, bi, bscore);
+    };
+    let score: Float = cf_predict_ref(mat, a, i, lam);
+    when bi < 0 || score > bscore {
+        term rec_argbest(mat, a, picked, lam, i + 1, i, score);
+    };
+    term rec_argbest(mat, a, picked, lam, i + 1, bi, bscore);
+};
+
 // ── fusion (Eq. 31) + clamp ───────────────────────────────────────────────────
 // fuse(ru, ri, lam): λ·ru + (1-λ)·ri, clamped to [1,5].
 defn fuse(ru: Float, ri: Float, lam: Float) [lam >= 0.0 && lam <= 1.0][true] -> Float {
@@ -348,6 +564,24 @@ node run [tick < 1][tick == 1] {
     println!("predui(u3,i3)={}", predict_user_imputed(mat, 3, 3));
     println!("predui(u0,i0)={}", predict_user_imputed(mat, 0, 0));
     println!("predui(u1,i2)={}", predict_user_imputed(mat, 1, 2));
+
+    // item-side sim'-weighted prediction (Eq. 30) + fused cf_predict (the Task 8
+    // serving anchors). The 4×4's missing cell is (u3,i3).
+    println!("predii(u3,i3)={}", predict_item_imputed(mat, 3, 3));
+    println!("predii(u0,i0)={}", predict_item_imputed(mat, 0, 0));
+    println!("cf_predict_ref(u3,i3,0.5)={}", cf_predict_ref(mat, 3, 3, 0.5));
+
+    // serving (Task 8): u3 has exactly ONE unrated item (i3), so its top-5 is
+    // [i3] — a direct exclusion + single-item check. Users u0..u2 rated every
+    // item ⇒ their eligible set is empty ⇒ length 0. The output buffer must hold
+    // `topn` entries (5), NOT NC — a smaller buffer overflows.
+    let recs: Int = Malloc#(5 * 8) as Int;
+    let n3: Int = recommend_user(mat, 3, 5, recs, 0.5);
+    let rp: Ptr<Int> = recs as Ptr<Int>;
+    println!("rec_u3_len={} first={} (expect len 1, item 3)", n3, rp[0]);
+    let n0: Int = recommend_user(mat, 0, 5, recs, 0.5);
+    println!("rec_u0_len={} (expect 0 — rated all)", n0);
+    Free#(recs as Ptr<Bit<8>>);
 
     // clamp edges
     println!("clamp(0.2)={} ok={}", clamp15(0.2), approx(clamp15(0.2), 1.0));
