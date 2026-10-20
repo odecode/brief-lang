@@ -231,6 +231,35 @@ fn string_concat_at_o2_is_correct() {
     assert_eq!(out, "abcd|abcd", "string concat at -O2: {out:?}");
 }
 
+/// 2026-10-20 (PR #26 reconciliation): canonical net-stack answers through
+/// the compiled pipeline — Base64, the RFC 6455 accept key (SHA-1 + Base64),
+/// incremental HTTP parse, and the websocket conveniences over the unified
+/// codec. Base64 is compiled-path only (interpreter callable-txn gap).
+/// 2026-10-20 (workstream C): pooled object globals — runtime initializer
+/// seeding, per-instance pool rows, and boxed argument passing.
+#[test]
+fn obj_globals_golden_output() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("obj_globals", "golden", &[]);
+    assert_eq!(out, "3|8|9|1|4", "pooled object globals drifted: {out:?}");
+}
+
+#[test]
+fn net_stack_helpers_golden_output() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("net_stack_helpers", "golden", &[]);
+    assert_eq!(
+        out, "aGVsbG8=|s3pPLMBiTxaQ9kYGzzhZRbK+xOo=|OK",
+        "net-stack helper golden drifted: {out:?}"
+    );
+}
+
 #[test]
 fn trait_generics_golden_output() {
     if !has("clang") {
