@@ -1,0 +1,634 @@
+// cf_engine - the AutAI-Fusion collaborative-filtering engine (recommender-app
+// APP code, NOT stdlib). Built on the general stdlib primitives (matrix.bv's
+// Vector/IntVec and rating_population.bv's dual-orientation CSR); the paper's
+// equations themselves are application knowledge and live here.
+//
+// 2026-10-20 (recommender-app Task 6, part 1): means + global-mean fallback.
+// The next increments add key-set imputation (6.3) and PCC similarity (6.5).
+//
+// CORRECTNESS ORACLE. Every value this engine produces is checked against
+// examples/recommender/reference.bv (the dense, straight-from-the-paper
+// oracle) on the hand-worked 4x4 fixture, within 1e-6 - NOT against
+// recommender_singlepass.cpp (whose three defects we must not reproduce).
+//
+// ── Part 1: means (Task 6.1) ─────────────────────────────────────────────────
+//
+// WHY A TRUE MEAN (corrects C++ defect #1). The AutAI-Fusion mean ua / ts is the
+// true arithmetic average of a user's / item's OBSERVED ratings. The C++
+// baseline substituted a degenerate constant; we compute the honest average and
+// fall back to the GLOBAL mean (the average of every observed rating) only when
+// a user or item has no ratings at all - never a magic number.
+
+import "std/matrix.bv";
+import "std/rating_population.bv";
+
+// Means holds the per-user and per-item mean vectors plus a presence flag for
+// each (has_mean == true iff that user/item had >= 1 observed rating). The
+// global mean is the fallback a prediction uses when a row/column is empty.
+obj Means {
+    user_mean: Vector;     // len nusers
+    item_mean: Vector;     // len nitems
+    user_has:  IntVec;     // len nusers; 1 if the user had >= 1 rating, else 0
+    item_has:  IntVec;     // len nitems; 1 if the item had >= 1 rating, else 0
+    global:    Float;      // average of ALL observed ratings (empty-row fallback)
+};
+
+// means_build - compute both mean vectors + presence flags + the global mean
+// from a populated RatingPopulation. One pass per orientation over the CSR
+// value arrays (the offsets already group ratings by row/column).
+defn means_build(pop: RatingPopulation)
+    [pop.nnz >= 0 && pop.nusers >= 1 && pop.nitems >= 1][true]
+    -> Means
+{
+    let global: Float = means_global(pop);
+    let umean: Vector = vec_new(pop.nusers);
+    let uhas:  IntVec = ivec_new(pop.nusers);
+    means_fill_users(pop, umean, uhas, global, 0);
+    let imean: Vector = vec_new(pop.nitems);
+    let ihas:  IntVec = ivec_new(pop.nitems);
+    means_fill_items(pop, imean, ihas, global, 0);
+    term Means {
+        user_mean: umean, item_mean: imean,
+        user_has: uhas, item_has: ihas, global: global
+    };
+};
+
+// means_global - the average of every observed rating (sum of all user_val /
+// nnz). nnz == 0 (no ratings at all) => 0.0, the only honest value then.
+defn means_global(pop: RatingPopulation) [pop.nnz >= 0][true] -> Float {
+    when pop.nnz <= 0 {
+        term 0.0;
+    };
+    term means_sum_all(pop.user_val, pop.nnz, 0, 0.0) / (pop.nnz as Float);
+};
+
+// means_sum_all - sum the first nnz values of a CSR value vector. Tail recursion.
+defn means_sum_all(val: Vector, nnz: Int, k: Int, acc: Float)
+    [nnz >= 0 && k >= 0][true]
+    -> Float
+{
+    when k >= nnz {
+        term acc;
+    };
+    term means_sum_all(val, nnz, k + 1, acc + vec_get(val, k));
+};
+
+// means_fill_users - for each user u, write its true mean and presence flag.
+// The user's ratings are user_val[begin..end); the count end-begin is the
+// observed-rating count. Empty user (begin == end) => mean := global, has := 0.
+defn means_fill_users(pop: RatingPopulation, umean: Vector, uhas: IntVec, global: Float, u: Int)
+    [u >= 0][true]
+    -> Int
+{
+    when u >= pop.nusers {
+        term 0;
+    };
+    let begin: Int = pop_user_begin(pop, u);
+    let end:   Int = pop_user_end(pop, u);
+    means_write_row(pop.user_val, umean, uhas, global, u, begin, end);
+    term means_fill_users(pop, umean, uhas, global, u + 1);
+};
+
+// means_fill_items - the per-item mirror over item_val / item offsets.
+defn means_fill_items(pop: RatingPopulation, imean: Vector, ihas: IntVec, global: Float, i: Int)
+    [i >= 0][true]
+    -> Int
+{
+    when i >= pop.nitems {
+        term 0;
+    };
+    let begin: Int = pop_item_begin(pop, i);
+    let end:   Int = pop_item_end(pop, i);
+    means_write_row(pop.item_val, imean, ihas, global, i, begin, end);
+    term means_fill_items(pop, imean, ihas, global, i + 1);
+};
+
+// means_write_row - shared writer: mean of val[begin..end) into dst[idx], or the
+// global fallback with has=0 when the slice is empty. val is the orientation's
+// value vector (user_val or item_val); the slice is contiguous in CSR order.
+defn means_write_row(val: Vector, dst: Vector, has: IntVec, global: Float, idx: Int, begin: Int, end: Int)
+    [idx >= 0 && begin >= 0 && end >= begin][true]
+    -> Int
+{
+    let cnt: Int = end - begin;
+    when cnt <= 0 {
+        vec_set(dst, idx, global);
+        ivec_set(has, idx, 0);
+        term 0;
+    };
+    let sum: Float = means_slice_sum(val, begin, end, 0.0);
+    vec_set(dst, idx, sum / (cnt as Float));
+    ivec_set(has, idx, 1);
+    term 0;
+};
+
+// means_slice_sum - sum val[begin..end). Tail recursion carrying the start
+// cursor forward to end.
+defn means_slice_sum(val: Vector, begin: Int, end: Int, acc: Float)
+    [begin >= 0 && end >= begin][true]
+    -> Float
+{
+    when begin >= end {
+        term acc;
+    };
+    term means_slice_sum(val, begin + 1, end, acc + vec_get(val, begin));
+};
+
+// ── accessors ─────────────────────────────────────────────────────────────────
+defn means_user(m: Means, u: Int) [u >= 0 && u < m.user_mean.len][true] -> Float {
+    term vec_get(m.user_mean, u);
+};
+defn means_item(m: Means, i: Int) [i >= 0 && i < m.item_mean.len][true] -> Float {
+    term vec_get(m.item_mean, i);
+};
+defn means_user_has(m: Means, u: Int) [u >= 0 && u < m.user_has.len][true] -> Bool {
+    term ivec_get(m.user_has, u) == 1;
+};
+defn means_item_has(m: Means, i: Int) [i >= 0 && i < m.item_has.len][true] -> Bool {
+    term ivec_get(m.item_has, i) == 1;
+};
+
+defn means_free(m: Means) -> Void {
+    vec_free(m.user_mean);
+    vec_free(m.item_mean);
+    ivec_free(m.user_has);
+    ivec_free(m.item_has);
+    term;
+};
+
+// ── Part 2a: base PCC over the RAW observed overlap (Task 6.3 prerequisite) ──
+//
+// WHY A "BASE" SIMILARITY. The served PCC (Task 6.5) is computed over the
+// IMPUTED key-set space, but the imputation itself (Eq. 7 / §3.2) needs
+// similarity weights — a definitional circularity. AutAI-Fusion resolves it in
+// two stages (design DAG: UMEAN → IMPUTE → SIM): a BASE similarity over the raw
+// observed overlap drives the imputation, then the served similarity is
+// recomputed over the now-dense imputed vectors. This section is that base
+// stage. It is exactly the oracle's `pcc_users` formula (mean-centered Pearson
+// over the items both users observed), but computed sparsely by merging the two
+// CSR rating lists instead of scanning a dense row.
+//
+// SPARSE OVERLAP MERGE. The counting-sort CSR (rating_population.bv) leaves each
+// row's (item, value) pairs in ITEM-ASCENDING order, so two users' rating lists
+// merge like two sorted runs: advance the smaller item index; on an equal index
+// the item is in the overlap and contributes to the three PCC sums.
+
+// base_sim_user - base PCC of users a,b over their raw observed item overlap,
+// mean-centered by each user's true mean. Zero-norm on either side => 0.0.
+defn base_sim_user(pop: RatingPopulation, m: Means, a: Int, b: Int)
+    [a >= 0 && a < pop.nusers && b >= 0 && b < pop.nusers][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    let mb: Float = means_user(m, b);
+    let (num, da, db): (Float, Float, Float) = overlap_acc(
+        pop.user_item, pop.user_val, pop.user_item, pop.user_val, ma, mb,
+        pop_user_begin(pop, a), pop_user_end(pop, a),
+        pop_user_begin(pop, b), pop_user_end(pop, b),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// base_sim_item - the item-space mirror: base PCC of items s,t over the raw
+// overlap of users who rated both, mean-centered by each item's true mean.
+defn base_sim_item(pop: RatingPopulation, m: Means, s: Int, t: Int)
+    [s >= 0 && s < pop.nitems && t >= 0 && t < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let mt: Float = means_item(m, t);
+    let (num, da, db): (Float, Float, Float) = overlap_acc(
+        pop.item_user, pop.item_val, pop.item_user, pop.item_val, ms, mt,
+        pop_item_begin(pop, s), pop_item_end(pop, s),
+        pop_item_begin(pop, t), pop_item_end(pop, t),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// overlap_acc - merge two sorted CSR runs and accumulate the three mean-centered
+// PCC sums over their shared keys. key_a[ia] is run A's current key (item index
+// for the user orientation, user index for the item orientation); val_a its
+// value. On a key match both contribute a centered product; otherwise advance
+// the run with the smaller key. Tail recursion over both cursors.
+defn overlap_acc(
+    key_a: IntVec, val_a: Vector, key_b: IntVec, val_b: Vector,
+    mean_a: Float, mean_b: Float,
+    ia: Int, enda: Int, ib: Int, endb: Int,
+    num: Float, da: Float, db: Float)
+    [ia >= 0 && ib >= 0][true]
+    -> (Float, Float, Float)
+{
+    when ia >= enda || ib >= endb {
+        term (num, da, db);
+    };
+    let ka: Int = ivec_get(key_a, ia);
+    let kb: Int = ivec_get(key_b, ib);
+    when ka == kb {
+        let ca: Float = vec_get(val_a, ia) - mean_a;
+        let cb: Float = vec_get(val_b, ib) - mean_b;
+        term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+            ia + 1, enda, ib + 1, endb,
+            num + ca * cb, da + ca * ca, db + cb * cb);
+    };
+    when ka < kb {
+        term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+            ia + 1, enda, ib, endb, num, da, db);
+    };
+    term overlap_acc(key_a, val_a, key_b, val_b, mean_a, mean_b,
+        ia, enda, ib + 1, endb, num, da, db);
+};
+
+// pcc_finish - num / (sqrt(da)·sqrt(db)); zero-variance (either norm 0) => 0.0,
+// the design's zero-variance rule (avoids a NaN denominator). Shared by base
+// and (Task 6.5) imputed-space PCC.
+defn pcc_finish(num: Float, da: Float, db: Float) -> Float {
+    when da <= 0.0 || db <= 0.0 {
+        term 0.0;
+    };
+    term num / (Sqrt#(da) * Sqrt#(db));
+};
+
+// ── Part 2b: key-set imputation (Task 6.3) — Eq. 7 / §3.2, EXECUTED ──────────
+//
+// WHY IMPUTE (corrects C++ defect #2). Before the served PCC and prediction,
+// AutAI fills the missing entries of the active key neighborhood with an
+// estimate instead of leaving them absent. The C++ guarded this loop into dead
+// code; here it RUNS, so an imputed cell genuinely differs from the raw
+// (missing) cell — that difference is exactly what Property 10 checks.
+//
+// Eq. 7 (user side): a missing cell (a, i) is estimated as
+//   r̂ai = ūa + ( Σ_x basesim(a,x)·(rxi − ūx) ) / ( Σ_x |basesim(a,x)| )
+// over users x ≠ a who OBSERVED item i. The neighbors-who-rated-i are exactly
+// item i's CSR column (item_user[item_off[i]..]), so the item orientation drives
+// the user-side imputation — the reason the population is dual-oriented.
+// §3.2 (item side) is the mirror: a missing (s, u) cell uses item means and the
+// users's rated items as the neighbor set.
+
+// impute_user - the Eq. 7 user-side estimate for cell (a, i). An OBSERVED cell
+// returns its real rating (imputation only fills gaps); a missing cell returns
+// the similarity-weighted neighbor estimate, falling back to ūa when no
+// weighted neighbor rated i (Σ|sim| == 0).
+defn impute_user(pop: RatingPopulation, m: Means, a: Int, i: Int)
+    [a >= 0 && a < pop.nusers && i >= 0 && i < pop.nitems][true]
+    -> Float
+{
+    let observed: Float = lookup_user_item(pop, a, i);
+    when observed >= 0.0 {
+        term observed;
+    };
+    let ma: Float = means_user(m, a);
+    // neighbors who rated item i = item i's CSR column of users.
+    let (accum, wsum): (Float, Float) = impute_user_acc(
+        pop, m, a, ma, pop.item_user, pop.item_val,
+        pop_item_begin(pop, i), pop_item_end(pop, i), 0.0, 0.0);
+    when wsum <= 0.0 {
+        term ma;
+    };
+    term ma + accum / wsum;
+};
+
+// impute_user_acc - over item i's column (user x, rating rxi), accumulate
+// Σ basesim(a,x)·(rxi − ūx) and Σ|basesim(a,x)|, skipping x == a. Tail recursion
+// down the column slice [cur, end).
+defn impute_user_acc(
+    pop: RatingPopulation, m: Means, a: Int, ma: Float,
+    col_user: IntVec, col_val: Vector, cur: Int, end: Int,
+    accum: Float, wsum: Float)
+    [a >= 0 && cur >= 0 && end >= cur][true]
+    -> (Float, Float)
+{
+    when cur >= end {
+        term (accum, wsum);
+    };
+    let x: Int = ivec_get(col_user, cur);
+    when x == a {
+        term impute_user_acc(pop, m, a, ma, col_user, col_val, cur + 1, end, accum, wsum);
+    };
+    let sim: Float = base_sim_user(pop, m, a, x);
+    let rxi: Float = vec_get(col_val, cur);
+    let mx:  Float = means_user(m, x);
+    term impute_user_acc(pop, m, a, ma, col_user, col_val, cur + 1, end,
+        accum + sim * (rxi - mx), wsum + Fabs#(sim));
+};
+
+// impute_item - the §3.2 item-side mirror: estimate cell (s, u). Observed =>
+// real rating; missing => Σ basesim(s,t)·(rut − t̄t) / Σ|basesim| over items t
+// (t ≠ s) that user u rated (user u's CSR row), falling back to t̄s.
+defn impute_item(pop: RatingPopulation, m: Means, s: Int, u: Int)
+    [s >= 0 && s < pop.nitems && u >= 0 && u < pop.nusers][true]
+    -> Float
+{
+    let observed: Float = lookup_user_item(pop, u, s);
+    when observed >= 0.0 {
+        term observed;
+    };
+    let ms: Float = means_item(m, s);
+    // neighbors = items user u rated = user u's CSR row.
+    let (accum, wsum): (Float, Float) = impute_item_acc(
+        pop, m, s, pop.user_item, pop.user_val,
+        pop_user_begin(pop, u), pop_user_end(pop, u), 0.0, 0.0);
+    when wsum <= 0.0 {
+        term ms;
+    };
+    term ms + accum / wsum;
+};
+
+// impute_item_acc - over user u's row (item t, rating rut), accumulate
+// Σ basesim(s,t)·(rut − t̄t) and Σ|basesim(s,t)|, skipping t == s. Tail recursion.
+defn impute_item_acc(
+    pop: RatingPopulation, m: Means, s: Int,
+    row_item: IntVec, row_val: Vector, cur: Int, end: Int,
+    accum: Float, wsum: Float)
+    [s >= 0 && cur >= 0 && end >= cur][true]
+    -> (Float, Float)
+{
+    when cur >= end {
+        term (accum, wsum);
+    };
+    let t: Int = ivec_get(row_item, cur);
+    when t == s {
+        term impute_item_acc(pop, m, s, row_item, row_val, cur + 1, end, accum, wsum);
+    };
+    let sim: Float = base_sim_item(pop, m, s, t);
+    let rut: Float = vec_get(row_val, cur);
+    let mt:  Float = means_item(m, t);
+    term impute_item_acc(pop, m, s, row_item, row_val, cur + 1, end,
+        accum + sim * (rut - mt), wsum + Fabs#(sim));
+};
+
+// lookup_user_item - the observed rating of (user u, item i), or -1.0 when the
+// cell is missing. Walks user u's item-ascending CSR row; ratings are in [1,5]
+// so -1.0 is an unambiguous "missing" sentinel.
+defn lookup_user_item(pop: RatingPopulation, u: Int, i: Int)
+    [u >= 0 && u < pop.nusers && i >= 0][true]
+    -> Float
+{
+    term lookup_row(pop.user_item, pop.user_val, i,
+        pop_user_begin(pop, u), pop_user_end(pop, u));
+};
+defn lookup_row(row_item: IntVec, row_val: Vector, target: Int, cur: Int, end: Int)
+    [cur >= 0 && end >= cur][true]
+    -> Float
+{
+    when cur >= end {
+        term -1.0;
+    };
+    let it: Int = ivec_get(row_item, cur);
+    when it == target {
+        term vec_get(row_val, cur);
+    };
+    when it > target {
+        term -1.0;
+    };
+    term lookup_row(row_item, row_val, target, cur + 1, end);
+};
+
+// ── Part 2c: served PCC sim' over the imputed key-set space (Task 6.5) ───────
+//
+// The served similarity (Eq. 9 user-user, Eq. 10 item-item) is stage 2: the PCC
+// over the IMPUTED KEY-SET space, not the raw overlap. The key set is the UNION
+// of items either user rated (user-confirmed); within it each user's entry is
+// `impute_user` (real where observed, Eq. 7 where missing), mean-centered by the
+// user's true mean. Zero-norm => 0.0 (zero-variance rule); the NaN/Inf guard is
+// pcc_finish's domain check (no Sqrt# of a negative, no /0).
+//
+// SPARSE UNION MERGE. Unlike overlap_acc (which processes only shared keys), the
+// union walk processes EVERY key present in either row — advancing both cursors
+// on a match and the smaller-key cursor otherwise — because an item rated by
+// only one user is still in the key set (imputed for the other). The two CSR
+// rows are item-ascending, so the union is produced in order with no dedup pass.
+
+// sim_user - sim'(a,b): PCC over the imputed union key-set of users a,b, each
+// entry imputed (Eq. 7) and mean-centered by the user's true mean.
+defn sim_user(pop: RatingPopulation, m: Means, a: Int, b: Int)
+    [a >= 0 && a < pop.nusers && b >= 0 && b < pop.nusers][true]
+    -> Float
+{
+    let ma: Float = means_user(m, a);
+    let mb: Float = means_user(m, b);
+    let (num, da, db): (Float, Float, Float) = sim_union_user(
+        pop, m, a, b, ma, mb,
+        pop_user_begin(pop, a), pop_user_end(pop, a),
+        pop_user_begin(pop, b), pop_user_end(pop, b),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+
+// sim_union_user - walk the UNION of users a,b item indices (item-ascending CSR
+// rows). At each union item, both users' imputed, mean-centered values feed the
+// three PCC sums. On a match advance both; otherwise advance the smaller item,
+// but ALWAYS process the item (the non-rater's value is the Eq. 7 imputation).
+defn sim_union_user(
+    pop: RatingPopulation, m: Means, a: Int, b: Int, ma: Float, mb: Float,
+    ia: Int, enda: Int, ib: Int, endb: Int,
+    num: Float, da: Float, db: Float)
+    [ia >= 0 && ib >= 0][true]
+    -> (Float, Float, Float)
+{
+    when ia >= enda && ib >= endb {
+        term (num, da, db);
+    };
+    let item: Int = sim_next_item(pop.user_item, ia, enda, pop.user_item, ib, endb);
+    let va: Float = impute_user(pop, m, a, item) - ma;
+    let vb: Float = impute_user(pop, m, b, item) - mb;
+    let (na, nb): (Int, Int) = sim_advance(pop.user_item, ia, enda, pop.user_item, ib, endb, item);
+    term sim_union_user(pop, m, a, b, ma, mb, na, enda, nb, endb,
+        num + va * vb, da + va * va, db + vb * vb);
+};
+
+// sim_item - sim'(s,t): the item-space mirror over the imputed union user-set.
+defn sim_item(pop: RatingPopulation, m: Means, s: Int, t: Int)
+    [s >= 0 && s < pop.nitems && t >= 0 && t < pop.nitems][true]
+    -> Float
+{
+    let ms: Float = means_item(m, s);
+    let mt: Float = means_item(m, t);
+    let (num, da, db): (Float, Float, Float) = sim_union_item(
+        pop, m, s, t, ms, mt,
+        pop_item_begin(pop, s), pop_item_end(pop, s),
+        pop_item_begin(pop, t), pop_item_end(pop, t),
+        0.0, 0.0, 0.0);
+    term pcc_finish(num, da, db);
+};
+defn sim_union_item(
+    pop: RatingPopulation, m: Means, s: Int, t: Int, ms: Float, mt: Float,
+    is: Int, ends: Int, it: Int, endt: Int,
+    num: Float, da: Float, db: Float)
+    [is >= 0 && it >= 0][true]
+    -> (Float, Float, Float)
+{
+    when is >= ends && it >= endt {
+        term (num, da, db);
+    };
+    let usr: Int = sim_next_item(pop.item_user, is, ends, pop.item_user, it, endt);
+    // imputed cell (item, user): impute_item(pop, m, item=s|t, user=usr).
+    let va: Float = impute_item(pop, m, s, usr) - ms;
+    let vb: Float = impute_item(pop, m, t, usr) - mt;
+    let (ns, nt): (Int, Int) = sim_advance(pop.item_user, is, ends, pop.item_user, it, endt, usr);
+    term sim_union_item(pop, m, s, t, ms, mt, ns, ends, nt, endt,
+        num + va * vb, da + va * va, db + vb * vb);
+};
+
+// sim_next_item - the next union key = the smaller of the two cursors' current
+// keys (or whichever run is non-exhausted). Shared by the user and item walks.
+defn sim_next_item(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: Int)
+    [ia >= 0 && ib >= 0][true]
+    -> Int
+{
+    when ia >= enda {
+        term ivec_get(kb, ib);
+    };
+    when ib >= endb {
+        term ivec_get(ka, ia);
+    };
+    let va: Int = ivec_get(ka, ia);
+    let vb: Int = ivec_get(kb, ib);
+    when va <= vb {
+        term va;
+    };
+    term vb;
+};
+
+// sim_advance - advance each cursor past `key` if it currently sits on `key`
+// (a cursor only moves off a key it actually holds — the merge invariant).
+defn sim_advance(ka: IntVec, ia: Int, enda: Int, kb: IntVec, ib: Int, endb: Int, key: Int)
+    [ia >= 0 && ib >= 0][true]
+    -> (Int, Int)
+{
+    let na: Int = sim_step(ka, ia, enda, key);
+    let nb: Int = sim_step(kb, ib, endb, key);
+    term (na, nb);
+};
+defn sim_step(k: IntVec, i: Int, end: Int, key: Int) [i >= 0][true] -> Int {
+    when i >= end {
+        term i;
+    };
+    when ivec_get(k, i) == key {
+        term i + 1;
+    };
+    term i;
+};
+
+// ── harness: means over the oracle's hand-worked 4x4 (Task 6.1 gate) ──────────
+//
+// Same fixture as reference.bv (0 = missing, so NOT stored in the sparse pop):
+//        i0  i1  i2  i3
+//   u0:   5   3   4   4      mean 4.0
+//   u1:   3   1   2   3      mean 2.25
+//   u2:   4   3   4   3      mean 3.5
+//   u3:   3   3   5   -      mean 11/3 ≈ 3.666667
+//   item means: i0=3.75  i1=2.5  i2=3.75  i3=10/3 ≈ 3.333333
+//
+// The 15 observed cells become 15 parallel (user, item, value) triples.
+defn approx(a: Float, b: Float) -> Bool {
+    term Fabs#(a - b) <= 0.000001;
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let nnz: Int = 15;
+    let us:  IntVec = ivec_new(nnz);
+    let it:  IntVec = ivec_new(nnz);
+    let val: Vector = vec_new(nnz);
+
+    // u0 row (i0..i3)
+    ivec_set(us,0,0); ivec_set(it,0,0); vec_set(val,0,5.0);
+    ivec_set(us,1,0); ivec_set(it,1,1); vec_set(val,1,3.0);
+    ivec_set(us,2,0); ivec_set(it,2,2); vec_set(val,2,4.0);
+    ivec_set(us,3,0); ivec_set(it,3,3); vec_set(val,3,4.0);
+    // u1 row
+    ivec_set(us,4,1); ivec_set(it,4,0); vec_set(val,4,3.0);
+    ivec_set(us,5,1); ivec_set(it,5,1); vec_set(val,5,1.0);
+    ivec_set(us,6,1); ivec_set(it,6,2); vec_set(val,6,2.0);
+    ivec_set(us,7,1); ivec_set(it,7,3); vec_set(val,7,3.0);
+    // u2 row
+    ivec_set(us,8,2);  ivec_set(it,8,0);  vec_set(val,8,4.0);
+    ivec_set(us,9,2);  ivec_set(it,9,1);  vec_set(val,9,3.0);
+    ivec_set(us,10,2); ivec_set(it,10,2); vec_set(val,10,4.0);
+    ivec_set(us,11,2); ivec_set(it,11,3); vec_set(val,11,3.0);
+    // u3 row (i3 missing — only 3 cells)
+    ivec_set(us,12,3); ivec_set(it,12,0); vec_set(val,12,3.0);
+    ivec_set(us,13,3); ivec_set(it,13,1); vec_set(val,13,3.0);
+    ivec_set(us,14,3); ivec_set(it,14,2); vec_set(val,14,5.0);
+
+    let pop: RatingPopulation = pop_build(us, it, val, nnz, 4, 4);
+    let m: Means = means_build(pop);
+
+    println!("u0_mean={} ok={}", means_user(m,0), approx(means_user(m,0), 4.0));
+    println!("u1_mean={} ok={}", means_user(m,1), approx(means_user(m,1), 2.25));
+    println!("u2_mean={} ok={}", means_user(m,2), approx(means_user(m,2), 3.5));
+    println!("u3_mean={} ok={}", means_user(m,3), approx(means_user(m,3), 3.666667));
+    println!("i0_mean={} ok={}", means_item(m,0), approx(means_item(m,0), 3.75));
+    println!("i1_mean={} ok={}", means_item(m,1), approx(means_item(m,1), 2.5));
+    println!("i2_mean={} ok={}", means_item(m,2), approx(means_item(m,2), 3.75));
+    println!("i3_mean={} ok={}", means_item(m,3), approx(means_item(m,3), 3.333333));
+    println!("all_have_means={}",
+        means_user_has(m,0) && means_user_has(m,3) && means_item_has(m,3));
+
+    // base similarity (raw-overlap PCC) — oracle anchor sim(u0,u1)=0.852802,
+    // symmetry, and self-sim=1.0 (reference.bv).
+    println!("base_sim(u0,u1)={} ok={}",
+        base_sim_user(pop,m,0,1), approx(base_sim_user(pop,m,0,1), 0.852802));
+    println!("base_sim_symmetric={}",
+        approx(base_sim_user(pop,m,0,1), base_sim_user(pop,m,1,0)));
+    println!("base_sim(u0,u0)={} ok={}",
+        base_sim_user(pop,m,0,0), approx(base_sim_user(pop,m,0,0), 1.0));
+    // item-side base similarity: symmetric and self-sim=1.0 (the item space is
+    // exercised fully by the engine; the oracle anchors the user side).
+    println!("base_sim_item_symmetric={}",
+        approx(base_sim_item(pop,m,0,1), base_sim_item(pop,m,1,0)));
+    println!("base_sim_item(i0,i0)={} ok={}",
+        base_sim_item(pop,m,0,0), approx(base_sim_item(pop,m,0,0), 1.0));
+
+    // imputation (Task 6.3). Property 10: the loop EXECUTES, so a missing cell
+    // is FILLED with a similarity-weighted estimate that DIFFERS from the raw
+    // fallback mean. (u3,i3) is the fixture's one missing cell; ū3≈3.666667.
+    let imp_u33: Float = impute_user(pop, m, 3, 3);
+    println!("impute_user(u3,i3)={}", imp_u33);
+    println!("impute_differs_from_mean={}", !approx(imp_u33, means_user(m,3)));
+    // an OBSERVED cell returns its real rating untouched (imputation fills gaps
+    // only): (u0,i0)=5.0.
+    println!("impute_observed(u0,i0)={} ok={}",
+        impute_user(pop,m,0,0), approx(impute_user(pop,m,0,0), 5.0));
+    // §3.2 item side: the mirror estimate for the same missing cell (item 3,
+    // user 3) also fills and differs from the item mean t̄3≈3.333333.
+    let imp_i33: Float = impute_item(pop, m, 3, 3);
+    println!("impute_item(i3,u3)={}", imp_i33);
+    println!("impute_item_differs_from_mean={}", !approx(imp_i33, means_item(m,3)));
+    println!("impute_item_observed(i0,u0)={} ok={}",
+        impute_item(pop,m,0,0), approx(impute_item(pop,m,0,0), 5.0));
+
+    // served similarity sim' over the imputed union key-set (Task 6.5).
+    // Anchors are reference.bv's pcc_imputed_users (printed by the oracle run).
+    println!("simp(u0,u1)={} ok={}",
+        sim_user(pop,m,0,1), approx(sim_user(pop,m,0,1), 0.852802813));
+    println!("simp(u0,u2)={} ok={}",
+        sim_user(pop,m,0,2), approx(sim_user(pop,m,0,2), 0.707106769));
+    println!("simp(u0,u3)={} ok={}",
+        sim_user(pop,m,0,3), approx(sim_user(pop,m,0,3), 0.0));
+    println!("simp(u1,u2)={} ok={}",
+        sim_user(pop,m,1,2), approx(sim_user(pop,m,1,2), 0.301511347));
+    println!("simp(u1,u3)={} ok={}",
+        sim_user(pop,m,1,3), approx(sim_user(pop,m,1,3), -0.132410213));
+    println!("simp(u2,u3)={} ok={}",
+        sim_user(pop,m,2,3), approx(sim_user(pop,m,2,3), 0.536745071));
+    println!("simp_symmetric={}",
+        approx(sim_user(pop,m,0,3), sim_user(pop,m,3,0)));
+    println!("simp(u0,u0)={} ok={}",
+        sim_user(pop,m,0,0), approx(sim_user(pop,m,0,0), 1.0));
+    // item-side sim': symmetric + self-sim'=1.0 (the full item-based Eq. 30
+    // in Task 7 anchors its values; here the structural guards).
+    println!("simp_item_symmetric={}",
+        approx(sim_item(pop,m,0,3), sim_item(pop,m,3,0)));
+    println!("simp_item(i0,i0)={} ok={}",
+        sim_item(pop,m,0,0), approx(sim_item(pop,m,0,0), 1.0));
+
+    means_free(m);
+    pop_free(pop);
+    // us/it/val were consumed by the build (copied into the CSR); free them.
+    ivec_free(us);
+    ivec_free(it);
+    vec_free(val);
+    tick = 1;
+    endprogram;
+};
