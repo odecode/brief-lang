@@ -201,3 +201,14 @@ for anything found. New .bv stdlib files must pass the conformance sweep.
 
 (Compiler bugs found during implementation get a BUGS.md entry AND a line here with
 the date, the .bv snippet that triggered it, and the workaround.)
+
+Task 11 native account service (2026-10-21): atomic parameterized registration,
+FNV demo storage, explicit random-token sessions and token-authenticated state
+pass their native gates (144 credential and 120 isolation cases). The human
+confirmed recommendation composition belongs to task 12, using this same owner.
+No compiler/stdlib fix needed; docs/plans/2026-10-21-recommender-accounts.md records
+the increments and tests. Full library suite is running; commit approval pending.
+
+Task 11 final gates (2026-10-21): native corpus and fresh-connection login/state
+persistence pass. Full library suite: 3164 passed, 38 baseline failures with
+exactly the same names as task 10. Praetor passes; no compiler/stdlib changes.
