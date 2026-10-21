@@ -10753,16 +10753,41 @@ wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
 stdlib branch carries no compiler changes. Integration build passes; library
 suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
 
-## Ordinary collection rebinding (FIXED 2026-10-21)
+## Ordinary local collection assignment inserts a handle (FIXED 2026-10-21)
 
-Same-type local assignment incorrectly invoked InsertAt with a collection handle.
-collection_assignment.rs now replaces the binding before the historical fallback.
-Explicit arrow insertion remains unchanged. Three unit tests and the native
-collection_rebind_gate.bv cover the behavior. See the collection-rebinding plan.
+Task 12's dense account-ID map and owner-view cache were corrupted by ordinary
+`values = values + entry`. Minimal scratch/task12_list_rebind.bv printed two
+heap addresses instead of 1,2; the interpreter's ordinary assignment semantics
+replace the binding. LLVM's identifier assignment consulted InsertAt before
+storing a local, treating a same-type collection RHS as an element.
 
-## Float Abs overload suffix (FIXED 2026-10-21)
+collection_assignment.rs now handles same-type declared collection rebinding
+before that historical fallback, using operator metadata and type equality.
+Explicit arrow insertion and different-type fallback remain unchanged. Three
+unit tests plus tests/fixtures/stdlib/collection_rebind_gate.bv cover replacement,
+concat accumulation, object elements, explicit push and unchanged fallbacks.
+Native gate passes; task-12 owner isolation and refresh mapping pass with it.
+Isolated branch fix/collection-assignment-rebind has the compiler fix prepared
+from main; commits remain pending workflow approval.
 
-Float Abs emitted llvm.fabs.float/double instead of width suffixes f32/f64.
-The overload-aware template now handles f16/bf16/f32/f64; narrow declarations
-are present too. Integer Abs and the legacy fallback are unchanged. Two unit
-tests and float_abs_gate.bv cover the fix. No interpreter changes.
+## JSON malformed-input progress and framing (FIXED 2026-10-21)
+
+Task 12 native probes hung on unterminated strings and exposed accepted missing
+commas/trailing commas, unvalidated null tokens, leading-zero numbers and broken
+escape advancement. json.bv now uses bounded recursive descent with an explicit
+consume-or-error progress invariant, strict separators and complete-input checks,
+Unicode scalar/surrogate validation, UTF-8 checks, integer overflow bounds and
+IEEE finite classification. A named builder-conversion import prevents collision
+with database/string imports. Native server_json_gate passes all grammar, Unicode,
+integer endpoint, nested-value and escape gates. Interpreter work is explicitly
+excluded at the user's request.
+
+## Float Abs intrinsic uses a type spelling as its overload (FIXED 2026-10-21)
+
+The task-12 cached/full-engine comparison failed native linking with undefined
+@llvm.fabs.float. template_for_op used the LLVM operand type as the intrinsic
+suffix. A new overload-aware seam emits f16/bf16/f32/f64 names; the narrow
+declarations are added beside existing f32/f64 declarations. Integer Abs and
+the legacy fallback remain unchanged. Two unit tests and native
+tests/fixtures/stdlib/float_abs_gate.bv pin the behavior. Prepared separately
+on fix/float-abs-intrinsic from main; no interpreter changes.
