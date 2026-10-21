@@ -1,0 +1,126 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_api.bv";
+import "./server_io.bv";
+import { stdout_flush } from "std/cast_lanes.bv";
+
+obj OwnerView { owner: Int; recommendations: String; };
+obj ServerState {
+    reactor: Reactor; conn: PgConn; model: ServerModel; sessions: SessionStore;
+    views: List<OwnerView>; lambda: Float; refresh: Bool; next_refresh: Int; interval: Int;
+};
+
+defn server_time(clock_id: Int) -> Int {
+    let memory: Int = Malloc#(16) as Int;
+    when memory == 0 { term -1; };
+    let result: Int = syscall(228,clock_id,memory);
+    let now: Int = Load#(memory,8)*1000 + Load#(memory+8,8)/1000000;
+    Free#(memory as Ptr);
+    when result < 0 { term -1; };
+    term now;
+};
+
+defn server_clock() -> Int { term server_time(1); };
+defn server_timestamp() -> Int { term server_time(0)/1000; };
+
+defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, lambda: Float, interval: Int) -> ServerState {
+    let views: List<OwnerView> = [];
+    term ServerState { reactor: reactor, conn: conn, model: model, sessions: sessions_new(),
+        views: views, lambda: lambda, refresh: false, next_refresh: server_clock()+interval, interval: interval };
+};
+
+defn server_with(state: ServerState, sessions: SessionStore, views: List<OwnerView>, refresh: Bool) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: sessions,
+        views: views, lambda: state.lambda, refresh: refresh, next_refresh: state.next_refresh, interval: state.interval };
+};
+
+defn server_owner_view(views: List<OwnerView>, owner: Int) -> String {
+    foreach idx in 0..views .^Length { when views[idx].owner == owner { term views[idx].recommendations; }; };
+    term "";
+};
+
+defn server_set_view(views: List<OwnerView>, owner: Int, body: String) -> List<OwnerView> {
+    let updated: List<OwnerView> = [];
+    foreach idx in 0..views .^Length {
+        when views[idx].owner != owner {
+            let entry: List<OwnerView> = [views[idx]];
+            updated = updated + entry;
+        };
+    };
+    let added: List<OwnerView> = [OwnerView { owner: owner, recommendations: body }];
+    term updated + added;
+};
+
+defn server_owner_token(sessions: SessionStore, owner: Int) -> String {
+    foreach idx in 0..sessions.entries .^Length {
+        when sessions.entries[idx].account_id == owner { term sessions.entries[idx].token; };
+    };
+    term "";
+};
+
+defn server_update_owner(state: ServerState, owner: Int) -> ServerState {
+    let account: AccountState = account_state(state.conn,state.sessions,server_owner_token(state.sessions,owner));
+    let body: String = "{\"error\":\"auth-failed\"}";
+    when account.result.ok { body = api_recommendations(state.model,account,state.lambda); };
+    when !account.result.ok && account.result.error != "auth-failed" { body = "{\"error\":\"database\"}"; };
+    term server_with(state,state.sessions,server_set_view(state.views,owner,body),state.refresh);
+};
+
+// 2026-10-21: login and rating changes materialize one owner's recommendations.
+// GETs read that result, never rerun similarity construction. Refresh updates
+// all materialized owners only AFTER the replacement model is complete.
+// Replace this per-owner cache only with another population-independent read path.
+defn server_cached_state(state: ServerState, request: HttpRequest) -> ApiReply {
+    let account: AccountState = account_state(state.conn,state.sessions,api_token(request.path));
+    when !account.result.ok { term api_error(account.result.error,state.sessions); };
+    let body: String = server_owner_view(state.views,account.result.account.id);
+    when body .^Length == 0 { term api_error("session",state.sessions); };
+    when api_path(request.path) == "/recommendations" { term api_reply(200,body,state.sessions); };
+    term api_reply(200,"{\"account\":{\"id\":" + account.result.account.id as String + ",\"username\":" +
+        api_quote(account.result.account.username) + "},\"ratings\":" + api_ratings(account) + "," + body[1:body .^Length],state.sessions);
+};
+
+defn server_channel_owned(row: Int, owner: Int) -> Bool {
+    term owner > 0 && Load#(row,8) >= 0 && Load#(row+16,8) == 1 && Load#(row+24,8) == owner && Load#(row+112,8) == 0;
+};
+
+defn server_push(state: ServerState, owner: Int) -> Bool {
+    let body: String = server_owner_view(state.views,owner);
+    foreach slot in 0..state.reactor.capacity {
+        let row: Int = reactor_row(state.reactor,slot);
+        when server_channel_owned(row,owner) {
+            io_queue(state.reactor,slot,ws_encode_text(body));
+        };
+    };
+    term true;
+};
+
+defn server_refresh(state: ServerState) -> ServerState {
+    let loaded: Result<ServerModel,PgResult> = model_load(state.conn,state.model.baseline_users,state.model.population.nitems);
+    when is_err(loaded) {
+        println!("Cache refresh failed: {}; check the database schema and retry /admin/refresh.",unwrap_err(loaded).err_msg);
+        stdout_flush();
+        term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: state.sessions,
+            views: state.views, lambda: state.lambda, refresh: false, next_refresh: server_clock()+state.interval, interval: state.interval };
+    };
+    let model: ServerModel = unwrap(loaded);
+    let replacement: ServerState = ServerState { reactor: state.reactor, conn: state.conn, model: model, sessions: state.sessions,
+        views: state.views, lambda: state.lambda, refresh: false, next_refresh: server_clock()+state.interval, interval: state.interval };
+    foreach idx in 0..state.views .^Length { replacement = server_update_owner(replacement,state.views[idx].owner); };
+    model_free(state.model);
+    term replacement;
+};
+
+defn server_after_reply(state: ServerState, reply: ApiReply) -> ServerState {
+    let updated: ServerState = server_with(state,reply.sessions,state.views,state.refresh || reply.refresh);
+    when reply.sessions.entries .^Length > state.sessions.entries .^Length {
+        let last: Int = reply.sessions.entries .^Length - 1;
+        updated = server_update_owner(updated,reply.sessions.entries[last].account_id);
+    };
+    when reply.changed_owner > 0 {
+        updated = server_update_owner(updated,reply.changed_owner);
+        server_push(updated,reply.changed_owner);
+    };
+    term updated;
+};

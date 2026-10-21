@@ -297,3 +297,12 @@ the increments and tests. Full library suite is running; commit approval pending
 Task 11 final gates (2026-10-21): native corpus and fresh-connection login/state
 persistence pass. Full library suite: 3164 passed, 38 baseline failures with
 exactly the same names as task 10. Praetor passes; no compiler/stdlib changes.
+
+Task 12 (2026-10-21): implemented native poll HTTP routing, token-owned live
+channels, buffered partial writes, active-account predictions and consistent
+periodic/explicit snapshot refresh. Native gates exposed and fixed collection
+rebinding (compiler) and JSON consume-or-error progress/framing (stdlib); see
+BUGS.md and docs/plans/2026-10-21-recommender-server.md. Compiler fix is prepared
+on its own main-based branch. Interpreter changes are excluded by explicit user
+instruction. Final native/property/library verification is recorded in the task
+plan; no throughput/latency claim is made before task 16.

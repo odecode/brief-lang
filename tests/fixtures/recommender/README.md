@@ -38,3 +38,22 @@ empty/deleted accounts, forged/restarted sessions, and database-error recovery.
 It resets only briev_accounts_gate and briev_account_state_gate. Sessions are
 process-local; credentials and ratings are PostgreSQL-backed. Recommendations
 are composed by the server in task 12 using the same authenticated owner.
+
+## Task 12 server gates
+
+```bash
+BRIEVC=/home/otto/briev-target/debug/brievc PGUSER=briev_test PGDATABASE=briev_recommender_test bash tests/fixtures/recommender/run_server.sh
+```
+
+This runner compiles native reactor, JSON, API, transport, protocol and complete
+HTTP/WebSocket loopback gates. It forces partial writes, checks fragmented live
+ratings, two channels owned by one account and a foreign channel, HTTP-triggered
+pushes, refresh mapping, malformed framing, half-close and failed refresh.
+It also runs 128 proptest cases for each of properties 5, 7 and 20 through the
+native property probe. PostgreSQL gates reset only briev_server_api_gate and
+briev_server_loop_gate. Do not run copies concurrently against the same test DB.
+
+Build the service with `brievc build examples/recommender/server.bv --out <dir>`;
+configure PGUSER, PGDATABASE and UDATA_PATH before running it. PORT defaults to
+8080, MAX_CONNECTIONS to 1024, LAMBDA_MILLI to 500 and REFRESH_SECONDS to 300.
+See docs/architecture/applications/recommender-server.md for the wire contract.
