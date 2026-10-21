@@ -367,6 +367,10 @@ defn http_status_text(status: Int) [true][CharCount#(term) >= 1] -> String {
     when status == 400 {
         term "Bad Request";
     };
+    when status == 401 { term "Unauthorized"; };
+    when status == 409 { term "Conflict"; };
+    when status == 413 { term "Content Too Large"; };
+    when status == 503 { term "Service Unavailable"; };
     when status == 404 {
         term "Not Found";
     };

@@ -707,12 +707,13 @@ and all-arms-terminate behavior retain their existing lowering paths.
 
 ### Ordinary collection rebinding (2026-10-21)
 
-Same-type local assignment replaces the collection handle before InsertAt
-dispatch. Eligibility comes from declared operator metadata and exact types;
-explicit arrow insertion keeps its existing path. See collection_assignment.rs.
+An ordinary local assignment whose RHS has the binding's declared collection
+type replaces its handle. It must not invoke InsertAt with that handle as an
+element. collection_assignment.rs handles this seam before the historical
+insertion fallback; explicit arrow insertion retains its separate lowering.
+Dispatch derives from declared operator metadata and type equality, never a
+collection name. Existing state/member stores retain their earlier precedence.
 
-### Float Abs overloads (2026-10-21)
-
-Abs uses LLVM bit-width overload suffixes, not textual operand type names.
-The additive seam precedes the unchanged legacy template fallback. Narrow
-fabs declarations accompany the existing f32/f64 declarations.
+Float Abs uses LLVM width suffixes (f16/bf16/f32/f64) rather than operand type
+spellings. Its overload-aware template seam precedes the unchanged legacy
+fallback. Narrow fabs declarations accompany the existing f32/f64 declarations.

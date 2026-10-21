@@ -21,7 +21,10 @@
 
 import "std/net/socket.bv";
 import "std/net/bytes.bv";
-import "std/string.bv";
+// 2026-10-21: only integer decoding is needed here. Importing all string
+// helpers leaks to_string(Int) into JSON users' StringBuilder namespace.
+// Keep this selective unless another string operation is actually required.
+import { to_int } from "std/string.bv";
 
 // ── PgConn ─────────────────────────────────────────────────────────────────
 //
