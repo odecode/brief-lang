@@ -77,8 +77,12 @@ defn pg_read_msg(c: PgConn) -> PgMsg {
         buf_free(hdr);
         term pg_msg_err();
     };
-    let mtype: Int = get_u8(hdr, 0);
-    let len: Int = get_u32_be(hdr, 1);
+    // 2026-10-21: recv updates bytes, not ByteBuf's value metadata. Readers
+    // must see the initialized prefix; otherwise bounded cstr scans later
+    // treat every received payload as empty (lost SQLSTATE/message fields).
+    let header: ByteBuf = buf_received(hdr, hn);
+    let mtype: Int = get_u8(header, 0);
+    let len: Int = get_u32_be(header, 1);
     buf_free(hdr);
     // payload is (len - 4) bytes (len counts the 4 length bytes).
     let plen: Int = len - 4;
@@ -94,7 +98,8 @@ defn pg_read_msg(c: PgConn) -> PgMsg {
         buf_free(body);
         term pg_msg_err();
     };
-    term PgMsg { ok: true, mtype: mtype, body: body, plen: plen };
+    let received: ByteBuf = buf_received(body, bn);
+    term PgMsg { ok: true, mtype: mtype, body: received, plen: plen };
 };
 
 // when_read_payload - read exactly plen payload bytes into body (0 is a valid
