@@ -10651,3 +10651,10 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Float Abs overload suffix (FIXED 2026-10-21)
+
+Float Abs emitted llvm.fabs.float/double instead of width suffixes f32/f64.
+The overload-aware template now handles f16/bf16/f32/f64; narrow declarations
+are present too. Integer Abs and the legacy fallback are unchanged. Two unit
+tests and float_abs_gate.bv cover the fix. No interpreter changes.

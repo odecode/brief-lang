@@ -685,3 +685,9 @@ These are resolved by `resolve_llvm_type()` in the casting graph. Never hardcode
 4. Add protocol arm in `type_to_protocol` priority chain.
 5. Add LLVM type resolution in `resolve_llvm_type`.
 6. **No name-based matching in the backend.**
+
+### Float Abs overloads (2026-10-21)
+
+Abs uses LLVM bit-width overload suffixes, not textual operand type names.
+The additive seam precedes the unchanged legacy template fallback. Narrow
+fabs declarations accompany the existing f32/f64 declarations.
