@@ -201,3 +201,9 @@ for anything found. New .bv stdlib files must pass the conformance sweep.
 
 (Compiler bugs found during implementation get a BUGS.md entry AND a line here with
 the date, the .bv snippet that triggered it, and the workaround.)
+
+Task 10 complete (2026-10-21): native parser/bootstrap/population/upsert gates
+pass, including batch rollback and concurrent startup. Integration suite: 3164
+passed, 38 known failures, none added. Stdlib fixes have separate PR branches
+fix/pg-receive-length and fix/result-wrong-side-unwrap; task-10 commit excludes
+those edits. See docs/plans/2026-10-21-recommender-bootstrap.md for evidence.
