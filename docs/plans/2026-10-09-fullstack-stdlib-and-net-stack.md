@@ -286,3 +286,14 @@ pass, including batch rollback and concurrent startup. Integration suite: 3164
 passed, 38 known failures, none added. Stdlib fixes have separate PR branches
 fix/pg-receive-length and fix/result-wrong-side-unwrap; task-10 commit excludes
 those edits. See docs/plans/2026-10-21-recommender-bootstrap.md for evidence.
+
+Task 11 native account service (2026-10-21): atomic parameterized registration,
+FNV demo storage, explicit random-token sessions and token-authenticated state
+pass their native gates (144 credential and 120 isolation cases). The human
+confirmed recommendation composition belongs to task 12, using this same owner.
+No compiler/stdlib fix needed; docs/plans/2026-10-21-recommender-accounts.md records
+the increments and tests. Full library suite is running; commit approval pending.
+
+Task 11 final gates (2026-10-21): native corpus and fresh-connection login/state
+persistence pass. Full library suite: 3164 passed, 38 baseline failures with
+exactly the same names as task 10. Praetor passes; no compiler/stdlib changes.

@@ -24,3 +24,17 @@ Set FULL_BASELINE=1 to additionally reconstruct public.baseline_ratings and chec
 both orientations against its count and sum. This requires successful bootstrap;
 it does not load or alter the public dataset. Full verification has also compared
 all 100,000 persisted baseline tuples independently with the source u.data.
+
+## Task 11 account gates
+
+```bash
+BRIEVC=/home/otto/briev-target/debug/brievc PGUSER=briev_test PGDATABASE=briev_recommender_test bash tests/fixtures/recommender/run_accounts.sh
+```
+
+This separate runner checks 144 credential combinations (including all Unicode
+whitespace classes), FNV vectors, parameterized registration/duplicates/login,
+explicit session ownership and token encoding, 120 account-isolation cases,
+empty/deleted accounts, forged/restarted sessions, and database-error recovery.
+It resets only briev_accounts_gate and briev_account_state_gate. Sessions are
+process-local; credentials and ratings are PostgreSQL-backed. Recommendations
+are composed by the server in task 12 using the same authenticated owner.
