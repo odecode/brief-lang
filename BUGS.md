@@ -10752,3 +10752,10 @@ tests/fixtures/stdlib/result_object_gate.bv passes both object payloads and both
 wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
 stdlib branch carries no compiler changes. Integration build passes; library
 suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
+
+## Ordinary collection rebinding (FIXED 2026-10-21)
+
+Same-type local assignment incorrectly invoked InsertAt with a collection handle.
+collection_assignment.rs now replaces the binding before the historical fallback.
+Explicit arrow insertion remains unchanged. Three unit tests and the native
+collection_rebind_gate.bv cover the behavior. See the collection-rebinding plan.
