@@ -280,3 +280,9 @@ tests/fixtures/stdlib/result_object_gate.bv passes both object payloads and both
 wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
 stdlib branch carries no compiler changes. Integration build passes; library
 suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
+
+Task 10 complete (2026-10-21): native parser/bootstrap/population/upsert gates
+pass, including batch rollback and concurrent startup. Integration suite: 3164
+passed, 38 known failures, none added. Stdlib fixes have separate PR branches
+fix/pg-receive-length and fix/result-wrong-side-unwrap; task-10 commit excludes
+those edits. See docs/plans/2026-10-21-recommender-bootstrap.md for evidence.
