@@ -10651,3 +10651,10 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Ordinary collection rebinding (FIXED 2026-10-21)
+
+Same-type local assignment incorrectly invoked InsertAt with a collection handle.
+collection_assignment.rs now replaces the binding before the historical fallback.
+Explicit arrow insertion remains unchanged. Three unit tests and the native
+collection_rebind_gate.bv cover the behavior. See the collection-rebinding plan.

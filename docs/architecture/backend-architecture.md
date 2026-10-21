@@ -685,3 +685,9 @@ These are resolved by `resolve_llvm_type()` in the casting graph. Never hardcode
 4. Add protocol arm in `type_to_protocol` priority chain.
 5. Add LLVM type resolution in `resolve_llvm_type`.
 6. **No name-based matching in the backend.**
+
+### Ordinary collection rebinding (2026-10-21)
+
+Same-type local assignment replaces the collection handle before InsertAt
+dispatch. Eligibility comes from declared operator metadata and exact types;
+explicit arrow insertion keeps its existing path. See collection_assignment.rs.
