@@ -57,3 +57,14 @@ Build the service with `brievc build examples/recommender/server.bv --out <dir>`
 configure PGUSER, PGDATABASE and UDATA_PATH before running it. PORT defaults to
 8080, MAX_CONNECTIONS to 1024, LAMBDA_MILLI to 500 and REFRESH_SECONDS to 300.
 See docs/architecture/applications/recommender-server.md for the wire contract.
+
+## Task 13 integrated checkpoint
+
+The backend/net-stack checkpoint is complete on `integration/ptr-provenance`.
+The three runners above, the reference/CF/cache probes, native compiler/stdlib
+regressions and ByteSink/socket/net-stack golden tests pass together. The full
+library suite has 3169 passes and exactly the 38 environment failures explicitly
+accepted by the user. See
+`docs/plans/2026-10-21-backend-checkpoint.md` for commands, branch commits and the
+existing LLVM Praetor/full-determinism limitations. Optional unfinished tasks
+remain skipped; frontend work starts at task 14.
