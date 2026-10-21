@@ -10651,3 +10651,15 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## JSON malformed-input progress and framing (FIXED 2026-10-21)
+
+Task 12 native probes hung on unterminated strings and exposed accepted missing
+commas/trailing commas, unvalidated null tokens, leading-zero numbers and broken
+escape advancement. json.bv now uses bounded recursive descent with an explicit
+consume-or-error progress invariant, strict separators and complete-input checks,
+Unicode scalar/surrogate validation, UTF-8 checks, integer overflow bounds and
+IEEE finite classification. A named builder-conversion import prevents collision
+with database/string imports. Native server_json_gate passes all grammar, Unicode,
+integer endpoint, nested-value and escape gates. Interpreter work is explicitly
+excluded at the user's request.
