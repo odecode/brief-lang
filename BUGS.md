@@ -10759,3 +10759,10 @@ Same-type local assignment incorrectly invoked InsertAt with a collection handle
 collection_assignment.rs now replaces the binding before the historical fallback.
 Explicit arrow insertion remains unchanged. Three unit tests and the native
 collection_rebind_gate.bv cover the behavior. See the collection-rebinding plan.
+
+## Float Abs overload suffix (FIXED 2026-10-21)
+
+Float Abs emitted llvm.fabs.float/double instead of width suffixes f32/f64.
+The overload-aware template now handles f16/bf16/f32/f64; narrow declarations
+are present too. Integer Abs and the legacy fallback are unchanged. Two unit
+tests and float_abs_gate.bv cover the fix. No interpreter changes.

@@ -860,6 +860,8 @@ impl LlvmBackend {
         // name#() mechanism emits them directly without frgn_map entries.
         writeln!(out, "declare float @llvm.sqrt.f32(float) #1").ok();
         writeln!(out, "declare float @llvm.fabs.f32(float) #1").ok();
+        writeln!(out, "declare half @llvm.fabs.f16(half) #1").ok();
+        writeln!(out, "declare bfloat @llvm.fabs.bf16(bfloat) #1").ok();
         writeln!(out, "declare float @llvm.ceil.f32(float) #1").ok();
         writeln!(out, "declare float @llvm.floor.f32(float) #1").ok();
         // 2026-06-29: Double-precision (Float64) intrinsic variants

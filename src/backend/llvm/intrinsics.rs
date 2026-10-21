@@ -465,6 +465,13 @@ pub(crate) fn template_for_op(op_name: &str, llvm_ty: &str, bytes: u64) -> Optio
     // doesn't look like an integer type (e.g., "ptr", "float").
     let int_llvm = if llvm_ty.starts_with('i') { llvm_ty.to_string() } else { format!("i{}", bytes * 8) };
 
+    // 2026-10-21: LLVM overload suffixes name bit widths, not IR type
+    // spellings. Float Abs# previously called undeclared llvm.fabs.float.
+    // Keep the historical template fallback for unrecognized representations;
+    // retire this seam when all templates use a shared overload descriptor.
+    if op_name == "Abs" && is_float {
+        if let Some(template) = float_abs_template(float_llvm) { return Some(template); }
+    }
     match (op_name, is_float) {
         ("Add", true) => Some(format!("%v = fadd fast {} %a, %b", float_llvm)),
         ("Sub", true) => Some(format!("%v = fsub fast {} %a, %b", float_llvm)),
@@ -509,6 +516,36 @@ pub(crate) fn template_for_op(op_name: &str, llvm_ty: &str, bytes: u64) -> Optio
         ("Shr", false) => Some(format!("%v = ashr {} %a, %b", int_llvm)),
 
         _ => None,
+    }
+}
+
+fn float_abs_template(llvm_type: &str) -> Option<String> {
+    let suffix = match llvm_type {
+        "half" => "f16",
+        "bfloat" => "bf16",
+        "float" => "f32",
+        "double" => "f64",
+        _ => return None,
+    };
+    Some(format!("%v = call {llvm_type} @llvm.fabs.{suffix}({llvm_type} %a)"))
+}
+
+#[cfg(test)]
+mod float_abs_tests {
+    use super::*;
+
+    #[test]
+    fn abs_uses_width_overloads_for_every_float_representation() {
+        for (ty, suffix, bytes) in [("half", "f16", 2), ("bfloat", "bf16", 2), ("float", "f32", 4), ("double", "f64", 8)] {
+            let template = template_for_op("Abs", ty, bytes).expect("floating abs template");
+            assert!(template.contains(&format!("@llvm.fabs.{suffix}({ty} %a)")), "{template}");
+        }
+    }
+
+    #[test]
+    fn abs_suffix_dispatch_keeps_integer_and_unknown_fallbacks() {
+        assert!(float_abs_template("i64").is_none());
+        assert!(template_for_op("Abs", "i64", 8).unwrap().contains("@llvm.abs.i64"));
     }
 }
 

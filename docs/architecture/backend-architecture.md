@@ -710,3 +710,9 @@ and all-arms-terminate behavior retain their existing lowering paths.
 Same-type local assignment replaces the collection handle before InsertAt
 dispatch. Eligibility comes from declared operator metadata and exact types;
 explicit arrow insertion keeps its existing path. See collection_assignment.rs.
+
+### Float Abs overloads (2026-10-21)
+
+Abs uses LLVM bit-width overload suffixes, not textual operand type names.
+The additive seam precedes the unchanged legacy template fallback. Narrow
+fabs declarations accompany the existing f32/f64 declarations.

@@ -1,0 +1,16 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/types/bootstrap.bv";
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let single: Float32 = -1.5;
+    let double: Float64 = -2.25;
+    let single_abs: Float32 = Abs#(single);
+    let double_abs: Float64 = Abs#(double);
+    let integer: Int = Abs#(-7);
+    let valid: Bool = single_abs == (1.5 as Float32) && double_abs == (2.25 as Float64) && integer == 7;
+    println!("float_abs_widths_and_integer_control={}",valid);
+    when !valid { endprogram 1; };
+    tick = 1; endprogram;
+};
