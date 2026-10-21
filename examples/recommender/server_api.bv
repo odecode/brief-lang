@@ -1,0 +1,215 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "./server_model.bv";
+import { JsonValue, ParseFrame, Object, Null, StrVal, IntVal, parse_value, skip_ws } from "std/json.bv";
+import "std/net/http.bv";
+
+obj ApiInput { ok: Bool; username: String; password: String; token: String; item: Int; rating: Int; };
+obj ApiReply { status: Int; body: String; sessions: SessionStore; changed_owner: Int; refresh: Bool; };
+
+defn api_rating_valid(input: ApiInput, nitems: Int) -> Bool {
+    term input.ok && input.item >= 0 && input.item < nitems && input.rating >= 1 && input.rating <= 5;
+};
+
+defn api_cold_start(count: Int) -> Bool { term count < 5; };
+
+defn api_quote(text: String) -> String {
+    let escaped: String = "\"";
+    let hex: String = "0123456789abcdef";
+    foreach idx in 0..text .^Length {
+        let byte: Int = byte_at(text,idx);
+        when byte == 34 || byte == 92 { escaped = escaped + "\\"; };
+        when byte >= 32 { escaped = escaped + text[idx:idx+1]; };
+        when byte < 32 { escaped = escaped + "\\u00" + hex[byte/16:byte/16+1] + hex[byte%16:byte%16+1]; };
+    };
+    term escaped + "\"";
+};
+
+defn api_member(value: JsonValue, key: String) -> JsonValue {
+    match value {
+        Object(pairs) => api_pair(pairs,key,0),
+        _ => Null(),
+    }
+};
+
+defn api_pair(pairs: List<(String,JsonValue)>, key: String, idx: Int) -> JsonValue {
+    when idx >= pairs .^Length { term Null(); };
+    when pairs[idx].0 == key { term pairs[idx].1; };
+    term api_pair(pairs,key,idx+1);
+};
+
+defn api_string(value: JsonValue) -> String {
+    match value { StrVal(text) => text, _ => "", }
+};
+
+defn api_integer(value: JsonValue) -> Int {
+    match value { IntVal(number) => number, _ => -1, }
+};
+
+defn api_unique(pairs: List<(String,JsonValue)>, idx: Int) -> Bool {
+    when idx >= pairs .^Length { term true; };
+    foreach other in (idx+1)..(pairs .^Length) {
+        when pairs[idx].0 == pairs[other].0 { term false; };
+    };
+    term api_unique(pairs,idx+1);
+};
+
+defn api_object(value: JsonValue) -> Bool {
+    match value { Object(pairs) => api_unique(pairs,0), _ => false, }
+};
+
+defn api_input(body: String) -> ApiInput {
+    let invalid: ApiInput = ApiInput { ok: false, username: "", password: "", token: "", item: -1, rating: -1 };
+    let parsed: Result<ParseFrame,String> = parse_value(body,0);
+    when is_err(parsed) { term invalid; };
+    let frame: ParseFrame = unwrap(parsed);
+    when !api_object(frame.value) || skip_ws(body,frame.pos) != body .^Length { term invalid; };
+    term ApiInput { ok: true,
+        username: api_string(api_member(frame.value,"username")), password: api_string(api_member(frame.value,"password")),
+        token: api_string(api_member(frame.value,"token")), item: api_integer(api_member(frame.value,"item_id")),
+        rating: api_integer(api_member(frame.value,"rating")) };
+};
+
+defn api_reply(status: Int, body: String, sessions: SessionStore) -> ApiReply {
+    term ApiReply { status: status, body: body, sessions: sessions, changed_owner: 0, refresh: false };
+};
+
+defn api_error(error: String, sessions: SessionStore) -> ApiReply {
+    let status: Int = 400;
+    let message: String = "Supply a JSON object with the required fields.";
+    when error == "validation" { message = "Use nonblank credentials, or an integer item index and a rating from 1 through 5."; };
+    when error == "auth-failed" { message = "Log in with matching credentials and use the returned session token."; };
+    when error == "account-exists" { message = "Choose another username or log in to the existing account."; };
+    when error == "database" || error == "session" { message = "The service cannot complete this request; retry after checking database availability."; };
+    when error == "auth-failed" { status = 401; };
+    when error == "account-exists" { status = 409; };
+    when error == "database" || error == "session" { status = 503; };
+    term api_reply(status,"{\"error\":" + api_quote(error) + ",\"message\":" + api_quote(message) + "}",sessions);
+};
+
+defn api_rated(state: AccountState, item: Int) -> Bool {
+    foreach idx in 0..state.ratings .^Length { when state.ratings[idx].item_id == item { term true; }; };
+    term false;
+};
+
+defn api_best_item(scores: Vector, picked: IntVec) -> Int {
+    let best: Int = -1;
+    let score: Float = -1.0;
+    foreach item in 0..scores.len {
+        when ivec_get(picked,item) == 0 && vec_get(scores,item) > score { best = item; score = vec_get(scores,item); };
+    };
+    term best;
+};
+
+defn api_add_recommendation(text: String, item: Int, score: Float) -> String {
+    let prefix: String = text;
+    when text .^Length > 0 { prefix = prefix+","; };
+    term prefix+"{\"item_id\":"+item as String+",\"score\":"+score as String+"}";
+};
+
+defn api_recommendations(model: ServerModel, state: AccountState, lambda: Float) -> String {
+    when api_cold_start(state.ratings .^Length) { term "{\"cold_start\":true}"; };
+    let active: ActivePrediction = active_build(model,state);
+    let scores: Vector = vec_new(model.population.nitems);
+    let picked: IntVec = ivec_new(model.population.nitems);
+    foreach item in 0..model.population.nitems {
+        ivec_set(picked,item,0);
+        when api_rated(state,item) { ivec_set(picked,item,1); };
+        let score: Float = clamp15(lambda * active_user_prediction(active,item) + (1.0-lambda) * active_item_prediction(active,item));
+        vec_set(scores,item,score);
+    };
+    let text: String = "";
+    foreach rank in 0..TOP_N {
+        let best: Int = api_best_item(scores,picked);
+        when best >= 0 {
+            text = api_add_recommendation(text,best,vec_get(scores,best));
+            ivec_set(picked,best,1);
+        };
+    };
+    vec_free(active.similarities); vec_free(scores); ivec_free(picked);
+    term "{\"recommendations\":[" + text + "]}";
+};
+
+defn api_ratings(state: AccountState) -> String {
+    let text: String = "";
+    foreach idx in 0..state.ratings .^Length {
+        when idx > 0 { text = text + ","; };
+        let row: AccountRating = state.ratings[idx];
+        text = text + "{\"item_id\":" + row.item_id as String + ",\"rating\":" + row.rating as String + "}";
+    };
+    term "[" + text + "]";
+};
+
+defn api_token(path: String) -> String {
+    let query: Int = str_find(path,"?token=");
+    when query < 0 { term ""; };
+    let token: String = path[query+7:path .^Length];
+    when token .^Length != 32 { term ""; };
+    term token;
+};
+
+defn api_path(path: String) -> String {
+    let query: Int = str_find(path,"?");
+    when query < 0 { term path; };
+    term path[0:query];
+};
+
+defn api_movies(nitems: Int) -> String {
+    let text: String = "";
+    foreach item in 0..nitems {
+        when item > 0 { text = text + ","; };
+        text = text + "{\"item_id\":" + item as String + "}";
+    };
+    term "{\"movies\":[" + text + "]}";
+};
+
+defn api_credentials(conn: PgConn, sessions: SessionStore, input: ApiInput, path: String) -> ApiReply {
+    when path == "/register" {
+        let result: AccountResult = register(conn,input.username,input.password);
+        when !result.ok { term api_error(result.error,sessions); };
+        term api_reply(200,"{\"ok\":true}",sessions);
+    };
+    let result: LoginResult = login(conn,sessions,input.username,input.password);
+    when !result.result.ok { term api_error(result.result.error,sessions); };
+    term api_reply(200,"{\"ok\":true,\"token\":" + api_quote(result.token) + "}",result.sessions);
+};
+
+defn api_rate(conn: PgConn, sessions: SessionStore, input: ApiInput, nitems: Int, timestamp: Int) -> ApiReply {
+    when !api_rating_valid(input,nitems) {
+        term api_error("validation",sessions);
+    };
+    let state: AccountState = account_state(conn,sessions,input.token);
+    when !state.result.ok { term api_error(state.result.error,sessions); };
+    let saved: PgResult = store_rating_upsert(conn,state.result.account.id,input.item,input.rating,timestamp);
+    when !saved.ok { term api_error("database",sessions); };
+    term ApiReply { status: 200, body: "{\"ok\":true}", sessions: sessions,
+        changed_owner: state.result.account.id, refresh: false };
+};
+
+defn api_state(conn: PgConn, sessions: SessionStore, model: ServerModel, request: HttpRequest, lambda: Float) -> ApiReply {
+    let state: AccountState = account_state(conn,sessions,api_token(request.path));
+    when !state.result.ok { term api_error(state.result.error,sessions); };
+    let recommendations: String = api_recommendations(model,state,lambda);
+    when api_path(request.path) == "/recommendations" { term api_reply(200,recommendations,sessions); };
+    let body: String = "{\"account\":{\"id\":" + state.result.account.id as String + ",\"username\":" +
+        api_quote(state.result.account.username) + "},\"ratings\":" + api_ratings(state) + "," + recommendations[1:recommendations .^Length];
+    term api_reply(200,body,sessions);
+};
+
+defn api_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel, request: HttpRequest, lambda: Float, timestamp: Int) -> ApiReply {
+    let path: String = api_path(request.path);
+    when request.method == "OPTIONS" { term api_reply(200,"{}",sessions); };
+    when request.method == "GET" && path == "/movies" { term api_reply(200,api_movies(model.population.nitems),sessions); };
+    when request.method == "GET" && (path == "/state" || path == "/recommendations") { term api_state(conn,sessions,model,request,lambda); };
+    when request.method == "POST" && path == "/admin/refresh" {
+        term ApiReply { status: 200, body: "{\"ok\":true}", sessions: sessions, changed_owner: 0, refresh: true };
+    };
+    when request.method == "POST" {
+        let input: ApiInput = api_input(request.body);
+        when !input.ok { term api_error("validation",sessions); };
+        when path == "/register" || path == "/login" { term api_credentials(conn,sessions,input,path); };
+        when path == "/rating" { term api_rate(conn,sessions,input,model.population.nitems,timestamp); };
+    };
+    term api_reply(404,"{\"error\":\"not-found\"}",sessions);
+};

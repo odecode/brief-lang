@@ -201,3 +201,108 @@ for anything found. New .bv stdlib files must pass the conformance sweep.
 
 (Compiler bugs found during implementation get a BUGS.md entry AND a line here with
 the date, the .bv snippet that triggered it, and the workaround.)
+
+### 2026-10-21 — relative code-import path bug (verification pending)
+
+Task 10.1 gate fails before typechecking: `../examples/recommender/udata.bv`
+becomes `///examples/recommender/udata.bv`. Minimal trigger is the first import
+in `scratch/udata_gate.bv`. The code resolver expands namespace dots inside
+filesystem-relative paths. Fix authored on `fix/relative-import-paths` with
+regression coverage; no application workaround. Human verification pending.
+
+### 2026-10-21 — relative import fix verified
+
+`fix/relative-import-paths`: preserve filesystem-relative path spelling via
+code_module_path; bare dotted module names retain their namespace expansion.
+Human reports post-refactor cargo check, cargo test --lib, and cargo build green;
+the native parser gate previously passed all six checks. Controlled Praetor
+before/after diagnostics match. Compiler PR is prepared before feature work resumes.
+
+### 2026-10-21 — schema gate exposes pointer-valued collection store (OPEN)
+
+Native schema-gate build fails inside pg_decode_fields before any DB connection:
+a singleton List<String> stores its ptr-valued element as i64 without conversion.
+Generated IR proves the type mismatch for both literal and decoded text.
+Controlled Int/String singleton probes authored, human verification pending.
+No pg.bv workaround. See the pointer-valued-collection-store investigation plan.
+
+
+### 2026-10-21 — generic literal argument type loss isolated
+
+Int list concatenation succeeds; String list concatenation reproduces the
+schema-gate ptr/i64 failure without net/db imports. The compiler constructs
+inline generic-call arguments using unspecialized List<T>. Frontend fix authored
+on fix/generic-call-literal-types, preserving the inferred collection type in a
+typed value block. Generic-call and operator-call paths share the helper.
+Unit/native verification pending human execution; application code unchanged.
+
+### 2026-10-21 — generic literal fix regression corrected, retest pending
+
+Full-suite output exposed empty tuple accumulators losing their declared return
+context during elaboration. Initialize current_output_type for defns and txns
+as ordinary typechecking already does. Dedicated accumulator regression added;
+no tests disabled or stdlib workarounds. Human filtered/full-suite reruns pending.
+
+### 2026-10-21 — generic literal argument fix verified
+
+Human reports full suite green after declared-return context correction. Native
+String concat gate: four true checks; Int control: two true checks. Reduced
+original failure is resolved without stdlib changes. Praetor has no increased
+metrics or added diagnostics. Commit/PR approval pending; full schema gate will
+be rerun on the integration branch after the separate compiler PR handoff.
+### 2026-10-21 — terminating match arm suppresses value merge (OPEN)
+
+After loading 100,000 baseline ratings, engine-adapter verification exposed a
+compiler defect independent of Result/app code: a match with one trap arm loses
+the continuing arm's result phi. Minimal value/value control compiles, value/trap
+fails LLVM. Fix/tests authored on fix/match-terminating-arm-values; human cargo
+verification pending. Feature work is preserved in the documented scratch patch.
+
+Verification: four focused regressions and native value/trap gates pass; cargo
+build passes. Full suite: 3157 passed, 38 known failure names, none added.
+
+## PostgreSQL receive buffer metadata (FIXED 2026-10-21)
+
+pg_read_msg filled memory without publishing ByteBuf.len, so bounded error-field
+scans returned empty SQLSTATE/message. buf_received now publishes initialized
+header/body prefixes without copying or creating a second allocation owner.
+Standalone tests/fixtures/stdlib/pg_receive_gate.bv passes prefix invariants and
+live 22012/division by zero preservation through rollback and connection reuse.
+Integration build passes; library suite: 3164 passed, 38 known failures, none new.
+Praetor directory checks pass. No compiler source changes or performance claim.
+Branch fix/pg-receive-length targets feat/net-db-postgres, absent from main.
+
+## Result wrong-side unwrap fabricated payloads (FIXED 2026-10-21)
+
+unwrap and unwrap_err fabricated cast fallback values instead of their documented
+trap. Wrong sides now trap; actual payloads are preserved. Standalone regression
+tests/fixtures/stdlib/result_object_gate.bv passes both object payloads and both
+wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
+stdlib branch carries no compiler changes. Integration build passes; library
+suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
+
+Task 10 complete (2026-10-21): native parser/bootstrap/population/upsert gates
+pass, including batch rollback and concurrent startup. Integration suite: 3164
+passed, 38 known failures, none added. Stdlib fixes have separate PR branches
+fix/pg-receive-length and fix/result-wrong-side-unwrap; task-10 commit excludes
+those edits. See docs/plans/2026-10-21-recommender-bootstrap.md for evidence.
+
+Task 11 native account service (2026-10-21): atomic parameterized registration,
+FNV demo storage, explicit random-token sessions and token-authenticated state
+pass their native gates (144 credential and 120 isolation cases). The human
+confirmed recommendation composition belongs to task 12, using this same owner.
+No compiler/stdlib fix needed; docs/plans/2026-10-21-recommender-accounts.md records
+the increments and tests. Full library suite is running; commit approval pending.
+
+Task 11 final gates (2026-10-21): native corpus and fresh-connection login/state
+persistence pass. Full library suite: 3164 passed, 38 baseline failures with
+exactly the same names as task 10. Praetor passes; no compiler/stdlib changes.
+
+Task 12 (2026-10-21): implemented native poll HTTP routing, token-owned live
+channels, buffered partial writes, active-account predictions and consistent
+periodic/explicit snapshot refresh. Native gates exposed and fixed collection
+rebinding (compiler) and JSON consume-or-error progress/framing (stdlib); see
+BUGS.md and docs/plans/2026-10-21-recommender-server.md. Compiler fix is prepared
+on its own main-based branch. Interpreter changes are excluded by explicit user
+instruction. Final native/property/library verification is recorded in the task
+plan; no throughput/latency claim is made before task 16.

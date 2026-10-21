@@ -1,0 +1,41 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "../../../examples/recommender/server_api.bv";
+import "std/env.bv";
+
+defn api_gate_request(method: String, path: String, body: String) -> HttpRequest {
+    term HttpRequest { method: method, path: path, headers: "", body: body };
+};
+
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
+    when conn.pid < 0 { endprogram 1; };
+    let schema: PgResult = pg_simple_query(conn,"CREATE SCHEMA IF NOT EXISTS briev_server_api_gate; SET search_path TO briev_server_api_gate");
+    let created: PgResult = store_create_schema(conn);
+    let seeded: PgResult = pg_simple_query(conn,"TRUNCATE ratings,accounts,baseline_ratings RESTART IDENTITY; INSERT INTO baseline_ratings SELECT usr,itm,1+(usr+itm)%5,1 FROM generate_series(0,2) usr CROSS JOIN generate_series(0,7) itm");
+    when !schema.ok || !created.ok || !seeded.ok { endprogram 1; };
+    let loaded: Result<ServerModel,PgResult> = model_load(conn,3,8);
+    when is_err(loaded) { println!("model failure={}",unwrap_err(loaded).err_msg); endprogram 1; };
+    let model: ServerModel = unwrap(loaded);
+    let sessions: SessionStore = sessions_new();
+    let registered: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/register","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1);
+    let signed_in: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1);
+    let token: String = api_input(signed_in.body).token;
+    sessions = signed_in.sessions;
+    let cold: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1);
+    let rated: Bool = true;
+    foreach item in 0..5 {
+        let reply: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/rating","{\"token\":"+api_quote(token)+",\"item_id\":"+item as String+",\"rating\":4}"),0.5,1);
+        when reply.status != 200 { rated = false; };
+    };
+    let recs: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1);
+    let state: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/state?token="+token,""),0.5,1);
+    let malformed: Bool = !api_input("{\"rating\":3} junk").ok && !api_input("{\"rating\":3,\"rating\":4}").ok && api_input("{\"rating\":3.5}").rating == -1;
+    let valid: Bool = registered.status == 200 && signed_in.status == 200 && token .^Length == 32 && cold.body == "{\"cold_start\":true}" && rated && str_find(recs.body,"recommendations") >= 0 && str_find(state.body,"alice") >= 0 && malformed;
+    println!("api_gate={} recs={} state={}",valid,recs.body,state.body);
+    model_free(model); pg_close(conn);
+    when !valid { endprogram 1; };
+    tick = 1; endprogram;
+};
