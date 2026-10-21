@@ -112,6 +112,19 @@ defn buf_new(cap: Int) [cap >= 1][term.cap >= cap && term.len == 0] -> ByteBuf {
     term ByteBuf { ptr: addr, len: 0, cap: cap };
 };
 
+// 2026-10-21: external writers (e.g. recv) fill memory but do not update this
+// value's logical length. Publish the initialized prefix before using readers
+// or bounded scanners. This transfers the existing buffer view, without copying
+// or allocating; the caller must still free the allocation exactly once.
+// Caller guarantees that all `count` bytes were actually initialized. Remove
+// this bridge only if external-write APIs return an updated ByteBuf themselves.
+defn buf_received(buf: ByteBuf, count: Int)
+    [count >= 0 && count <= buf.cap][term.len == count && term.cap == buf.cap]
+    -> ByteBuf
+{
+    term ByteBuf { ptr: buf.ptr, len: count, cap: buf.cap };
+};
+
 // buf_free - release the allocation. After this the ByteBuf must not be used.
 defn buf_free(buf: ByteBuf) -> Void {
     Free#(buf.ptr as Ptr);
