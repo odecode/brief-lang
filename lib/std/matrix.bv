@@ -9,9 +9,12 @@
 // float slot.
 //
 // LAYOUT. Following the bytes.bv pattern, the allocation's address is held as
-// an Int field and indexed by pointer arithmetic. A Float is the Briev 64-bit
-// float fundamental = 8 bytes, so a rows x cols matrix occupies rows*cols*8
-// bytes and element (r, c) lives at flat index r*cols + c.
+// an Int field and indexed by pointer arithmetic. Allocations reserve eight
+// bytes per Float element; typed Ptr<Float> indexing uses Float's declared
+// physical width (currently four bytes). The live values form a packed prefix;
+// remaining allocation capacity is not initialized. Element (r,c) has logical
+// index r*cols+c. 2026-10-21: clarified for snapshot serialization; retire the
+// spare capacity only with a coordinated allocation/format migration.
 //
 // WHY A TYPED-POINTER CAST, NOT `LoadF#`/`StoreF#`. The design named float
 // load/store intrinsics `LoadF#`/`StoreF#` pending resolution against the
@@ -20,7 +23,7 @@
 // storing a Float through them would need a manual Float<->bit-pattern
 // reinterpret (the risk the ledger flags). Instead we reinterpret the Int
 // address as a `Ptr<Float>` and use the language's native typed-pointer
-// indexing (`arr[idx]`), which lowers to a real f64 load/store - no bit
+// indexing (`arr[idx]`), which lowers to a typed floating load/store - no bit
 // shuffling, no new intrinsic, Intrinsics-before-frgn satisfied. This is the
 // exact pattern the working benchmarks/recommender.bv uses.
 
@@ -47,7 +50,7 @@ defn mat_new(rows: Int, cols: Int)
 
 // mat_get - the Float at (r, c). The precondition pins (r, c) in bounds so the
 // flat index r*cols+c is a valid slot; the address is reinterpreted as a
-// Ptr<Float> and read with native typed indexing (a real f64 load).
+// Ptr<Float> and read with native typed indexing at Float's declared width.
 defn mat_get(m: Matrix, r: Int, c: Int)
     [r >= 0 && r < m.rows && c >= 0 && c < m.cols][true]
     -> Float
@@ -57,7 +60,7 @@ defn mat_get(m: Matrix, r: Int, c: Int)
 };
 
 // mat_set - store Float v at (r, c). Same in-bounds precondition and typed
-// Ptr<Float> write (a real f64 store). Store# mutates the shared heap block in
+// Ptr<Float> write at Float's declared width. The store mutates the shared heap block in
 // place; Matrix is a value handle over that block, so nothing is returned.
 defn mat_set(m: Matrix, r: Int, c: Int, v: Float)
     [r >= 0 && r < m.rows && c >= 0 && c < m.cols][true]
@@ -111,7 +114,7 @@ defn vec_free(v: Vector) -> Void {
 //
 // A SEPARATE named type (not Vector) so the integer CSR offset/index arrays of
 // the sparse rating population never silently reuse the float Vector - an
-// integer stored into a Float slot and read back would round-trip through f64,
+// integer stored into a Float slot and read back would round-trip through Float,
 // corrupting large offsets. IntVec uses an 8-byte stride and a Ptr<Int> view,
 // so the stored bits are the integer itself, never a float encoding.
 obj IntVec {

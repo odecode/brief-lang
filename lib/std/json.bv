@@ -20,7 +20,7 @@
 import "std/char";
 import "std/collections.bv";
 import "std/iterator.bv";
-import { str_to_float } from "std/cast_lanes.bv";
+import { str_to_float } from "std/cast_portable.bv";
 // 2026-10-21: the builder conversion shares a spelling with integer string
 // conversion. Give this dependency an explicit local name so JSON composes
 // with database/string users; keep the alias if builder internals change.
@@ -128,6 +128,71 @@ defn json_get_by_index(v: JsonValue, i: Int) -> Result<JsonValue, String> {
         }
         _ => err_value(e_utoken()),
     }
+};
+
+// 2026-10-21: encode the same value algebra accepted by json_parse. The depth
+// bound, Unicode validation and finite-number check keep generated documents
+// parseable. Preserve this contract if the builder implementation changes.
+defn json_stringify(value: JsonValue) -> Result<String,String> {
+    term json_encode_depth(value,0);
+};
+
+defn json_encode_depth(value: JsonValue, depth: Int) -> Result<String,String> {
+    when depth > 64 { term Err("nesting_limit"); };
+    match value {
+        Null() => Ok("null"),
+        BoolVal(flag) => {
+            when flag { term Ok("true"); };
+            term Ok("false");
+        },
+        IntVal(number) => Ok(number as String),
+        FloatVal(number) => {
+            when !json_finite(number) { term Err("invalid_number"); };
+            term Ok(number as String);
+        },
+        StrVal(text) => json_encode_text(text,0,"\""),
+        Array(values) => json_encode_array(values,depth+1),
+        Object(pairs) => json_encode_object(pairs,depth+1),
+    }
+};
+
+defn json_encode_text(text: String, pos: Int, encoded: String) -> Result<String,String> {
+    when pos >= text .^Length { term Ok(encoded+"\""); };
+    let byte: Int = char_at(text,pos) as Int;
+    when byte == 34 || byte == 92 {
+        term json_encode_text(text,pos+1,encoded+"\\"+text[pos:pos+1]);
+    };
+    when byte < 32 {
+        let hex: String = "0123456789abcdef";
+        term json_encode_text(text,pos+1,encoded+"\\u00"+hex[byte/16:byte/16+1]+hex[byte%16:byte%16+1]);
+    };
+    let width: Int = json_utf8_width(text,pos);
+    when width < 1 { term Err("invalid_utf8"); };
+    term json_encode_text(text,pos+width,encoded+text[pos:pos+width]);
+};
+
+defn json_encode_array(values: List<JsonValue>, depth: Int) -> Result<String,String> {
+    let encoded: String = "[";
+    foreach idx in 0..values .^Length {
+        let entry: Result<String,String> = json_encode_depth(values[idx],depth);
+        when is_err(entry) { term entry; };
+        when idx > 0 { encoded = encoded+","; };
+        encoded = encoded+unwrap(entry);
+    };
+    term Ok(encoded+"]");
+};
+
+defn json_encode_object(pairs: List<(String,JsonValue)>, depth: Int) -> Result<String,String> {
+    let encoded: String = "{";
+    foreach idx in 0..pairs .^Length {
+        let key: Result<String,String> = json_encode_text(pairs[idx].0,0,"\"");
+        when is_err(key) { term key; };
+        let entry: Result<String,String> = json_encode_depth(pairs[idx].1,depth);
+        when is_err(entry) { term entry; };
+        when idx > 0 { encoded = encoded+","; };
+        encoded = encoded+unwrap(key)+":"+unwrap(entry);
+    };
+    term Ok(encoded+"}");
 };
 
 // ===== Strict, bounded recursive descent =====
@@ -286,9 +351,14 @@ defn json_signed_integer(text: String, pos: Int, end: Int, negative: Bool, value
         term Ok(ParseFrame { value: IntVal(0-value), pos: end });
     };
     let digit: Int = digit_to_int(char_at(text,pos));
-    let last: Int = 7;
-    when negative { last = 8; };
-    when value < -922337203685477580 || (value == -922337203685477580 && digit > last) { term err_frame(e_invnum()); };
+    // 2026-10-21: Int follows the target word width. Accumulate negatively
+    // against its derived minimum, preserving the asymmetric signed endpoint
+    // on both 32- and 64-bit targets instead of assuming a 64-bit browser Int.
+    let minimum: Int = 1 << (value .^^Bytes * 8 - 1);
+    let cutoff: Int = minimum / 10;
+    let last: Int = 0 - (minimum % 10);
+    when !negative { last = last - 1; };
+    when value < cutoff || (value == cutoff && digit > last) { term err_frame(e_invnum()); };
     term json_signed_integer(text,pos+1,end,negative,value*10-digit);
 };
 
@@ -312,11 +382,11 @@ defn parse_number(text: String, pos: Int) -> Result<ParseFrame,String> {
 // Integer classification is independent of floating reassociation/fast flags;
 // remove these masks only in favor of a stdlib classification protocol.
 defn json_finite(value: Float) -> Bool {
-    let bits: Int = (value as Data) as Int;
+    let bits: Int64 = (value as Data) as Int64;
     let width: Int = value .^^Bytes;
-    when width == 2 { term (bits & 31744) != 31744; };
-    when width == 4 { term (bits & 2139095040) != 2139095040; };
-    when width == 8 { term (bits & 9218868437227405312) != 9218868437227405312; };
+    when width == 2 { term (bits & ((31 as Int64) << (10 as Int64))) != ((31 as Int64) << (10 as Int64)); };
+    when width == 4 { term (bits & ((255 as Int64) << (23 as Int64))) != ((255 as Int64) << (23 as Int64)); };
+    when width == 8 { term (bits & ((2047 as Int64) << (52 as Int64))) != ((2047 as Int64) << (52 as Int64)); };
     term false;
 };
 
