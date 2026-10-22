@@ -1,0 +1,260 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/json.bv";
+import "std/web/fetch.bv";
+import "std/web/websocket.bv";
+import "std/web/events.bv";
+
+defn client_member(value: JsonValue, key: String) -> JsonValue {
+    match value {
+        Object(pairs) => {
+            foreach idx in 0..pairs .^Length {
+                when pairs[idx].0 == key { term pairs[idx].1; };
+            };
+            term Null();
+        },
+        _ => Null(),
+    }
+};
+
+defn client_string(value: JsonValue) -> String {
+    match value { StrVal(text) => text, _ => "", }
+};
+
+defn client_integer(value: JsonValue) -> Int {
+    match value { IntVal(number) => number, _ => -1, }
+};
+
+defn client_values(value: JsonValue) -> List<JsonValue> {
+    match value { Array(values) => values, _ => [], }
+};
+
+defn client_response(text: String) -> Result<JsonValue,String> {
+    when text .^Length == 0 { term Err("Cannot reach the service. Check the address and try again."); };
+    let parsed: Result<JsonValue,String> = json_parse(text);
+    when is_err(parsed) { term Err("The service returned an invalid JSON response."); };
+    let value: JsonValue = unwrap(parsed);
+    let error: String = client_string(client_member(value,"error"));
+    when error .^Length > 0 {
+        let message: String = client_string(client_member(value,"message"));
+        when message .^Length == 0 { message = "Request failed: "+error+". Try again."; };
+        term Err(message);
+    };
+    term Ok(value);
+};
+
+defn client_credentials(user: String, secret: String) -> String {
+    let pairs: List<(String,JsonValue)> = [("username",StrVal(user)),("password",StrVal(secret))];
+    term unwrap(json_stringify(Object(pairs)));
+};
+
+let api: String = query_parameter("api","http://127.0.0.1:8080");
+let username: String = "";
+let password: String = "";
+let token: String = "";
+let authenticated: Bool = false;
+let notice: String = "Create an account or sign in to start rating.";
+
+let movie: Int = 1;
+let stars: Int = 5;
+let rating_count: Int = 0;
+let cold_start: Bool = true;
+let movies_text: String = "";
+let ratings_text: String = "";
+let rec_lines: List<String> = [];
+let channel: Int = 0;
+let reconnect_timer: Int = 0;
+let reconnect_delay: Int = 250;
+let connection: String = "Offline";
+
+defn client_recommendations(value: JsonValue) -> Bool {
+    let marker: JsonValue = client_member(value,"cold_start");
+    cold_start = false;
+    match marker { BoolVal(flag) => { cold_start = flag; }, _ => {} };
+    rec_lines = [];
+    when !cold_start {
+        let items: List<JsonValue> = client_values(client_member(value,"recommendations"));
+        foreach idx in 0..items .^Length {
+            let item: Int = client_integer(client_member(items[idx],"item_id"));
+            when item >= 0 { rec_lines += ["Movie "+((item+1) as String)]; };
+        };
+    };
+    term true;
+};
+
+defn client_load_state() -> Bool {
+    let reply: Result<JsonValue,String> = client_response(http_get(api+"/state?token="+token));
+    when is_err(reply) { notice = unwrap_err(reply); term false; };
+    let value: JsonValue = unwrap(reply);
+    let ratings: List<JsonValue> = client_values(client_member(value,"ratings"));
+    rating_count = ratings .^Length;
+    ratings_text = "";
+    foreach idx in 0..ratings .^Length {
+        let item: Int = client_integer(client_member(ratings[idx],"item_id"));
+        let score: Int = client_integer(client_member(ratings[idx],"rating"));
+        ratings_text += "Movie "+((item+1) as String)+": "+(score as String)+" / 5. ";
+    };
+    client_recommendations(value);
+    term true;
+};
+
+defn client_connect() -> Bool {
+    when channel > 0 { ws_close(channel); channel = 0; };
+    let address: String = "";
+    when api[0:7] == "http://" { address = "ws://"+api[7:api .^Length]; };
+    when api[0:8] == "https://" { address = "wss://"+api[8:api .^Length]; };
+    when address .^Length == 0 { connection = "Invalid service address"; term false; };
+    channel = websocket_connect(address+"/live?token="+token,"recommender-live");
+    connection = "Connecting";
+    when channel == 0 {
+        connection = "Reconnecting";
+        reconnect_timer = event_after("recommender-reconnect",reconnect_delay);
+    };
+    term channel > 0;
+};
+
+txn edit_movie(value: Int) [movie != value][movie == value] { movie = value; term; };
+txn edit_stars(value: Int) [stars != value][stars == value] { stars = value; term; };
+
+txn save_rating [authenticated][true] {
+    when movie < 1 || stars < 1 || stars > 5 { notice = "Choose a movie number and a rating from 1 to 5."; };
+    when movie >= 1 && stars >= 1 && stars <= 5 {
+    let pairs: List<(String,JsonValue)> = [("token",StrVal(token)),("item_id",IntVal(movie-1)),("rating",IntVal(stars))];
+    let reply: Result<JsonValue,String> = client_response(http_post(api+"/rating",unwrap(json_stringify(Object(pairs)))));
+    when is_err(reply) { notice = unwrap_err(reply); };
+    when is_ok(reply) { client_load_state(); notice = "Rating saved. Your shortlist is up to date."; };
+    };
+    term;
+};
+
+txn live_event [authenticated][true] {
+    when channel > 0 {
+        let pending: Int = ws_pending(channel);
+        foreach idx in 0..pending {
+            let reply: Result<JsonValue,String> = client_response(ws_receive(channel));
+            when is_ok(reply) { client_recommendations(unwrap(reply)); };
+            when is_err(reply) { notice = unwrap_err(reply); };
+        };
+        when ws_status(channel) == 1 { connection = "Live"; reconnect_delay = 250; };
+        when ws_status(channel) == 3 {
+            ws_close(channel); channel = 0; connection = "Reconnecting";
+            when reconnect_timer == 0 {
+                reconnect_timer = event_after("recommender-reconnect",reconnect_delay);
+                reconnect_delay = reconnect_delay*2;
+                when reconnect_delay > 8000 { reconnect_delay = 8000; };
+            };
+        };
+    };
+    term;
+};
+
+txn reconnect [authenticated][true] {
+    reconnect_timer = 0;
+    client_load_state();
+    client_connect();
+    term;
+};
+
+txn logout [authenticated][true] {
+    when reconnect_timer > 0 { event_cancel(reconnect_timer); reconnect_timer = 0; };
+    when channel > 0 { ws_close(channel); channel = 0; };
+    token = ""; authenticated = false; rec_lines = []; ratings_text = "";
+    rating_count = 0; cold_start = true; connection = "Offline";
+    notice = "Signed out. Sign in to continue.";
+    term;
+};
+txn edit_username(value: String) [username != value][username == value] {
+    username = value; term;
+};
+
+txn edit_password(value: String) [password != value][password == value] {
+    password = value; term;
+};
+
+txn register_user [!authenticated][true] {
+    let reply: Result<JsonValue,String> = client_response(http_post(api+"/register",client_credentials(username,password)));
+    when is_err(reply) { notice = unwrap_err(reply); };
+    when is_ok(reply) { notice = "Account created. Sign in with these credentials."; };
+    term;
+};
+
+txn login_user [!authenticated][true] {
+    let reply: Result<JsonValue,String> = client_response(http_post(api+"/login",client_credentials(username,password)));
+    when is_err(reply) { notice = unwrap_err(reply); };
+    when is_ok(reply) {
+        let received: String = client_string(client_member(unwrap(reply),"token"));
+        when received .^Length != 32 { notice = "The service did not return a valid session. Try signing in again."; };
+        when received .^Length == 32 {
+            token = received;
+            authenticated = true;
+            notice = "Signed in. Your ratings belong to this account.";
+            let catalogue: Result<JsonValue,String> = client_response(http_get(api+"/movies"));
+            movies_text = "";
+            when is_ok(catalogue) {
+                let movies: List<JsonValue> = client_values(client_member(unwrap(catalogue),"movies"));
+                foreach idx in 0..movies .^Length {
+                    let item: Int = client_integer(client_member(movies[idx],"item_id"));
+                    when item >= 0 { movies_text += ((item+1) as String)+" "; };
+                };
+            };
+            client_load_state(); client_connect();
+        };
+    };
+    term;
+};
+
+<view>
+  <main class="shell">
+    <header><p class="eyebrow">THE NEXT GOOD FILM</p><h1>A little taste.<br>A better shortlist.</h1><p>Rate what you know. Find something you will love.</p></header>
+    <p id="notice" role="status" aria-live="polite" b-text="notice">Create an account or sign in to start rating.</p>
+    <section class="panel" b-show="authenticated == false">
+      <h2>Your taste starts here</h2>
+      <label for="username">Username</label><input id="username" autocomplete="username" b-bind:value="username">
+      <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" b-bind:value="password">
+      <div class="actions"><button id="login" b-trigger:click="login_user">Sign in</button><button id="register" class="secondary" b-trigger:click="register_user">Create account</button></div>
+      <p class="muted">Demo accounts only. Use a password you do not use elsewhere.</p>
+    </section>
+    <section class="panel" b-show="authenticated" b-window:recommender-live="live_event">
+      <p>Connection: <span id="connection" b-text="connection">Connecting</span></p>
+      <button class="secondary" id="logout" b-trigger:click="logout">Sign out</button>
+      <h2>Rate a film</h2><p>Available movie numbers: <span id="movies" b-text="movies_text"></span></p>
+      <label for="movie">Movie number</label><input id="movie" type="number" min="1" b-bind:value="movie">
+      <label for="stars">Rating (1 to 5)</label><input id="stars" type="number" min="1" max="5" b-bind:value="stars">
+      <p><button id="save-rating" b-trigger:click="save_rating">Save rating</button></p>
+      <p>Rated films: <span id="rating-count" b-text="rating_count">0</span></p>
+      <p id="ratings" b-text="ratings_text"></p>
+    </section>
+    <section class="panel" b-show="authenticated" b-window:recommender-reconnect="reconnect">
+      <p id="cold-start" b-show="cold_start">Rate at least five different movies to unlock your shortlist.</p>
+      <div id="recommendations" b-show="cold_start == false"><h2>Your next good film</h2>
+        <ol><li b-each:item="rec_lines" b-key="item"><span b-text="item"></span></li></ol>
+      </div>
+    </section>
+    <footer>Recommendations shaped by your ratings · AutAI-Fusion</footer>
+  </main>
+</view>
+
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f4f1e8; color: #1c2e2a; font-family: system-ui, sans-serif; }
+  .shell { max-width: 1100px; margin: 0 auto; padding: 56px 24px; }
+  header { padding: 12px 0 32px; }
+  .eyebrow { color: #57776a; font-size: 12px; font-weight: 700; letter-spacing: .18em; }
+  h1 { font-family: Georgia, serif; font-size: clamp(42px, 7vw, 78px); line-height: 1.05; font-weight: 400; letter-spacing: -.04em; margin: 20px 0; }
+  h2 { font-family: Georgia, serif; font-size: 28px; font-weight: 400; }
+  #notice { padding: 16px 20px; background: #e2eadf; border-left: 3px solid #3b6551; border-radius: 4px; }
+  .panel { background: #fffdf6; padding: 28px; margin-top: 24px; border: 1px solid #deded0; border-radius: 16px; }
+  label { display: block; font-size: 14px; font-weight: 600; margin: 18px 0 8px; }
+  input, select { font: inherit; padding: 12px; border: 1px solid #aebcae; border-radius: 8px; background: white; width: 100%; max-width: 420px; }
+  button { padding: 13px 20px; font: inherit; font-weight: 600; border: 1px solid #244b3a; background: #244b3a; color: white; border-radius: 8px; cursor: pointer; }
+  button:hover { background: #37664e; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #b38035; outline-offset: 3px; }
+  button.secondary { color: #244b3a; background: transparent; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0; }
+  .muted, footer { color: #65736b; font-size: 13px; line-height: 1.6; }
+  footer { margin-top: 32px; }
+  @media(max-width: 600px) { .shell { padding: 24px 16px; } .panel { padding: 20px; } }
+</style>
+
+when true { reside; };
