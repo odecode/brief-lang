@@ -10723,3 +10723,21 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Logical RHS evaluated before its guard (2026-10-22)
+
+Recommender I02 exposed `idx > 0 && items[idx-1]...` reading index -1. LLVM's
+ordinary BinaryOp path emitted both operands before register `and`/`or`; the
+loop-exit evaluator did likewise. The reference interpreter already skips the
+unneeded RHS. Minimal discriminators use runtime flags around a trapping/read
+RHS and count exactly-once writes for the required edge.
+
+The new logical CFG emitter branches before RHS emission, joins canonical i8
+values through explicit predecessor blocks, handles nested/terminating RHS
+paths, and supplies the exit evaluator's existing i64 boundary through shared
+adaptation. Specific AST arms precede the unchanged eager fallback; bitwise
+operations remain eager. Native -O0/-O2 and LLVM verifier regressions are in
+`logical_tests.rs`. Verification is recorded in the dated short-circuit plan.
+Conditional expression-block writes also require entry-slot discovery for locals
+and mutable native ABI parameters. Logical merges discard RHS-only pointer,
+state-pointer and last-value cache entries to preserve SSA dominance.

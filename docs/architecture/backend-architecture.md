@@ -4,6 +4,20 @@
 
 **Status:** Living document — updated as the backend evolves.
 
+2026-10-22: `logical.rs` owns LLVM `&&`/`||` evaluation control flow. Specific
+AST dispatch arms select the lazy path before either binary operand is emitted;
+other binary lowering remains unchanged. Dedicated constant/RHS predecessor
+blocks feed a canonical i8 phi, so nested RHS control flow needs no speculative
+loads or stack result slot. Terminating RHS edges contribute no fabricated value.
+The merge updates FunctionContext's current block for enclosing loop phis.
+Exit predicates share this lowering and widen the completed Bool at their i64
+boundary. Register-level bitwise operations keep their eager semantics.
+RHS-only pointer/state/last-value cache entries cannot survive the merge: retain
+only unchanged incoming entries, preserving invalidations. Expression-block
+mutations participate in entry-slot discovery. Mutable definition parameters use
+native ABI entry slots (including Float, Bool and pointers), with matching typed
+loads/stores, so skipping an assignment preserves the incoming parameter.
+
 ---
 
 ## 1. Core Architecture
