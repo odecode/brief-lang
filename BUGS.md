@@ -10651,3 +10651,10 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## read_file leaked descriptors after EOF and failure (FIXED 2026-10-21)
+
+The wrapper opened a descriptor and returned read_whole without closing it.
+Snapshot reuse would eventually exhaust descriptors. The owning wrapper now
+closes after either read outcome and preserves the original result. Native
+fs_read_lifecycle_gate reads 512 times with RLIMIT_NOFILE=64.

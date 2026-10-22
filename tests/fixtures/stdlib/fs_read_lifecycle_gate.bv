@@ -1,0 +1,23 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/os/fs.bv";
+let tick: Int = 0;
+node run [tick < 1][tick == 1] {
+    let path: String = "/tmp/briev-read-lifecycle-"+syscall(39) as String;
+    let written: Result<Int,Int> = write_file(path,"snapshot bytes");
+    let ok: Bool = is_ok(written);
+    foreach idx in 0..512 {
+        let result: Result<String,Int> = read_file(path);
+        when is_err(result) { ok = false; };
+        when is_ok(result) {
+            let text: String = unwrap(result);
+            when text != "snapshot bytes" { ok = false; };
+            Free#(((text as Data) as Int) as Ptr);
+        };
+    };
+    remove_file(path);
+    println!("repeated_reads_close_descriptors={}",ok);
+    when !ok { endprogram 1; };
+    tick = 1; endprogram;
+};

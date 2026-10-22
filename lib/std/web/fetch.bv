@@ -3,3 +3,23 @@
 // use the lower-level fetch with callbacks (future enhancement).
 
 frgn fetch(url: String) -> String : fetch_url from "glue/web/web.js";
+
+// 2026-10-21: all verbs share the existing synchronous text boundary. Empty
+// response means transport failure (HTTP errors retain their response body).
+frgn fetch_method(url: String, method: String, body: String, content_type: String) -> String from "glue/web/web.js";
+
+defn http_get(url: String) -> String {
+    term fetch_method(url,"GET","","");
+};
+
+defn http_post(url: String, body: String) -> String {
+    term fetch_method(url,"POST",body,"application/json");
+};
+
+defn http_put(url: String, body: String) -> String {
+    term fetch_method(url,"PUT",body,"application/json");
+};
+
+defn http_delete(url: String, body: String) -> String {
+    term fetch_method(url,"DELETE",body,"application/json");
+};
