@@ -934,7 +934,10 @@ impl LlvmBackend {
         val: &str,
     ) -> String {
         let r = self.fun.next_reg_with_prefix(prefix);
-        self.emit_inttoptr(out, indent, &r, &val);
+        // 2026-10-21: concat/tag helpers consume boxed i64 words, even on
+        // narrow targets. Adapt the fixed ABI before the pointer-width helper.
+        let address = self.adapt_from_i64(out, indent, val, &Type::int());
+        self.emit_inttoptr(out, indent, &r, &address);
         r
     }
 
@@ -1167,7 +1170,8 @@ impl LlvmBackend {
             } else {
                 let t = self.fun.gen_reg();
                 if param_ll == "ptr" {
-                    self.emit_inttoptr(out, indent, &t, &clean);
+                    let address = self.adapt_from_i64(out, indent, &clean, &Type::int());
+                    self.emit_inttoptr(out, indent, &t, &address);
                 } else {
                     writeln!(out, "{}{} = trunc i64 {} to {}", indent, t, clean, param_ll).ok();
                 }
@@ -1471,6 +1475,18 @@ impl LlvmBackend {
         self.is_protocol_member(ty, "Blob")
     }
 
+    /// 2026-10-21: composite values in pointer buffers use boxed words even
+    /// when their register handles are pointer-sized. Numeric refinements
+    /// retain native element widths; never classify a handle from LLVM width.
+    pub(super) fn is_composite_handle(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Tuple(_) | Type::Union(_) | Type::Function(_, _) | Type::Dyn(_) => true,
+            Type::Custom(name) | Type::Applied(name, _) => self.ctx.enum_handle_types.contains(name)
+                || self.ctx.struct_types.contains_key(name) || self.ctx.obj_types.contains(name),
+            _ => false,
+        }
+    }
+
     /// 2026-08-28 (String ABI fix, obj params): the base obj name when `ty`
     /// is a registered struct/obj type (`Custom` or `Applied`) — `None` for
     /// anything else. Used to gate the boxed-obj-param recovery arm (an i64
@@ -1518,7 +1534,7 @@ impl LlvmBackend {
             return reg.name.clone();
         }
         let p = self.fun.gen_reg();
-        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, p, reg.name).ok();
+        writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, p, self.llvm_type(&reg.ty), reg.name).ok();
         p
     }
 
@@ -2376,24 +2392,16 @@ impl LlvmBackend {
         if self.llvm_type(&reg.ty) == "i64" {
             return reg.name.clone();
         }
+        // 2026-10-21: integer-backed handles and numeric refinements share
+        // the boxed word boundary, even when they have no numeric protocol.
+        if self.llvm_type(&reg.ty).starts_with('i') {
+            return self.coerce_to_param_type(out, reg, "i64", indent).name;
+        }
         // 2026-07-26: Protocol-driven dispatch. No name matching.
         let ty = &reg.ty;
-        // Float protocol: convert float/double to i64
+        // Float protocol: preserve its bit representation at the boxed boundary.
         if self.is_protocol_member(ty, "Float") {
-            let maxbits = self.ctx.type_universe.as_ref()
-                .and_then(|u| ty.universe_key().and_then(|k| u.get(k)))
-                .map(|rt| rt.max_bits).unwrap_or(32);
-            if maxbits > 32 {
-                let tr = self.fun.gen_reg();
-                writeln!(out, "{}{} = bitcast double {} to i64", indent, tr, reg.name).ok();
-                return tr;
-            } else {
-                let tr = self.fun.gen_reg();
-                writeln!(out, "{}{} = bitcast float {} to i32", indent, tr, reg.name).ok();
-                let ze = self.fun.gen_reg();
-                writeln!(out, "{}{} = zext i32 {} to i64", indent, ze, tr).ok();
-                return ze;
-            }
+            return self.box_float_word(out, indent, reg);
         }
         // Bool protocol: zext i8 to i64
         if self.is_protocol_member(ty, "Bool") {
@@ -2438,6 +2446,24 @@ impl LlvmBackend {
             return reg.name.clone();
         }
         reg.name.clone()
+    }
+
+    // 2026-10-21: isolate the existing Float boxing path from integer/handle
+    // adaptation so each boundary remains independently auditable.
+    fn box_float_word(&mut self, out: &mut String, indent: &str, reg: &TypedRegister) -> String {
+        let ty = &reg.ty;
+        let maxbits = self.ctx.type_universe.as_ref()
+            .and_then(|u| ty.universe_key().and_then(|k| u.get(k)))
+            .map(|rt| rt.max_bits).unwrap_or(32);
+        let tr = self.fun.gen_reg();
+        if maxbits > 32 {
+            writeln!(out, "{}{} = bitcast double {} to i64", indent, tr, reg.name).ok();
+            return tr;
+        }
+        writeln!(out, "{}{} = bitcast float {} to i32", indent, tr, reg.name).ok();
+        let ze = self.fun.gen_reg();
+        writeln!(out, "{}{} = zext i32 {} to i64", indent, ze, tr).ok();
+        ze
     }
 
     /// Emit a getelementptr for a state field and return the GEP register name.

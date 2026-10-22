@@ -102,6 +102,15 @@ fn build_supported_ops() -> HashSet<String> {
         "AtomicLoad#", "AtomicStore#", "AtomicCas#", "AtomicXchg#",
         "AtomicAdd#", "Fence#",
     ] { set.insert(op.to_string()); }
+    // 2026-10-21: wasm uses LLVM's existing UTF-8 and declared collection
+    // lowering too. Rejecting these here prevented ordinary portable libraries
+    // from reaching that lowering. Keep OS-specific operations excluded; retire
+    // this list when portable intrinsic admission is shared by LLVM targets.
+    for op in &[
+        "CharCount#", "At#", "Slice#", "InsertAt#", "ExtractFrom#", "CopyFrom#",
+        "Append#", "Prepend#", "Count#", "Iter#", "Step#", "IsEnd#", "Current#",
+        "Capacity#", "Resize#", "EnsureCap#", "TrimCap#",
+    ] { set.insert(op.to_string()); }
     // Tier 3: Browser API (console, time, env queries — JS shim provides)
     for op in &[
         "PrintInt#", "PrintFloat#", "PrintChar#", "Print#",
@@ -113,6 +122,25 @@ fn build_supported_ops() -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_collection_calls_reach_wasm_lowering() {
+        let calls = ["CharCount#", "Count#", "At#", "Slice#", "InsertAt#",
+            "ExtractFrom#", "CopyFrom#", "Append#", "Prepend#", "Iter#",
+            "Step#", "IsEnd#", "Current#", "Capacity#", "Resize#", "EnsureCap#", "TrimCap#"];
+        let mut items = calls.iter().map(|name| TopLevel::Statement(Box::new(
+            Statement::Expression(Expr::Call((*name).into(), vec![Expr::Decimal(0)], None))
+        ))).collect();
+        assert!(normalize(&mut items, &mut TypeUniverse::new(), 32).is_ok());
+    }
+
+    #[test]
+    fn portable_collection_admission_keeps_os_boundary() {
+        let mut items = vec![TopLevel::Statement(Box::new(Statement::Expression(
+            Expr::Call("SysCall#".into(), vec![Expr::Decimal(0)], None)
+        )))];
+        assert!(normalize(&mut items, &mut TypeUniverse::new(), 32).is_err());
+    }
 
     fn make_type_def(name: &str, protocol: Option<&str>, slots: Vec<(&str, Type)>) -> TopLevel {
         use crate::ast::top::{TypeDef, TypeDefBody, TypeDefSlot};

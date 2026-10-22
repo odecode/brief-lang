@@ -438,12 +438,14 @@ impl GlueWebGenerator {
                 .collect::<String>()
         };
         let host_module_src = self.host_module_src.as_str();
+        let heap_runtime_js = include_str!("web_heap.js");
 
         format!(
             r#"// dom-shim.mjs — Auto-generated GLUE web runtime for {app_name}
 // Reads WASM linear memory at known state offsets.
 
 {host_fns_js}{host_module_src}
+{heap_runtime_js}
 export class WasmDomRuntime {{
   constructor(wasmBytes) {{
     this._handles = [null];
@@ -456,6 +458,7 @@ export class WasmDomRuntime {{
     this._viewEffects = new Map();
     this._instance = null;
     this._memory = null;
+    this._heap = createWebHeap(() => this._memory);
     this._generationOffset = {generation_offset};
     this._flushBufferOffset = {flush_buffer_offset};
     this._maxFlushEntries = {max_flush_entries};
@@ -492,6 +495,7 @@ export class WasmDomRuntime {{
 
   _buildImports() {{
     return {{
+      ...this._heap,
       __web_flush_state: (updatesPtr, count) => {{
         this._applyFlush(updatesPtr, count);
       }},
@@ -599,12 +603,9 @@ export class WasmDomRuntime {{
   }}
 
   _allocateStatic(size) {{
-    // Fallback: bump-allocate from a known free region.
-    // Overridden by the WASM module's malloc when available.
-    if (!this._heapPtr) this._heapPtr = 65536;
-    const ptr = this._heapPtr;
-    this._heapPtr += size;
-    return ptr;
+    // 2026-10-21: host strings share the allocator used by compiled code;
+    // no guessed free address may overlap the module's stack or globals.
+    return this._heap.malloc(size);
   }}
 
   _startRenderLoop() {{
@@ -780,7 +781,7 @@ export async function createApp(wasmBytes) {{
              const __sp = Number(BigInt.asUintN(32, BigInt(__word)));\
              const __len = Number(dv.getBigInt64(__sp, true));\
              const __bytes = new Uint8Array(this._memory.buffer, __sp + 8, __len);\
-             const item = String.fromCharCode(...__bytes);".to_string()
+             const item = new TextDecoder().decode(__bytes);".to_string()
         } else {
             "const item = Number(dv.getBigInt64(snapPtr + 8 + i * 8, true));".to_string()
         };
@@ -795,7 +796,7 @@ export async function createApp(wasmBytes) {{
              \x20         anchor.remove();\n\
              \x20         const itemBindings = {ibs_js};\n\
              \x20         const evalItem = (expr, item) => {{\n\
-             \x20           if (expr === {item_name:?}) return Boolean(item);\n\
+             \x20           if (expr === {item_name:?}) return item;\n\
              \x20           for (const op of [\"==\", \"!=\", \"<=\", \">=\", \"<\", \">\"]) {{\n\
              \x20             const i = expr.indexOf(op);\n\
              \x20             if (i < 0) continue;\n\
@@ -841,9 +842,9 @@ export async function createApp(wasmBytes) {{
               \x20               el2 = document.createElement(tagName);\n\
               \x20               el2.innerHTML = templateInner;\n\
               \x20               applyItem(el2, item);\n\
-              \x20               container.appendChild(el2);\n\
              \x20               rendered.set(key, el2);\n\
              \x20             }}\n\
+             \x20             container.appendChild(el2);\n\
              \x20           }}\n\
              \x20           for (const [key, el2] of rendered) {{\n\
              \x20             if (!seen.has(key)) {{\n\
@@ -956,7 +957,7 @@ export async function createApp(wasmBytes) {{
                 format!(
                     "this._registerViewEffect({handle}, (value) => {{\n\
                      \x20         const el = {el};\n\
-                     \x20         if (el) el.style.display = ({hidden} ? !({cond}) : ({cond})) ? 'none' : '';\n\
+                     \x20         if (el) el.style.display = ({hidden} ? !({cond}) : ({cond})) ? '' : 'none';\n\
                      \x20       }});",
                     hidden = if hidden { "true" } else { "false" },
                     cond = cond
@@ -1075,7 +1076,7 @@ export async function createApp(wasmBytes) {{
                     String::new()
                 } else {
                     let args: Vec<String> = params.iter().map(|(_, v)| v.clone()).collect();
-                    format!(", {}", args.join(", "))
+                    args.join(", ")
                 };
                 if *scope == crate::view_compiler::TriggerScope::Window {
                     format!(

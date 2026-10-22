@@ -76,6 +76,11 @@ pub(super) fn emit_web_flush_batch(backend: &mut LlvmBackend, out: &mut String, 
         })
         .unwrap_or_default();
     written.sort_unstable();
+    if let Some(writes) = backend.ctx.web_commit_writes.get(&txn_name) {
+        written.extend(writes.iter().filter_map(|name| backend.ctx.field_index_map.get(name).copied()));
+        written.sort_unstable();
+        written.dedup();
+    }
     if written.is_empty() {
         writeln!(out, "{}call void @__web_flush_state(i32 0, i32 0)", indent).ok();
         return;
@@ -350,10 +355,11 @@ fn emit_bare_term_stop(backend: &mut LlvmBackend, out: &mut String, indent: &str
 /// membership + the casting graph's LLVM width, so every Float-family type
 /// (Float, Float32, Float64, Double, user aliases) unboxes correctly, and a
 /// width the graph does not resolve as double/float is left untouched.
-/// Mirrors the boxed Float param-slot unbox in emit_expr.rs. Non-Float
-/// elements return the loaded i64 unchanged. To undo: bind `elem` directly
-/// at the destructure call site.
-fn unbox_tuple_float_element(
+/// Mirrors the boxed Float param-slot unbox in emit_expr.rs. 2026-10-21:
+/// non-Float elements use the shared unbox adapter too — otherwise a narrow
+/// Int or a String pointer was incorrectly bound to the raw i64 slot. To undo:
+/// only bind `elem` directly when its actual and declared representations agree.
+fn unbox_tuple_element(
     backend: &mut LlvmBackend,
     out: &mut String,
     indent: &str,
@@ -361,7 +367,7 @@ fn unbox_tuple_float_element(
     elem_ty: &Type,
 ) -> String {
     if !backend.is_protocol_member(elem_ty, "Float") {
-        return elem.to_string();
+        return backend.adapt_from_i64(out, indent, elem, elem_ty);
     }
     let native = match backend.llvm_type(elem_ty).as_str() {
         "double" => {
@@ -737,7 +743,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     _ => vec![Type::int(); names.len()],
                 };
                 let handle_p = backend.fun.gen_reg();
-                writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, handle_p, val.name).ok();
+                writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, handle_p, backend.ptr_int_ty(), val.name).ok();
                 for (i, n) in names.iter().enumerate() {
                     let slot = backend.fun.gen_reg();
                     writeln!(
@@ -749,7 +755,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     let elem = backend.fun.gen_reg();
                     writeln!(out, "{}{} = load i64, ptr {}", indent, elem, slot).ok();
                     let elem_ty = elem_tys.get(i).cloned().unwrap_or_else(Type::int);
-                    let bound = unbox_tuple_float_element(backend, out, indent, &elem, &elem_ty);
+                    let bound = unbox_tuple_element(backend, out, indent, &elem, &elem_ty);
                     backend.fun.let_bindings.insert(n.clone(), bound.clone());
                     backend.fun.let_binding_types.insert(n.clone(), elem_ty.clone());
                     backend.fun.let_original_types.insert(n.clone(), elem_ty);
@@ -916,7 +922,8 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 return TypedRegister { name: result, ty: Type::int() };
             }
 
-            let val = backend.emit_expr(out, rhs, indent);
+            let expected = match lhs { Expr::Identifier(name) => backend.resolve_id_type(name), _ => None };
+            let val = backend.emit_contextual_expr(out, rhs, expected.as_ref(), indent);
             match lhs {
                 Expr::Identifier(name) => {
                     // 2026-08-07 (object instance pools): a bare member
@@ -1247,6 +1254,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     if matches!(obj_reg.ty, Type::Ptr(_)) {
                         let idx_reg = backend.emit_expr(out, idx, indent);
                         let ptr = backend.fun.gen_reg();
+                        // Ptr fields retain the fixed i64 address-word ABI.
                         writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, ptr, obj_reg.name).ok();
                         let gep = backend.fun.gen_reg();
                         let offset = backend.fun.gen_reg();
@@ -1278,7 +1286,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                             Type::Ptr(inner) => backend.llvm_type(inner),
                             _ => "i64".to_string(),
                         };
-                        let scalar_pointee = matches!(
+                        let scalar_pointee = !matches!(&obj_reg.ty, Type::Ptr(inner) if backend.is_composite_handle(inner)) && matches!(
                             elem_llvm.as_str(),
                             "i8" | "i16" | "i32" | "i64" | "float" | "double"
                         );
@@ -1371,7 +1379,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     };
                     let offset = backend.lookup_field_offset(&obj_key, name);
                     let ptr = backend.fun.gen_reg();
-                    writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, ptr, obj_reg.name).ok();
+                    backend.emit_inttoptr(out, indent, &ptr, &obj_reg.name);
                     let gep = backend.fun.gen_reg();
                     writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, gep, ptr, offset).ok();
                     // 2026-08-13 (Phase 5): an `atomic` state-field store.
@@ -1794,7 +1802,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // exits (term is a successful completion).
             backend.flush_defer_cleanup(out, indent);
             if let Some(val) = val {
-                let mut reg = backend.emit_expr(out, val, indent);
+                let expected = backend.ctx.defn_return_types.get(&backend.fun.txn_name)
+                    .and_then(|types| types.first()).cloned();
+                let mut reg = backend.emit_contextual_expr(out, val, expected.as_ref(), indent);
                 // 2026-08-01 (C3): a boxed Float param returned from a defn
                 // (`term v`) is an i64 handle — unbox through the float cache so
                 // `ret float` receives the actual float, not the handle.
@@ -1817,7 +1827,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // branches to post (convergence loop). The 'ret' is at done:.
                     let val_ty = backend.llvm_type(&reg.ty);
                     let store_name = if val_ty != backend.fun.fn_ret_ty {
-                        if val_ty == "i64" && backend.fun.fn_ret_ty == "ptr" {
+                        if val_ty.starts_with('i') && backend.fun.fn_ret_ty.starts_with('i') {
+                            let target = backend.fun.fn_ret_ty.clone();
+                            backend.coerce_to_param_type(out, &reg, &target, indent).name
+                        } else if val_ty == "i32" && backend.fun.fn_ret_ty == "ptr" {
+                            let target = backend.fun.fn_ret_ty.clone();
+                            backend.coerce_to_param_type(out, &reg, &target, indent).name
+                        } else if val_ty == "i64" && backend.fun.fn_ret_ty == "ptr" {
                             let c = backend.fun.gen_reg();
                             writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, c, reg.name).ok();
                             c
@@ -1862,7 +1878,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         // 2026-07-20: Insert type conversion when the expression type doesn't
                         // match the function's declared return type (e.g., SysCall# returns i64
                         // but function returns ptr → need inttoptr).
-                        if val_ty == "i64" && backend.fun.fn_ret_ty == "ptr" {
+                        if val_ty.starts_with('i') && backend.fun.fn_ret_ty.starts_with('i') {
+                            let target = backend.fun.fn_ret_ty.clone();
+                            backend.coerce_to_param_type(out, &reg, &target, indent).name
+                        } else if val_ty == "i32" && backend.fun.fn_ret_ty == "ptr" {
+                            let target = backend.fun.fn_ret_ty.clone();
+                            backend.coerce_to_param_type(out, &reg, &target, indent).name
+                        } else if val_ty == "i64" && backend.fun.fn_ret_ty == "ptr" {
                             let c = backend.fun.gen_reg();
                             writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, c, reg.name).ok();
                             c
@@ -2160,7 +2182,11 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 Expr::Range { start, end, inclusive } => {
                     let s = backend.emit_expr(out, start, indent);
                     let e = backend.emit_expr(out, end, indent);
-                    IterKind::Counter { init: s.name, bound: e.name, inclusive: *inclusive }
+                    // 2026-10-21: internal loop slots stay i64, but range
+                    // bounds and exposed items keep their declared widths.
+                    let init = backend.adapt_to_i64(out, indent, &s);
+                    let bound = backend.adapt_to_i64(out, indent, &e);
+                    IterKind::Counter { init, bound, inclusive: *inclusive }
                 }
                 // 2026-08-12 (Iterable protocol): a POOLED instance
                 // (`let m = spawn HashMap(0)`) unpacks into columns — the
@@ -2232,10 +2258,12 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 IterKind::OpCollection { count, .. } => {
                     let zero = backend.fun.gen_reg();
                     writeln!(out, "{}{} = add i64 0, 0", indent, zero).ok();
-                    (zero, count.clone(), "slt")
+                    let count = backend.adapt_to_i64(out, indent, &TypedRegister { name: count.clone(), ty: Type::int() });
+                    (zero, count, "slt")
                 }
                 IterKind::Tier1Cursor { iter_reg, .. } => {
-                    (iter_reg.clone(), String::new(), "")
+                    let cursor = backend.adapt_to_i64(out, indent, &TypedRegister { name: iter_reg.clone(), ty: Type::int() });
+                    (cursor, String::new(), "")
                 }
                 IterKind::VectorField { count, .. } => {
                     let zero = backend.fun.gen_reg();
@@ -2251,7 +2279,8 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             if let IterKind::Tier1Cursor { list, .. } = &iter {
                 // Tier 1: exit when the cursor is past the end — the IsEnd op.
                 let cur_tmp = "__foreach_cur".to_string();
-                backend.fun.let_bindings.insert(cur_tmp.clone(), cur.clone());
+                let cursor = backend.adapt_from_i64(out, indent, &cur, &Type::int());
+                    backend.fun.let_bindings.insert(cur_tmp.clone(), cursor);
                 backend.fun.let_binding_types.insert(cur_tmp.clone(), Type::int());
                 backend.fun.let_original_types.insert(cur_tmp.clone(), Type::int());
                 let arg = Expr::Identifier(cur_tmp);
@@ -2275,7 +2304,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             writeln!(out, "{}{}:", indent, body_lbl).ok();
             // Derive the item value for this iteration.
             let item_reg = match &iter {
-                IterKind::Counter { .. } => cur.clone(),
+                IterKind::Counter { .. } => backend.adapt_from_i64(out, indent, &cur, &Type::int()),
                 // 2026-08-12 (Iterable protocol, Tier 2): the item is the
                 // collection's `op At(i)` member call — structural iteration,
                 // never a hardcoded layout.
@@ -2285,13 +2314,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // is i64 but the At INDEX param is Int (i32 on wasm32) —
                     // truncate before the call so the member body's i32 index
                     // matches (a raw i64 arg typed Int produced `sext i32 <i64>`).
-                    let cur_i = if backend.ctx.int_bits == 32 {
-                        let t = backend.fun.gen_reg();
-                        writeln!(out, "{}{} = trunc i64 {} to i32", indent, t, cur).ok();
-                        t
-                    } else {
-                        cur.clone()
-                    };
+                    let cur_i = backend.adapt_from_i64(out, indent, &cur, &Type::int());
                     backend.fun.let_bindings.insert(counter_tmp.clone(), cur_i);
                     backend.fun.let_binding_types.insert(counter_tmp.clone(), Type::int());
                     backend.fun.let_original_types.insert(counter_tmp.clone(), Type::int());
@@ -2314,7 +2337,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         && at.ty == Type::int()
                     {
                         let p = backend.fun.gen_reg();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, p, at.name).ok();
+                        backend.emit_inttoptr(out, indent, &p, &at.name);
                         at.name = p;
                     }
                     at.name
@@ -2323,7 +2346,8 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 // collection's `op Current(cur)` member call at the cursor.
                 IterKind::Tier1Cursor { list, element_ty, .. } => {
                     let cur_tmp = "__foreach_cur".to_string();
-                    backend.fun.let_bindings.insert(cur_tmp.clone(), cur.clone());
+                    let cursor = backend.adapt_from_i64(out, indent, &cur, &Type::int());
+                    backend.fun.let_bindings.insert(cur_tmp.clone(), cursor);
                     backend.fun.let_binding_types.insert(cur_tmp.clone(), Type::int());
                     backend.fun.let_original_types.insert(cur_tmp.clone(), Type::int());
                     let arg = Expr::Identifier(cur_tmp);
@@ -2334,7 +2358,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         && item.ty == Type::int()
                     {
                         let p = backend.fun.gen_reg();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, p, item.name).ok();
+                        backend.emit_inttoptr(out, indent, &p, &item.name);
                         item.name = p;
                     }
                     item.name
@@ -2347,7 +2371,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     let raw = backend.fun.gen_reg();
                     writeln!(out, "{}{} = load i8, ptr {}", indent, raw, elem_p).ok();
                     let elem = backend.fun.gen_reg();
-                    writeln!(out, "{}{} = zext i8 {} to i64", indent, elem, raw).ok();
+                    writeln!(out, "{}{} = zext i8 {} to {}", indent, elem, raw, backend.llvm_type(&Type::int())).ok();
                     elem
                 }
                 // 2026-08-14 (String unification): `String` iterates CHARs.
@@ -2364,19 +2388,23 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // int64_t* — the BITS are the same address either way.
                     let slot_i64 = backend.fun.gen_reg();
                     if backend.ctx.defn_params.contains_key("briev_str_next_char") {
-                        writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, slot_i64, slot).ok();
+                        let int_ty = backend.llvm_type(&Type::int());
+                        writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, slot_i64, slot, int_ty).ok();
                         // 2026-09-23 (stateless-defn mechanism): briev_str_next_char
                         // is stateless (Load#/byte_raw) — pass %state only when the
                         // defn takes it.
                         let st = if backend.ctx.defn_takes_state("briev_str_next_char") { "ptr %state, " } else { "" };
-                        writeln!(out, "{}{} = call i64 @briev_str_next_char({}ptr {}, i64 {})",
-                            indent, cp, st, ptr, slot_i64).ok();
+                        writeln!(out, "{}{} = call {} @briev_str_next_char({}ptr {}, {} {})",
+                            indent, cp, int_ty, st, ptr, int_ty, slot_i64).ok();
                     } else {
                         writeln!(out, "{}{} = call i64 @briev_str_next_char(ptr {}, ptr {})",
                             indent, cp, ptr, slot).ok();
                     }
                     let ch = backend.fun.gen_reg();
-                    writeln!(out, "{}{} = trunc i64 {} to i32", indent, ch, cp).ok();
+                    let width = if backend.ctx.defn_params.contains_key("briev_str_next_char") { backend.ctx.int_bits } else { 64 };
+                    let op = if width > 32 { "trunc" } else { "zext" };
+                    if width == 32 { writeln!(out, "{}{} = add i32 {}, 0", indent, ch, cp).ok(); }
+                    else { writeln!(out, "{}{} = {} i{} {} to i32", indent, ch, op, width, cp).ok(); }
                     ch
                 }
                 IterKind::VectorField { gep, element_ty, .. } => {
@@ -2455,13 +2483,14 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // 2026-08-12 (Iterable protocol, Tier 1): advance the
                     // cursor via the collection's `op Step(cur)` member.
                     let cur_tmp = "__foreach_cur".to_string();
-                    backend.fun.let_bindings.insert(cur_tmp.clone(), cur.clone());
+                    let cursor = backend.adapt_from_i64(out, indent, &cur, &Type::int());
+                    backend.fun.let_bindings.insert(cur_tmp.clone(), cursor);
                     backend.fun.let_binding_types.insert(cur_tmp.clone(), Type::int());
                     backend.fun.let_original_types.insert(cur_tmp.clone(), Type::int());
                     let arg = Expr::Identifier(cur_tmp);
                     let out_tmp = backend.fun.gen_reg();
                     let step = backend.emit_method_call(out, &out_tmp, list, "Step", &[arg], &[], indent);
-                    step.name
+                    backend.adapt_to_i64(out, indent, &step)
                 } else {
                     let n = backend.fun.gen_reg();
                     writeln!(out, "{}{} = add i64 {}, 1", indent, n, cur).ok();
@@ -2590,6 +2619,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // through the condition chain into the merge.
             // To undo: delete this arm (restores the silent drop).
             let scrut = backend.emit_expr(out, scrutinee, indent);
+            let scrut = TypedRegister { name: backend.adapt_to_i64(out, indent, &scrut), ty: scrut.ty };
             let counter = backend.fun.txn_counter;
             backend.fun.txn_counter += 1;
             let merge = format!(".smt_end_{}", counter);

@@ -369,6 +369,10 @@ pub atomic_fields: std::collections::HashMap<String, String>,
     /// (`obj Stack<T, N>` → ["T", "N"]). Used to substitute a receiver's
     /// concrete type args into the generic slots/members (monomorphization).
     pub obj_type_params: HashMap<String, Vec<String>>,
+    /// 2026-10-21: retain concrete type arguments beside their display key.
+    /// Member substitution must never reconstruct types from selected names.
+    pub mono_types: HashMap<String, Type>,
+    pub web_commit_writes: HashMap<String, HashSet<String>>,
     pub enum_types: HashMap<String, EnumDefinition>,
     pub cell_defs: HashMap<String, CellDef>,
     pub cell_state_types: HashMap<String, (HashMap<String, usize>, Vec<String>)>,
@@ -663,6 +667,8 @@ impl CompilerContext {
             dyn_concrete_tag_of: HashMap::new(),
             dyn_collection_info: std::collections::HashMap::new(),
             obj_type_params: HashMap::new(),
+            mono_types: HashMap::new(),
+            web_commit_writes: HashMap::new(),
             enum_types: HashMap::new(),
             cell_defs: HashMap::new(),
             cell_state_types: HashMap::new(),

@@ -10791,3 +10791,67 @@ declarations are added beside existing f32/f64 declarations. Integer Abs and
 the legacy fallback remain unchanged. Two unit tests and native
 tests/fixtures/stdlib/float_abs_gate.bv pin the behavior. Prepared separately
 on fix/float-abs-intrinsic from main; no interpreter changes.
+
+## Nested object allocation smaller than finalized fields (FIXED 2026-10-21)
+
+Full-model snapshot construction allocated ServerModel with an early 212-byte
+aggregate size but emitted its last field at byte 332, corrupting the heap.
+Valgrind pinned invalid stores to model_load_path. Ordinary object allocation
+now covers the finalized field extent and preserves larger declared padding;
+packed/union paths are unchanged. The unit gate intentionally supplies stale
+aggregate metadata; native snapshot round-trip and refresh gates verify the
+real trigger. Remove the extent guard only after nested registration finalizes
+aggregate metadata consistently with every member offset.
+
+## read_file leaked descriptors after EOF and failure (FIXED 2026-10-21)
+
+The wrapper opened a descriptor and returned read_whole without closing it.
+Snapshot reuse would eventually exhaust descriptors. The owning wrapper now
+closes after either read outcome and preserves the original result. Native
+fs_read_lifecycle_gate reads 512 times with RLIMIT_NOFILE=64.
+
+## Full similarity cache repeatedly recomputed prerequisites (FIXED 2026-10-21)
+
+Each pair's imputed-union PCC recursively recalculated base PCC and missing
+ratings. The full 943/1682/100000 startup exceeded 37 minutes before cancellation.
+Application-level prepared stages reuse base pairs and imputed cells while
+retaining the exact original union/accumulation order. Full startup now reaches
+readiness in 11.8–15.3 seconds in development checks; fresh persisted startup
+takes 0.40–0.47 seconds. See the cache-reuse plan for same-geometry reference
+gates and timing limitations. Transactional revisions and off-loop workers fix
+unconditional startup rebuilding and synchronous refresh stalls at the same time.
+
+## Print macro inside foreach can reach codegen unresolved (OPEN 2026-10-21)
+
+A diagnostic println! inside cache_full_reference_gate's foreach survived the
+print plugin and reached the existing backend rejection. print_plugin::walk_stmt
+does not visit Foreach bodies. The numeric gate uses a final aggregate result
+instead; recommender transport/cache behavior does not depend on loop printing.
+Repair belongs in the print plugin's traversal, not a permissive backend fallback.
+## Browser target widths and persistent state boundaries (FIXED 2026-10-22)
+
+The recommender's generated WASM exposed native-register/boxed-payload width
+mismatches in calls, collections, closures, tuples, enums and pointer indexing.
+Shared lowering boundaries now adapt the target representation explicitly;
+native 64-bit boxed storage remains intact. Portable JSON/formatting uses an
+explicit Int64 accumulator and browser-safe imports. The UTF-8 character-to-
+String allocation includes its full header and maximum payload. Actual WASM JSON,
+heap and collection snapshot gates cover the application path.
+
+Initialized collection objects could retain init_state stack addresses, and view
+materializers had a fixed 1024-word buffer. Both empty/seeded state allocations
+now outlive initialization, and snapshots resize to cardinality. The collection
+fixture verifies Unicode, 1100 elements, reuse and reset. Rendering now decodes
+UTF-8 values and reconciles current order; helper-call writes invalidate views.
+Window-event parsing accepts hyphenated event names. Host behavioral gates cover
+HTTP errors, channel isolation, bounded queues and timer/socket cleanup.
+
+## Nested lexical types lost during operator elaboration (FIXED 2026-10-22)
+
+`foreach index in 0..n { result += [index as String]; }` lost the loop element
+binding during elaboration and emitted raw addition of collection handles.
+Binding the element also exposed missing enum payload bindings in enclosing
+match arms. Elaboration now consumes the checker's existing iterable and enum
+payload type authorities, including generic substitution, and restores lexical
+scope afterward. Two unit regressions and the generated-WASM collection fixture
+pin declared concatenation through both forms.

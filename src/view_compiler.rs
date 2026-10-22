@@ -1497,7 +1497,7 @@ if attr.starts_with("b-text") {
         let after = &tag_lower[attr_idx + attr_name.len()..];
 
         if after.starts_with(':') {
-            let end = after[1..].find(|c: char| !c.is_alphanumeric() && c != '_')?;
+            let end = after[1..].find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')?;
             Some(after[1..end + 1].to_string())
         } else {
             None

@@ -1608,7 +1608,10 @@ impl LlvmBackend {
             if let Some(empty_member) = empty_member {
                 let size = self.struct_type_size(&type_key);
                 let inst = self.fun.gen_reg();
-                writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+                // 2026-10-21: state retains this instance after init_state
+                // returns. Heap storage is required just like escaping object
+                // literals; a stack instance leaves collection Count/At dangling.
+                writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
                 let addr = self.fun.gen_reg();
                 let hw = format!("i{}", self.ctx.int_bits);
                 writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, addr, inst, hw).ok();
@@ -1645,7 +1648,9 @@ impl LlvmBackend {
         // Allocate the instance storage and pass its address as `self`.
         let size = self.struct_type_size(&type_key);
         let inst = self.fun.gen_reg();
-        writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+        // 2026-10-21: the initialized handle escapes into a persistent State
+        // field, so its storage must outlive the initialization call frame.
+        writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
         let addr = self.fun.gen_reg();
         // 2026-08-11 (wasm32 obj-member fix): obj instance handles are
         // i{int_bits} (i32 on wasm32), not hardcoded i64.
@@ -2667,6 +2672,7 @@ impl LlvmBackend {
             base,
             args.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join(", ")
         );
+        self.ctx.mono_types.insert(key.clone(), Type::Applied(base.to_string(), args.to_vec()));
         if !self.ctx.struct_types.contains_key(&key) {
             let subst = self.mono_subst(base, args);
             let slots = self.ctx.struct_types.get(base).cloned().unwrap_or_default()
@@ -3482,6 +3488,10 @@ impl LlvmBackend {
     pub(super) fn emit_definition(&mut self, out: &mut String, d: &crate::ast::Definition, needs_state: bool) {
         self.fun.pending_cleanup.clear();
         self.fun.clear_locals();
+        // 2026-10-21: a definition owns its commit context. A specialization
+        // emitted after a transaction must not inherit that transaction's web
+        // write set and reference an absent state parameter.
+        self.fun.txn_name = d.name.clone();
         // 2026-10-16 (term-semantics plan §1): bare `term;` in this defn is
         // P-gated against the defn's postcondition.
         self.fun.item_post = Some(d.contract.post_condition.clone());
@@ -3651,7 +3661,10 @@ impl LlvmBackend {
             // to the default List arena path, causing realloc on non-heap memory.
             self.fun.let_original_types.insert(n.clone(), t.clone());
             if self.is_boxed_int_type(t) {
-                self.fun.let_binding_types.insert(n.clone(), Type::int());
+                // 2026-10-21: the box has a fixed physical width even when
+                // the target's flexible Int is narrower. Semantic type stays
+                // in let_original_types for protocol dispatch and unboxing.
+                self.fun.let_binding_types.insert(n.clone(), Type::Bits(64));
             } else {
                 self.fun.let_binding_types.insert(n.clone(), t.clone());
             }

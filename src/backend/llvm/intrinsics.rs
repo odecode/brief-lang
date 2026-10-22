@@ -29,6 +29,15 @@ pub fn emit_intrinsic_call(
 ) -> BTypedRegister {
     // Special-case intrinsics that don't fit the template pattern
     match name {
+        // 2026-10-21: captured process values are flexible Ints. On narrow
+        // targets, the historical i64 register disagreed with its declared
+        // type at every caller. Keep the existing 64-bit emission unchanged.
+        "Environ#" if backend.ctx.int_bits != 64 =>
+            return emit_captured_pointer(backend, out, "__briev_environ", indent),
+        "Args#" if backend.ctx.int_bits != 64 =>
+            return emit_captured_pointer(backend, out, "__briev_argv", indent),
+        "Argc#" if backend.ctx.int_bits != 64 =>
+            return emit_captured_argc(backend, out, indent),
         "Malloc#" => return emit_malloc(backend, out, v, args, indent),
         // 2026-08-12 (Iterable protocol): the UTF8 CHAR count of a String —
         // the scan (a computed property, so an intrinsic; `.^Length` is the
@@ -407,10 +416,7 @@ pub fn emit_intrinsic_call(
         if op_name == "Count" && backend.is_string_operand(&arg_regs[0].ty) {
             // `Count#` on a String operand = its CHAR count (the element
             // count of Iterable<Char>), not a declared `op Count`.
-            let p = backend.string_ptr(out, indent, &arg_regs[0]);
-            writeln!(out, "{}{} = call i64 @briev_char_len({}ptr {})", indent, v,
-            if backend.ctx.defn_takes_state("briev_char_len") { "ptr %state, " } else { "" }, p).ok();
-            return BTypedRegister { name: v.to_string(), ty: Type::int() };
+            return emit_string_count(backend, out, v, &arg_regs[0], indent);
         }
         if !args.is_empty() {
             let recv = &args[0];
@@ -519,6 +525,54 @@ pub(crate) fn template_for_op(op_name: &str, llvm_ty: &str, bytes: u64) -> Optio
     }
 }
 
+fn emit_captured_pointer(backend: &mut LlvmBackend, out: &mut String, global: &str, indent: &str) -> BTypedRegister {
+    let pointer = backend.fun.gen_reg();
+    let value = backend.fun.gen_reg();
+    let ty = format!("i{}", backend.ctx.int_bits);
+    writeln!(out, "{indent}{pointer} = load ptr, ptr @{global}").ok();
+    writeln!(out, "{indent}{value} = ptrtoint ptr {pointer} to {ty}").ok();
+    BTypedRegister { name: value, ty: Type::int() }
+}
+
+fn emit_captured_argc(backend: &mut LlvmBackend, out: &mut String, indent: &str) -> BTypedRegister {
+    let count = backend.fun.gen_reg();
+    writeln!(out, "{indent}{count} = load i32, ptr @__briev_argc").ok();
+    if backend.ctx.int_bits == 32 { return BTypedRegister { name: count, ty: Type::int() }; }
+    let value = backend.fun.gen_reg();
+    let ty = format!("i{}", backend.ctx.int_bits);
+    writeln!(out, "{indent}{value} = trunc i32 {count} to {ty}").ok();
+    BTypedRegister { name: value, ty: Type::int() }
+}
+
+#[cfg(test)]
+mod captured_process_tests {
+    use super::*;
+
+    #[test]
+    fn captured_values_use_the_target_int_width() {
+        for bits in [8, 16, 32] {
+            for name in ["Environ#", "Args#", "Argc#"] {
+                let mut backend = LlvmBackend::new().with_int_bits(bits);
+                let mut out = String::new();
+                emit_intrinsic_call(&mut backend, &mut out, "%value", name, &[], None, "  ");
+                assert!(!out.contains("to i64"), "{name}: {out}");
+                assert!(!out.contains("zext"), "{name}: {out}");
+                assert!(bits == 32 && name == "Argc#" || out.contains(&format!("to i{bits}")), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_values_keep_the_existing_64_bit_lowering() {
+        for name in ["Environ#", "Args#", "Argc#"] {
+            let mut backend = LlvmBackend::new();
+            let mut out = String::new();
+            emit_intrinsic_call(&mut backend, &mut out, "%value", name, &[], None, "  ");
+            assert!(out.contains("to i64"), "{name}: {out}");
+        }
+    }
+}
+
 fn float_abs_template(llvm_type: &str) -> Option<String> {
     let suffix = match llvm_type {
         "half" => "f16",
@@ -567,6 +621,24 @@ fn emit_arg(backend: &mut LlvmBackend, out: &mut String, arg: &Expr, indent: &st
     backend.emit_expr(out, arg, indent).name
 }
 
+fn emit_i64_arg(backend: &mut LlvmBackend, out: &mut String, arg: &Expr, indent: &str) -> String {
+    let value = backend.emit_expr(out, arg, indent);
+    backend.adapt_to_i64(out, indent, &value)
+}
+
+// 2026-10-21: collection bridges use declared Briev signatures when present;
+// the fallback C runtime retains its fixed word ABI. Replace only with a
+// unified runtime declaration registry, never a target-specific symbol rule.
+fn call_collection_resize(backend: &mut LlvmBackend, out: &mut String, handle: &str, capacity: &str, indent: &str) {
+    let result = backend.fun.gen_reg();
+    if backend.ctx.defn_params.contains_key("coll_resize") {
+        let args = [handle, capacity].map(|name| BTypedRegister { name: name.to_string(), ty: Type::Bits(64) });
+        backend.finish_user_call(out, &result, "coll_resize", &args, indent);
+        return;
+    }
+    writeln!(out, "{indent}{result} = call i64 @__briev_coll_resize(i64 {handle}, i64 {capacity})").ok();
+}
+
 /// 2026-08-10: Truncate an i64-valued Int intrinsic result to the target int
 /// width (i{int_bits}). C-runtime intrinsics (Now#, syscall, sysconf, atol)
 /// return i64, but an Int-typed register is i{int_bits} (i32 on wasm32) — an
@@ -597,7 +669,16 @@ fn emit_char_count(
         return BTypedRegister { name: v.to_string(), ty: Type::int() };
     }
     let reg = backend.emit_expr(out, &args[0], indent);
+    emit_string_count(backend, out, v, &reg, indent)
+}
+
+// 2026-10-21: Count# and CharCount# share one declared-runtime boundary;
+// a wasm32 Briev implementation returns i32, while the C fallback returns i64.
+fn emit_string_count(backend: &mut LlvmBackend, out: &mut String, v: &str, reg: &BTypedRegister, indent: &str) -> BTypedRegister {
     let p = backend.string_ptr(out, indent, &reg);
+    if backend.ctx.defn_params.contains_key("briev_char_len") {
+        return backend.finish_user_call(out, v, "briev_char_len", &[BTypedRegister { name: p, ty: Type::string() }], indent);
+    }
     writeln!(out, "{}{} = call i64 @briev_char_len({}ptr {})", indent, v,
             if backend.ctx.defn_takes_state("briev_char_len") { "ptr %state, " } else { "" }, p).ok();
     let narrowed = narrow_int_result(backend, out, v, indent);
@@ -1258,12 +1339,10 @@ fn emit_resize(
     backend: &mut LlvmBackend, out: &mut String, v: &str,
     args: &[Expr], indent: &str,
 ) -> BTypedRegister {
-    let h = emit_arg(backend, out, &args[0], indent);
-    let cap = emit_arg(backend, out, &args[1], indent);
+    let h = emit_i64_arg(backend, out, &args[0], indent);
+    let cap = emit_i64_arg(backend, out, &args[1], indent);
     let call = backend.fun.gen_reg();
-    let rsym = bridge_symbol(backend, "coll_resize", "__briev_coll_resize");
-    writeln!(out, "{}{} = call i64 @{}({}i64 {}, i64 {})", indent, call, &rsym,
-            if backend.ctx.defn_takes_state(&rsym) { "ptr %state, " } else { "" }, h, cap).ok();
+    call_collection_resize(backend, out, &h, &cap, indent);
     let _ = call;
     writeln!(out, "{}{} = add i64 0, 0", indent, v).ok();
     BTypedRegister { name: v.to_string(), ty: Type::void() }
@@ -1275,8 +1354,8 @@ fn emit_ensure_cap(
     backend: &mut LlvmBackend, out: &mut String, v: &str,
     args: &[Expr], indent: &str,
 ) -> BTypedRegister {
-    let h = emit_arg(backend, out, &args[0], indent);
-    let n = emit_arg(backend, out, &args[1], indent);
+    let h = emit_i64_arg(backend, out, &args[0], indent);
+    let n = emit_i64_arg(backend, out, &args[1], indent);
     let p = backend.fun.gen_reg();
     let cap_gep = backend.fun.gen_reg();
     let cur_cap = backend.fun.gen_reg();
@@ -1291,10 +1370,8 @@ fn emit_ensure_cap(
     writeln!(out, "{}{} = icmp ult i64 {}, {}", indent, cmp, cur_cap, n).ok();
     writeln!(out, "{}{} = add i64 0, 0", indent, grow).ok();
     writeln!(out, "{}{} = select i1 {}, i64 {}, i64 {}", indent, after, cmp, n, cur_cap).ok();
-    let rsym = bridge_symbol(backend, "coll_resize", "__briev_coll_resize");
-    writeln!(out, "{}{} = call i64 @{}({}i64 {}, i64 {})", indent, target, &rsym,
-            if backend.ctx.defn_takes_state(&rsym) { "ptr %state, " } else { "" }, h, after).ok();
-    writeln!(out, "{}{} = add i64 {}, 0", indent, call, target).ok();
+    call_collection_resize(backend, out, &h, &after, indent);
+
     let _ = (grow, call);
     writeln!(out, "{}{} = add i64 0, 0", indent, v).ok();
     BTypedRegister { name: v.to_string(), ty: Type::void() }
@@ -1306,7 +1383,7 @@ fn emit_trim_cap(
     backend: &mut LlvmBackend, out: &mut String, v: &str,
     args: &[Expr], indent: &str,
 ) -> BTypedRegister {
-    let h = emit_arg(backend, out, &args[0], indent);
+    let h = emit_i64_arg(backend, out, &args[0], indent);
     let p = backend.fun.gen_reg();
     let len_gep = backend.fun.gen_reg();
     let len = backend.fun.gen_reg();
@@ -1314,9 +1391,7 @@ fn emit_trim_cap(
     writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, p, h).ok();
     writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 16", indent, len_gep, p).ok();
     writeln!(out, "{}{} = load i64, ptr {}", indent, len, len_gep).ok();
-    let rsym = bridge_symbol(backend, "coll_resize", "__briev_coll_resize");
-    writeln!(out, "{}{} = call i64 @{}({}i64 {}, i64 {})", indent, call, &rsym,
-            if backend.ctx.defn_takes_state(&rsym) { "ptr %state, " } else { "" }, h, len).ok();
+    call_collection_resize(backend, out, &h, &len, indent);
     let _ = call;
     writeln!(out, "{}{} = add i64 0, 0", indent, v).ok();
     BTypedRegister { name: v.to_string(), ty: Type::void() }
