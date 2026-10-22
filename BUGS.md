@@ -10651,3 +10651,42 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Nested object allocation smaller than finalized fields (FIXED 2026-10-21)
+
+Full-model snapshot construction allocated ServerModel with an early 212-byte
+aggregate size but emitted its last field at byte 332, corrupting the heap.
+Valgrind pinned invalid stores to model_load_path. Ordinary object allocation
+now covers the finalized field extent and preserves larger declared padding;
+packed/union paths are unchanged. The unit gate intentionally supplies stale
+aggregate metadata; native snapshot round-trip and refresh gates verify the
+real trigger. Remove the extent guard only after nested registration finalizes
+aggregate metadata consistently with every member offset.
+
+## Browser target widths and persistent state boundaries (FIXED 2026-10-22)
+
+The recommender's generated WASM exposed native-register/boxed-payload width
+mismatches in calls, collections, closures, tuples, enums and pointer indexing.
+Shared lowering boundaries now adapt the target representation explicitly;
+native 64-bit boxed storage remains intact. Portable JSON/formatting uses an
+explicit Int64 accumulator and browser-safe imports. The UTF-8 character-to-
+String allocation includes its full header and maximum payload. Actual WASM JSON,
+heap and collection snapshot gates cover the application path.
+
+Initialized collection objects could retain init_state stack addresses, and view
+materializers had a fixed 1024-word buffer. Both empty/seeded state allocations
+now outlive initialization, and snapshots resize to cardinality. The collection
+fixture verifies Unicode, 1100 elements, reuse and reset. Rendering now decodes
+UTF-8 values and reconciles current order; helper-call writes invalidate views.
+Window-event parsing accepts hyphenated event names. Host behavioral gates cover
+HTTP errors, channel isolation, bounded queues and timer/socket cleanup.
+
+## Nested lexical types lost during operator elaboration (FIXED 2026-10-22)
+
+`foreach index in 0..n { result += [index as String]; }` lost the loop element
+binding during elaboration and emitted raw addition of collection handles.
+Binding the element also exposed missing enum payload bindings in enclosing
+match arms. Elaboration now consumes the checker's existing iterable and enum
+payload type authorities, including generic substitution, and restores lexical
+scope afterward. Two unit regressions and the generated-WASM collection fixture
+pin declared concatenation through both forms.

@@ -2251,8 +2251,9 @@ mod json_interpreter_tests {
             "import \"std/collections.bv\";\nimport \"std/iterator.bv\";\nimport \"std/json\";",
         );
         let s = Value::bits(b"[1,2,3]".to_vec());
-        let Ok(Value::Sum { name, payload }) = interp.call_function("json_parse", &[s]) else {
-            panic!("json_parse must return a Result");
+        let result = interp.call_function("json_parse", &[s]);
+        let Ok(Value::Sum { name, payload }) = result else {
+            panic!("json_parse must return a Result: {result:?}");
         };
         assert_eq!(name, "Ok", "json_parse(\"[1,2,3]\") must succeed");
         let v = payload.into_iter().next().unwrap();

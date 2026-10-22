@@ -329,6 +329,24 @@ is the one protocol hashword.
 
 ## 12. References
 
+### 2026-10-22 implementation: browser transport and memory
+
+The recommender frontend exercises the declared browser boundary with HTTP
+method/body calls, owned WebSocket handles, window-event notifications and
+cancellable reconnect timers. JSON and application state transitions remain
+Briev code. HTTP currently returns synchronously through the String ABI;
+WebSocket notifications enter transactions through declared window events.
+The host bounds queued text by message count and UTF-8 byte count and suppresses
+callbacks after handle closure. See `applications/recommender-frontend.md` for
+the contracts, launch instructions and behavioral gates.
+
+The generated host allocates beyond initial WASM memory and grows linear memory
+with checked ranges, reusable free blocks and realloc preservation. Native
+wasm32 registers are explicitly adapted at the existing 64-bit boxed-payload
+boundary. Initialized collection objects outlive initialization frames, and
+collection view snapshots resize to actual cardinality. These rules apply to
+all browser programs, independently of application vocabulary.
+
 - Web IDL Standard — https://webidl.spec.whatwg.org/
 - HTML Standard, Web application APIs — https://html.spec.whatwg.org/multipage/webappapis.html
 - ECMAScript host/implementation equivalence — https://github.com/tc39/ecma262/issues/1524

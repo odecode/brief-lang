@@ -4,6 +4,13 @@
 
 **Status:** Living document — updated as the backend evolves.
 
+2026-10-21: ordinary object allocations cover the finalized field layout used
+by member accesses, while preserving any larger declared trailing allocation.
+An early aggregate byte count can precede nested type registration; it cannot
+bound later field stores. Packed and union layout paths retain their dedicated
+rules. The regression gate uses an intentionally undersized aggregate record
+and verifies both the last field's extent and preservation of explicit padding.
+
 ---
 
 ## 1. Core Architecture
@@ -685,3 +692,24 @@ These are resolved by `resolve_llvm_type()` in the casting graph. Never hardcode
 4. Add protocol arm in `type_to_protocol` priority chain.
 5. Add LLVM type resolution in `resolve_llvm_type`.
 6. **No name-based matching in the backend.**
+
+## Portable value and persistent browser-state boundaries (2026-10-22)
+
+Target-native integer and pointer registers must be adapted explicitly when
+entering or leaving 64-bit boxed collection, tuple, enum and closure payloads.
+Call parameter/return widths come from resolved signatures; generic arguments
+come from argument expression types. Reflection derives physical widths from
+the selected representation. The interpreter uses the same numeric byte-width
+contract. Portable casting and formatting are selected through the browser
+prelude rather than native syscall/environment imports.
+
+Objects stored in persistent state are heap allocated during initialization,
+including empty objects. Generated view materializers own reusable dynamically
+sized buffers per instance and compile with fresh function-local context.
+Frontend possible-write analysis propagates helper-call writes to a fixed point;
+these conservative sets drive DOM invalidation, not concurrency proofs.
+
+Operator elaboration preserves foreach element bindings and enum-pattern
+payload bindings using existing type authorities and generic substitutions.
+Lexical bindings and facts are restored after the nested scope. This prevents
+declared collection operations from falling through to raw handle arithmetic.

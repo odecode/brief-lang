@@ -9458,7 +9458,7 @@ node start [true][false] {
     let tokens = crate::lexer::tokenize(src).unwrap();
     let mut p = crate::parser::Parser::new(tokens, src);
     let items = p.parse_program().unwrap();
-    let mut backend = LlvmBackend::new();
+    let mut backend = LlvmBackend::new().with_type_universe(crate::type_universe::TypeUniverse::new());
     let ir = backend.generate(&items, None);
     assert!(
         ir.contains("@bstr.0") && ir.contains("i8 -119") && ir.contains("i8 80"),
@@ -11878,4 +11878,42 @@ node tick [count < 9][count == 9] ?[count < 4] -> report(count) {
         "4",
         "the version-DAG-dispatched watchdog must fire report(4); got:\n{out:?}"
     );
+}
+
+#[test]
+fn portable_fixed_width_arithmetic_and_calls_keep_their_declared_width() {
+    let mut items = parse_bv_source(r#"
+type Wide: Int { spec Bits: 64; };
+out defn difference(x: Wide, y: Wide) -> Wide { term x-y; };
+out defn apply(x: Wide) -> Wide { term difference(-x, 1 as Wide); };
+let tick: Int = 0;
+node run [tick < 1][tick == 1] { Print#(apply(7 as Wide)); tick = 1; endprogram; };
+"#);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::plugin::PluginManager::new()
+        .run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("register numeric refinements");
+    let ir = LlvmBackend::new().with_type_universe(universe)
+        .with_int_bits(32).with_target_triple("wasm32-unknown-wasi")
+        .generate(&items, None);
+    assert!(ir.contains("define i64 @difference(i64"), "{ir}");
+    assert!(ir.contains("call i64 @difference(i64"), "{ir}");
+    assert!(ir.contains("sub i64 0,"), "{ir}");
+    assert!(!ir.contains("sub i64 0, %arg0\n  ret i32"), "{ir}");
+}
+
+#[test]
+fn object_allocation_covers_final_nested_field_layout() {
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut info = universe.get("Int").expect("bootstrap integer").clone();
+    info.name = "Envelope".into();
+    info.bytes = 8;
+    info.fields = vec![("payload".into(), Type::Bits(128)), ("tail".into(), Type::Bits(64))];
+    universe.types.insert("Envelope".into(), info.clone());
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    backend.ctx.struct_types.insert("Envelope".into(), info.fields);
+    assert_eq!(backend.lookup_field_offset("Envelope", "tail"), 16);
+    assert_eq!(backend.struct_type_size("Envelope"), 24);
+    backend.ctx.type_universe.as_mut().unwrap().types.get_mut("Envelope").unwrap().bytes = 32;
+    assert_eq!(backend.struct_type_size("Envelope"), 32, "explicit trailing padding survives");
 }

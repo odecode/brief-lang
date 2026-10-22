@@ -1543,6 +1543,13 @@ fn eval_reflect(
             _ => Ok(Value::int(1)),
         },
         ("Bytes", true) => match val {
+            // 2026-10-21: scalar atoms have physical storage too. The
+            // reference evaluator owns i64/f64 atoms independently of a
+            // compiled target; byte reflection must describe those cells so
+            // portable numeric bounds can be derived without constants.
+            Value::Atom(Atom::Int(_)) | Value::Atom(Atom::Float(_)) => Ok(Value::int(8)),
+            Value::Atom(Atom::Bool(_)) => Ok(Value::int(1)),
+            Value::Atom(Atom::Char(_)) => Ok(Value::int(4)),
             Value::Bits(bytes) => Ok(Value::int(bytes.len() as i64)),
             (Value::Product { fields, .. } | Value::Sum { payload: fields, .. }) => {
                 Ok(Value::int(fields.len() as i64))
@@ -2170,6 +2177,7 @@ fn eval_binary_op(
                 }
             }
         }
+        BinaryOpKind::Mod => execute_intrinsic("Rem#", &[lv, rv], heap),
         _ => {
             // Pass through unknown operators as intrinsic calls
             let op_name = format!("{:?}#", kind);

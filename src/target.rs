@@ -442,7 +442,7 @@ plugins = ["prelude-hw"]
 [".rbv"]
 backend = "webstack"
 defaults = ["--target", "wasm"]
-plugins = ["prelude"]
+plugins = ["prelude-web"]
 
 [".abv"]
 backend = "spirv"
