@@ -7,11 +7,8 @@ import { Means, SimCache, means_build, means_free, means_user, simcache_build,
     sim_user, knn_aggregate, NEIGHBOR_K, TOP_N, clamp15 } from "./cf_engine.bv";
 import "std/rating_population.bv";
 import "./account_state.bv";
-
-obj ServerModel {
-    population: RatingPopulation; means: Means; cache: SimCache;
-    accounts: List<Int>; baseline_users: Int;
-};
+import "./model_snapshot.bv";
+import { simcache_build_prepared } from "./cf_prepared.bv";
 
 defn model_account_row(model: ServerModel, id: Int, idx: Int) -> Int {
     when idx >= model.accounts .^Length { term -1; };
@@ -57,8 +54,21 @@ defn model_read_rows(conn: PgConn, users: IntVec, items: IntVec, values: Vector,
 // even after IDs are deleted/skipped. Never alias login IDs with dataset rows.
 // Cursors bound wire-result size. Replace only with an equally consistent loader.
 defn model_load(conn: PgConn, baseline_users: Int, nitems: Int) -> Result<ServerModel, PgResult> {
+    term model_load_path(conn,baseline_users,nitems,model_cache_path());
+};
+
+defn model_load_path(conn: PgConn, baseline_users: Int, nitems: Int, path: String) -> Result<ServerModel, PgResult> {
     let begun: PgResult = pg_simple_query(conn, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     when !begun.ok { term Err(store_abort(conn,begun)); };
+    let version: Result<String,PgResult> = model_revision(conn);
+    when is_err(version) { term Err(store_abort(conn,unwrap_err(version))); };
+    let revision: String = unwrap(version);
+    let restored: Result<ServerModel,PgResult> = model_restore(path,revision,baseline_users,nitems);
+    when is_ok(restored) {
+        let committed: PgResult = pg_simple_query(conn,"COMMIT");
+        when !committed.ok { model_free(unwrap(restored)); term Err(committed); };
+        term restored;
+    };
     let declared: PgResult = pg_simple_query(conn,
         "DECLARE account_ids CURSOR FOR SELECT id FROM accounts ORDER BY id");
     when !declared.ok { term Err(store_abort(conn,declared)); };
@@ -72,7 +82,7 @@ defn model_load(conn: PgConn, baseline_users: Int, nitems: Int) -> Result<Server
         " OR item_id >= " + nitems as String + ") + (SELECT count(*) FROM ratings WHERE item_id >= " + nitems as String + ")");
     when !counted.ok { term Err(store_abort(conn,counted)); };
     let total: Int = pg_row_int(counted,0,0);
-    when total < 0 || total > 10000000 || pg_row_int(counted,0,1) != 0 || baseline_users < 1 || nitems < 1 {
+    when total < 0 || total > 10000000 || pg_row_int(counted,0,1) != 0 || baseline_users < 1 || nitems < 1 || nitems > 65535 || baseline_users + ids .^Length > 65535 {
         term Err(store_abort(conn,store_error("Population exceeds configured dimensions or the ten-million-rating memory limit; check the dataset and configuration.")));
     };
     let cursor: PgResult = pg_simple_query(conn,
@@ -97,8 +107,10 @@ defn model_load(conn: PgConn, baseline_users: Int, nitems: Int) -> Result<Server
     let pop: RatingPopulation = pop_build(users,items,values,total,baseline_users + ids .^Length,nitems);
     ivec_free(users); ivec_free(items); vec_free(values);
     let means: Means = means_build(pop);
-    let cache: SimCache = simcache_build(pop,means,0);
-    term Ok(ServerModel { population: pop, means: means, cache: cache, accounts: ids, baseline_users: baseline_users });
+    let cache: SimCache = simcache_build_prepared(pop,means,0);
+    let model: ServerModel = ServerModel { population: pop, means: means, cache: cache, accounts: ids, baseline_users: baseline_users, revision: revision };
+    when !model_save(model,path) { println!("Cannot persist the recommendation snapshot; check CACHE_PATH and directory permissions. The in-memory snapshot remains available."); };
+    term Ok(model);
 };
 
 obj ActivePrediction {

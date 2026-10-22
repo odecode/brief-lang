@@ -36,6 +36,21 @@ defn store_load_state_ddl() -> String {
         "key TEXT PRIMARY KEY, done BOOLEAN NOT NULL)";
 };
 
+// 2026-10-21: statement triggers serialize population revisions with their
+// writes, including updates/deletes/TRUNCATE and account identity changes.
+// Epoch distinguishes a recreated revision table. Replace only with another
+// transactional identity that detects same-count edits and rolled-back writes.
+defn store_revision_ddl() -> String {
+    term "CREATE TABLE IF NOT EXISTS model_revision (id BOOLEAN PRIMARY KEY CHECK(id), " +
+        "epoch TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text), revision BIGINT NOT NULL DEFAULT 0); " +
+        "INSERT INTO model_revision(id) VALUES(TRUE) ON CONFLICT DO NOTHING; " +
+        "CREATE OR REPLACE FUNCTION bump_model_revision() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN " +
+        "EXECUTE format('UPDATE %I.model_revision SET revision=revision+1 WHERE id',TG_TABLE_SCHEMA); RETURN NULL; END $$; " +
+        "DROP TRIGGER IF EXISTS model_changed ON accounts; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON accounts FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision(); " +
+        "DROP TRIGGER IF EXISTS model_changed ON ratings; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ratings FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision(); " +
+        "DROP TRIGGER IF EXISTS model_changed ON baseline_ratings; CREATE TRIGGER model_changed AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON baseline_ratings FOR EACH STATEMENT EXECUTE FUNCTION bump_model_revision()";
+};
+
 // 2026-10-21: DDL is atomic, including reruns. A failed multi-statement
 // Simple Query leaves the transaction aborted, so explicitly roll it back
 // before returning the ORIGINAL error. Caller supplies an idle connection;
@@ -44,7 +59,7 @@ defn store_load_state_ddl() -> String {
 defn store_create_schema(conn: PgConn) -> PgResult {
     let sql: String = "BEGIN; " + store_accounts_ddl() + "; " +
         store_ratings_ddl() + "; " + store_baseline_ddl() + "; " +
-        store_load_state_ddl() + "; COMMIT;";
+        store_load_state_ddl() + "; " + store_revision_ddl() + "; COMMIT;";
     let result: PgResult = pg_simple_query(conn, sql);
     when result.ok == false {
         term store_abort(conn, result);

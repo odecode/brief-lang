@@ -11,6 +11,8 @@ is Briev; PostgreSQL is external infrastructure.
 PostgreSQL is trust-authenticated on 127.0.0.1:5432 using PGUSER/PGDATABASE.
 UDATA_PATH defaults to u.data. PORT defaults to 8080; MAX_CONNECTIONS to 1024;
 LAMBDA_MILLI to 500 (0..1000 means lambda 0..1); REFRESH_SECONDS to 300.
+`CACHE_PATH` defaults to `recommender.snapshot.bin`. Its directory must already
+exist and be writable for durable reuse and refresh worker handoff.
 Invalid configuration or failed bootstrap fails startup with a concrete error.
 
 POST /register and /login accept username/password JSON strings; login returns
@@ -65,11 +67,42 @@ similarities are computed once for that update, while item similarities and
 neighbor means come from the immutable served cache. Serving a recommendation
 reads its owner's materialized result rather than rebuilding matrices.
 
-Explicit and periodic refreshes run between sweeps. A new model and all existing
-owner views are built before the old model is freed. Failed refresh preserves
-the previous model. This is synchronous single-process rebuilding; it may delay
-socket servicing while running. Timings and 1000-channel capacity remain task 16
-gates. No throughput or latency result is claimed here.
+Explicit and periodic refreshes fork a Linux worker. The child closes inherited
+reactor and PostgreSQL descriptors WITHOUT sending protocol shutdown messages,
+opens its own database session in the parent's schema, and loads/builds a complete
+replacement snapshot. The parent uses nonblocking wait4, keeps serving the old
+snapshot, and installs a validated worker artifact only after successful exit.
+The child exits with the parent (prctl plus parent-PID recheck); completed children
+are reaped. Requests during a build coalesce into one queued refresh. Failure
+keeps the old model and permits retry; one owner's materialized view is refreshed
+and pushed per sweep after installation. Cold startup still waits for its first
+model. This does not promise a bound on ordinary owner-recommendation computation
+or on the one-time snapshot decoding/copy at installation.
+
+`cf_prepared.bv` memoizes both base-PCC matrices and both orientations of imputed
+ratings. Orientations are represented by CSR/mean data and share one algorithm.
+Final PCC still walks each pair's original observed union in the original order.
+Each orientation's scratch base/imputed arrays are freed before the next stage;
+the original direct engine remains the numerical reference. No approximate
+neighbors, changed key sets, or compiler algorithm recognition are introduced.
+
+`model_snapshot.bv` persists the ENTIRE model, not just its matrices, so a refresh
+never combines one database population with another cache. A statement trigger
+on accounts, ratings and baseline_ratings advances model_revision in the same
+transaction as INSERT/UPDATE/DELETE/TRUNCATE; rollback rolls back the revision.
+A persistent epoch distinguishes recreated revision tables. Database name,
+schema, epoch and revision form an exact length-delimited identity captured in
+the population's repeatable-read transaction. Startup reuses only a matching
+snapshot. A format/algorithm magic, bounded dimensions, exact image length and
+whole-image checksum reject incompatible/truncated/damaged images before decode.
+The checksum detects accidental corruption; artifacts are trusted local files,
+not authenticated interchange. The native numeric ABI is part of the format.
+Floating blocks copy their live typed prefix and zero spare allocation capacity.
+
+Writes use a PID-specific temporary file, complete-write validation, file fsync,
+atomic rename, and directory fsync. A failed write does not publish partial data;
+the in-memory model remains usable. Cold/warm startup timing and exact-reference
+gates are recorded in the cache-reuse plan; 1000-channel capacity remains task 16.
 
 ## Gates
 

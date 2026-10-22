@@ -358,3 +358,6 @@ benchmarks/recommender
 benchmarks/recommender_c
 examples/gpu/.tmp_quad/
 examples/gpu/briev_*_test_*.abv
+
+# Local recommendation snapshots, including atomic-write and worker artifacts.
+/recommender.snapshot.bin*

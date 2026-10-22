@@ -3,12 +3,13 @@
 //===----------------------------------------------------------------------===//
 import "./server_api.bv";
 import "./server_io.bv";
+import "./model_worker.bv";
 import { stdout_flush } from "std/cast_lanes.bv";
 
 obj OwnerView { owner: Int; recommendations: String; };
 obj ServerState {
     reactor: Reactor; conn: PgConn; model: ServerModel; sessions: SessionStore;
-    views: List<OwnerView>; lambda: Float; refresh: Bool; next_refresh: Int; interval: Int;
+    views: List<OwnerView>; lambda: Float; refresh: Bool; next_refresh: Int; interval: Int; worker: RefreshWorker;
 };
 
 defn server_time(clock_id: Int) -> Int {
@@ -27,12 +28,12 @@ defn server_timestamp() -> Int { term server_time(0)/1000; };
 defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, lambda: Float, interval: Int) -> ServerState {
     let views: List<OwnerView> = [];
     term ServerState { reactor: reactor, conn: conn, model: model, sessions: sessions_new(),
-        views: views, lambda: lambda, refresh: false, next_refresh: server_clock()+interval, interval: interval };
+        views: views, lambda: lambda, refresh: false, next_refresh: server_clock()+interval, interval: interval, worker: worker_idle() };
 };
 
 defn server_with(state: ServerState, sessions: SessionStore, views: List<OwnerView>, refresh: Bool) -> ServerState {
     term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: sessions,
-        views: views, lambda: state.lambda, refresh: refresh, next_refresh: state.next_refresh, interval: state.interval };
+        views: views, lambda: state.lambda, refresh: refresh, next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
 };
 
 defn server_owner_view(views: List<OwnerView>, owner: Int) -> String {
@@ -97,19 +98,52 @@ defn server_push(state: ServerState, owner: Int) -> Bool {
 };
 
 defn server_refresh(state: ServerState) -> ServerState {
-    let loaded: Result<ServerModel,PgResult> = model_load(state.conn,state.model.baseline_users,state.model.population.nitems);
+    when state.worker.pid > 0 { term server_finish_refresh(state); };
+    when state.worker.owners .^Length > 0 { term state; };
+    let worker: RefreshWorker = worker_start(state.conn,state.reactor,state.model.baseline_users,state.model.population.nitems);
+    let updated: ServerState = server_snapshot_state(state,state.model,worker,false,server_clock()+state.interval);
+    when worker.pid == 0 { println!("Cannot start snapshot refresh; check database access and CACHE_PATH. Serving the previous snapshot."); stdout_flush(); };
+    term updated;
+};
+
+defn server_snapshot_state(state: ServerState, model: ServerModel, worker: RefreshWorker, queued: Bool, deadline: Int) -> ServerState {
+    term ServerState { reactor: state.reactor, conn: state.conn, model: model, sessions: state.sessions,
+        views: state.views, lambda: state.lambda, refresh: queued, next_refresh: deadline, interval: state.interval, worker: worker };
+};
+
+// 2026-10-21: only a reaped, successful worker can install its complete model.
+// Newer requests/sessions survive the swap. Refresh requests during a build
+// remain queued; failure retains the old model. Rebuild owner views one per
+// sweep rather than holding the event loop for all logged-in owners at once.
+defn server_finish_refresh(state: ServerState) -> ServerState {
+    let status: Int = worker_poll(state.worker);
+    when status == 0 { term state; };
+    let updated: ServerState = server_snapshot_state(state,state.model,worker_idle(),state.refresh,server_clock()+state.interval);
+    let loaded: Result<ServerModel,PgResult> = Err(store_error("Snapshot worker failed; retry refresh."));
+    when status == 1 { loaded = model_restore(state.worker.path,"",state.model.baseline_users,state.model.population.nitems); };
+    remove_file(state.worker.path);
+    remove_file(state.worker.path+".tmp."+state.worker.pid as String);
     when is_err(loaded) {
-        println!("Cache refresh failed: {}; check the database schema and retry /admin/refresh.",unwrap_err(loaded).err_msg);
-        stdout_flush();
-        term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: state.sessions,
-            views: state.views, lambda: state.lambda, refresh: false, next_refresh: server_clock()+state.interval, interval: state.interval };
+        println!("Snapshot refresh failed; check database access and CACHE_PATH, then retry /admin/refresh. Serving the previous snapshot.");
+        stdout_flush(); term updated;
     };
-    let model: ServerModel = unwrap(loaded);
-    let replacement: ServerState = ServerState { reactor: state.reactor, conn: state.conn, model: model, sessions: state.sessions,
-        views: state.views, lambda: state.lambda, refresh: false, next_refresh: server_clock()+state.interval, interval: state.interval };
-    foreach idx in 0..state.views .^Length { replacement = server_update_owner(replacement,state.views[idx].owner); };
+    updated.model = unwrap(loaded);
+    let owners: List<Int> = [];
+    foreach idx in 0..state.views .^Length { let entry: List<Int> = [state.views[idx].owner]; owners = owners+entry; };
+    updated.worker = RefreshWorker { pid: 0, path: "", owners: owners };
     model_free(state.model);
-    term replacement;
+    term updated;
+};
+
+defn server_refresh_owner(state: ServerState) -> ServerState {
+    let pending: List<Int> = state.worker.owners;
+    when pending .^Length == 0 { term state; };
+    let updated: ServerState = server_update_owner(state,pending[0]);
+    server_push(updated,pending[0]);
+    let remaining: List<Int> = [];
+    foreach idx in 1..pending .^Length { let entry: List<Int> = [pending[idx]]; remaining = remaining+entry; };
+    updated.worker = RefreshWorker { pid: state.worker.pid, path: state.worker.path, owners: remaining };
+    term updated;
 };
 
 defn server_after_reply(state: ServerState, reply: ApiReply) -> ServerState {

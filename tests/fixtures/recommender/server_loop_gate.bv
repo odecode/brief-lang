@@ -69,7 +69,7 @@ node run [tick < 1][tick == 1] {
     let bob_push: String = test_read(live_bob);
     let http_live: Bool = str_find(http_rating.response," 200 ") >= 0 && http_push .^Length > 0 && http_push == second_push && bob_push .^Length == 0;
     let refresh: TestExchange = test_http(server,"POST","/admin/refresh","");
-    server = test_pump(refresh.server);
+    server = test_refresh_complete(refresh.server);
     let refreshed: Bool = server.model.accounts .^Length == 2 && server.model.population.nnz == 29 && model_account_row(server.model,1,0) == 3 && model_account_row(server.model,2,0) == 4;
     when !refreshed { println!("refresh response={} accounts={} nnz={} rows={},{}",refresh.response,server.model.accounts .^Length,server.model.population.nnz,model_account_row(server.model,1,0),model_account_row(server.model,2,0)); };
     let fresh_account: AccountState = account_state(server.conn,server.sessions,alice);
