@@ -59,7 +59,7 @@ node run [tick < 1][tick == 1] {
     let incremental: Bool = premature .^Length == 0 && str_find(response," 200 ") >= 0;
     let refresh_before: Int = state.model.population.nnz;
     let broken: PgResult = pg_simple_query(state.conn,"ALTER TABLE baseline_ratings RENAME TO hidden_baseline_ratings");
-    let failed_refresh: ServerState = server_refresh(state);
+    let failed_refresh: ServerState = test_refresh_complete(server_refresh(state));
     let restored: PgResult = pg_simple_query(state.conn,"ALTER TABLE hidden_baseline_ratings RENAME TO baseline_ratings");
     state = failed_refresh;
     let snapshot: Bool = broken.ok && restored.ok && state.model.population.nnz == refresh_before;

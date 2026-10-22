@@ -10651,3 +10651,14 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Full similarity cache repeatedly recomputed prerequisites (FIXED 2026-10-21)
+
+Each pair's imputed-union PCC recursively recalculated base PCC and missing
+ratings. The full 943/1682/100000 startup exceeded 37 minutes before cancellation.
+Application-level prepared stages reuse base pairs and imputed cells while
+retaining the exact original union/accumulation order. Full startup now reaches
+readiness in 11.8–15.3 seconds in development checks; fresh persisted startup
+takes 0.40–0.47 seconds. See the cache-reuse plan for same-geometry reference
+gates and timing limitations. Transactional revisions and off-loop workers fix
+unconditional startup rebuilding and synchronous refresh stalls at the same time.

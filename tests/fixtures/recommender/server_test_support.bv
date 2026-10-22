@@ -28,6 +28,19 @@ defn test_pump(state: ServerState) -> ServerState {
     term updated;
 };
 
+// 2026-10-21: refresh now runs in a child. Keep driving actual socket sweeps
+// while awaiting installation; a fixed six-tick assumption tests scheduler
+// speed rather than refresh completion. Timeout remains a failing assertion
+// in callers, not an implicit successful synchronous refresh.
+defn test_refresh_complete(state: ServerState) -> ServerState {
+    let updated: ServerState = state;
+    foreach step in 0..1000 {
+        updated = server_step(updated,10);
+        when updated.worker.pid == 0 && !updated.refresh && updated.worker.owners .^Length == 0 { term updated; };
+    };
+    term updated;
+};
+
 defn test_send(socket: Socket, text: String) -> Bool {
     let buffer: GrowBuf = put_str(grow_new(text .^Length+1),text);
     let sent: Int = sock_send(socket,ByteBuf { ptr: buffer.ptr, len: buffer.len, cap: buffer.cap },buffer.len);

@@ -54,7 +54,7 @@ defn server_advance(state: ServerState, slot: Int) -> ServerState {
 
 defn server_step(state: ServerState, timeout: Int) -> ServerState {
     let updated: ServerState = state;
-    when state.refresh || server_clock() >= state.next_refresh { updated = server_refresh(state); };
+    when state.worker.pid > 0 || state.refresh || server_clock() >= state.next_refresh { updated = server_refresh(state); };
     let ready: Int = reactor_poll(updated.reactor,timeout);
     when ready < 0 {
         println!("Socket readiness failed (errno {}); check descriptor limits and restart with a valid MAX_CONNECTIONS.",ready);
@@ -63,5 +63,6 @@ defn server_step(state: ServerState, timeout: Int) -> ServerState {
         term updated;
     };
     foreach slot in 0..updated.reactor.capacity { updated = server_advance(updated,slot); };
+    updated = server_refresh_owner(updated);
     term updated;
 };
