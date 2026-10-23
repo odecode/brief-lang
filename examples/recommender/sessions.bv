@@ -88,3 +88,25 @@ defn session_issue(store: SessionStore, account_id: Int, attempts: Int) -> Sessi
     term SessionIssue { ok: true, token: token,
         sessions: SessionStore { entries: store.entries + added } };
 };
+
+// 2026-10-23: a persistence child may authenticate credentials off-reactor and
+// return the freshly generated opaque token with its owner identity. The parent
+// adopts that exact token only after the worker reply is validated. Retire this
+// bridge when session ownership moves into a dedicated coordinator service.
+defn session_adopt(store: SessionStore, account_id: Int, token: String) -> SessionIssue {
+    when account_id < 1 || account_id > 2147483647 || !session_token_valid(token) || session_account(store,token) != 0 {
+        term SessionIssue { ok: false, token: "", sessions: store };
+    };
+    let entry: AccountSession = AccountSession { token: token, account_id: account_id };
+    let added: List<AccountSession> = [entry];
+    term SessionIssue { ok: true, token: token, sessions: SessionStore { entries: store.entries + added } };
+};
+
+defn session_token_valid(token: String) -> Bool {
+    when token .^Length != 32 { term false; };
+    foreach idx in 0..token .^Length {
+        let byte: Int = byte_at(token,idx);
+        when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { term false; };
+    };
+    term true;
+};

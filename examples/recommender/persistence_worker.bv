@@ -176,8 +176,13 @@ defn persistence_worker_event_step(worker: PersistenceWorker, request: WorkerMes
 
 defn persistence_worker_failure_step(worker: PersistenceWorker, request: WorkerMessage,
     code: String, message: String, retryable: Bool) -> PersistenceWorkerStep {
+    let operation_id: String = protocol_text(protocol_member(request.payload,"operation_id"));
+    when operation_id .^Length == 0 {
+        let command: Result<RatingCommand,String> = protocol_command_value(protocol_member(request.payload,"operation"));
+        when is_ok(command) { operation_id = unwrap(command).operation_id; };
+    };
     let failed: RatingSaveFailed = RatingSaveFailed { profile: request.tag.profile,
-        operation_id: protocol_text(protocol_member(request.payload,"operation_id")),
+        operation_id: operation_id,
         error: code, message: message, retryable: retryable };
     term persistence_worker_event_step(worker,request,"save-failed",FailedRating(failed),false);
 };

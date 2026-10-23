@@ -212,7 +212,9 @@ defn client_apply_accepted(accepted: RatingAccepted) -> Void {
 defn client_apply_failed(failure: RatingSaveFailed) -> Void {
     let index: Int = browser_operation_index(browser_operations,failure.operation_id);
     when client_protocol_owner(failure.profile) && (index < 0 || !client_operation_terminal(index)) {
-        client_operation_update(failure.operation_id,"failed",failure.profile.revision,
+        let status: String = "failed";
+        when failure.error == "commit-uncertain" { status = "uncertain"; };
+        client_operation_update(failure.operation_id,status,failure.profile.revision,
             failure.retryable,failure.message);
         save_status = failure.message;
     };

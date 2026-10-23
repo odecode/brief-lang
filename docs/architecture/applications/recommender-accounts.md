@@ -32,11 +32,16 @@ without changing state. Tokens are table keys, never encoded account IDs.
 
 SessionStore is explicit process-local value state. Tokens last for the lifetime
 of that retained store; restarting the server starts an empty store. Persistent
-credentials and ratings survive and can establish fresh sessions. Expiration,
-logout routes, and durable session storage are not part of the current API.
-The reactor owns one authoritative store; request handlers must not keep stale
-copies as independent authorities. Service connections are used idle/autocommit
-by the server; these APIs do not commit caller-owned transactions.
+credentials and ratings survive and can establish fresh sessions. Session
+expiration and durable session storage are not part of the current API. `POST /v1/logout`
+(also `/logout`) requires the token query parameter, revokes only that token,
+and returns the versioned `logged-out` envelope. A missing, invalid or already
+revoked token returns the ordinary authentication error. The reactor owns one
+authoritative store; request handlers must not keep stale copies as independent
+authorities. Each live channel is bound to its exact token and receives a policy
+close when that token is revoked, while other sessions for the account remain
+valid. Service connections are used idle/autocommit by the server; these APIs do
+not commit caller-owned transactions.
 
 `account_state(conn,sessions,token)` resolves the owner from the session table,
 then performs one account-filtered LEFT JOIN of identity and ratings. It returns
@@ -52,6 +57,19 @@ returns a fabricated empty recommendation cache for warm accounts. HTTP and live
 routes must reuse the resolved owner for writes, recommendations, and delivery.
 Account IDs are not baseline user indices: task 12 must map them to appended
 engine rows explicitly rather than indexing the 943 baseline rows with an ID.
+
+Login and registration run through the persistence child. Login returns the
+owner's ratings and a generated opaque token; the reactor adopts that exact
+token and hydrates its process-local admission profile before responding. The
+reactor validates later HTTP and WebSocket requests from that in-memory session
+store. Profile state reads use the hydrated cache. Operation-status requests
+query durable receipts through the persistence child, so an account-row lock
+does not block the reactor.
+
+Server startup applies the additive `rating_operation_receipts` table migration
+after creating the base account/rating schema. Each accepted rating is persisted
+with its idempotency receipt in one account-locked transaction; a restart can
+reconcile an uncertain client operation without replaying an unverified write.
 
 Native gates: tests/fixtures/recommender/run_accounts.sh. Dedicated schemas
 briev_accounts_gate and briev_account_state_gate isolate the fixtures from public

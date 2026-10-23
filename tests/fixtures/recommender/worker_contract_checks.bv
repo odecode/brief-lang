@@ -57,13 +57,15 @@ defn contract_worker_checks(epoch: String) -> Bool {
     messages <- WorkerMessage { kind: "receipts", tag: io, payload: Object(receipts_payload) };
     messages <- WorkerMessage { kind: "ready", tag: model, payload: contract_worker_payload("{\"generation\":\"2\",\"identity\":\"fixture\"}") };
     messages <- WorkerMessage { kind: "stopped", tag: control, payload: contract_worker_payload("{\"drained\":true}") };
-    let authenticated: JsonValue = contract_worker_payload("{\"account_id\":17,\"username\":\"雪\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
+    let authenticated: JsonValue = contract_worker_payload("{\"account_id\":17,\"username\":\"雪\",\"token\":\"00112233445566778899aabbccddeeff\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
     messages <- WorkerMessage { kind: "authenticated", tag: control, payload: authenticated };
     messages <- WorkerMessage { kind: "registered", tag: control, payload: authenticated };
     messages <- WorkerMessage { kind: "error", tag: prediction, payload: contract_worker_payload("{\"error\":\"worker-crashed\",\"message\":\"Retry this calculation.\",\"retryable\":true}") };
     foreach idx in 0..messages .^Length {
         when !contract_worker_roundtrip(messages[idx]) { term false; };
     };
+    let tokenless: JsonValue = contract_worker_payload("{\"account_id\":17,\"username\":\"雪\",\"ratings\":[{\"item_id\":0,\"rating\":5}]}");
+    when is_ok(protocol_encode_worker(WorkerMessage { kind: "authenticated", tag: control, payload: tokenless })) { term false; };
     when is_ok(protocol_encode_worker(WorkerMessage { kind: "predict", tag: io, payload: ratings })) { term false; };
     let zero_revision: WorkerTag = WorkerTag { profile: ProfileVersion { server_epoch: epoch, account_id: 17, revision: "0" }, job_id: "42", attempt: 1, model_generation: "2" };
     when is_ok(protocol_encode_worker(WorkerMessage { kind: "predict", tag: zero_revision, payload: ratings })) { term false; };

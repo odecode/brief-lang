@@ -3,6 +3,7 @@
 //===----------------------------------------------------------------------===//
 import "./server_loop.bv";
 import "./bootstrap.bv";
+import "./operation_store.bv";
 import "std/env.bv";
 
 defn server_env_number(key: String, fallback: Int) -> Int {
@@ -30,6 +31,8 @@ defn server_boot() -> ServerState {
     when conn.pid < 0 || conn.sock.fd < 0 { server_fatal("Cannot connect to PostgreSQL on 127.0.0.1:5432; check PGUSER, PGDATABASE and local trust authentication."); };
     let schema: PgResult = store_create_schema(conn);
     when !schema.ok { pg_close(conn); server_fatal("Cannot create the database schema: "+schema.err_msg); };
+    let receipt_schema: PgResult = pg_simple_query(conn,operation_store_table_ddl());
+    when !receipt_schema.ok { pg_close(conn); server_fatal("Cannot create durable rating receipts: "+receipt_schema.err_msg); };
     let path: String = get_env("UDATA_PATH");
     when path .^Length == 0 { path = "u.data"; };
     let loaded: BaselineLoad = baseline_bootstrap(conn,path);
@@ -41,7 +44,11 @@ defn server_boot() -> ServerState {
         model_free(unwrap(model)); pg_close(conn);
         server_fatal("Cannot open the listener (errno "+reactor.listener as String+"); choose an available PORT and check descriptor limits.");
     };
-    let server: ServerState = server_new(reactor,conn,unwrap(model),(lambda_milli as Float)/1000.0,refresh_seconds*1000);
+    let initial: ServerState = server_new(reactor,conn,unwrap(model),(lambda_milli as Float)/1000.0,refresh_seconds*1000);
+    let workers: Result<ServerState,String> = server_workers_start(initial);
+    when is_err(workers) { model_free(unwrap(model)); pg_close(conn); reactor_close(reactor);
+        server_fatal("Cannot start the bounded persistence and prediction workers: "+unwrap_err(workers)); };
+    let server: ServerState = unwrap(workers);
     when server.server_epoch .^Length != 32 {
         server_fatal("Cannot create a secure server session epoch; check system entropy availability.");
     };
@@ -50,11 +57,14 @@ defn server_boot() -> ServerState {
     term server;
 };
 
-let server: ServerState = server_boot();
+// 2026-10-23: the reactor carries worker/session state across firings whose
+// external effects arrive later; keep that state live between socket events.
+// Undo when reactive-node state is a first-class liveness root automatically.
+out let server: ServerState = server_boot();
 // 2026-10-21: this is an intentional long-lived service: socket readiness,
 // not a finite iteration count, drives progress. One bounded sweep per firing.
 // Replace the perpetual goal only when a graceful shutdown input is introduced.
-node serve [true][false] {
+out node serve [true][false] {
     server = server_step(server,100);
     term;
 };

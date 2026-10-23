@@ -58,6 +58,31 @@ configure PGUSER, PGDATABASE and UDATA_PATH before running it. PORT defaults to
 8080, MAX_CONNECTIONS to 1024, LAMBDA_MILLI to 500 and REFRESH_SECONDS to 300.
 See docs/architecture/applications/recommender-server.md for the wire contract.
 
+## I11 real browser/server integration gate
+
+Run this gate only with a dedicated PostgreSQL test database and the browser
+dependencies installed. It builds both the native server and split WASM/host app
+from the current checkout, records their hashes, and runs Playwright against the
+real server on port 18110. The test registers a unique account, seeds five
+ratings in that account, then holds its PostgreSQL account row while changing a
+rating in the browser. It releases the lock only after the fresh recommendation
+has arrived and appeared in the page.
+
+```bash
+PGUSER=briev_test PGDATABASE=briev_recommender_test \
+  PLAYWRIGHT_MODULE=/path/to/node_modules/playwright \
+  python3 benchmarks/recommender_responsiveness/run_i11_browser.py \
+    --compiler /home/otto/briev-target/release/brievc \
+    --output /tmp/recommender-i11-browser-run
+```
+
+The PostgreSQL server must listen on 127.0.0.1:5432. `PGHOST`, `PGPORT`,
+`PSQL`, `NODE`, `PLAYWRIGHT_CHANNEL` and `PLAYWRIGHT_MODULE` can select local
+tools; the app and server source revision is the checkout used by the runner.
+The output directory must not already exist. It retains build logs, server log,
+source/artifact hashes and the gate result for review. The runner stops only the
+server process it starts.
+
 ## Task 13 integrated checkpoint
 
 The backend/net-stack checkpoint is complete on `integration/ptr-provenance`.

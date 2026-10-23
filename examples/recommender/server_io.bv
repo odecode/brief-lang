@@ -59,6 +59,14 @@ defn io_http_reply(reactor: Reactor, slot: Int, status: Int, body: String) -> Bo
     term io_queue(reactor,slot,http_json_response(status,body));
 };
 
+defn io_ws_close(reactor: Reactor, slot: Int, code: Int) -> Bool {
+    let payload: GrowBuf = grow_new(2).put_u16_be(code);
+    let frame: GrowBuf = ws_encode(grow_new(4),true,8,false,0,payload.ptr,payload.len);
+    grow_free(payload);
+    Store#(reactor_row(reactor,slot)+112,1,8);
+    term io_queue(reactor,slot,frame);
+};
+
 defn io_flush(reactor: Reactor, slot: Int) -> Bool {
     let row: Int = reactor_row(reactor,slot);
     let output: Int = Load#(row + 48,8);

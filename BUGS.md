@@ -33,6 +33,14 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## Reassigned parameter slots reused LLVM SSA names in the function body — FIXED 2026-10-23
+
+**Symptom:** clang rejected the recommender HTTP logout gate with “multiple definition of local value” when compiling a recursive helper that mutates a `List` parameter. Its entry alloca and a later body load both used `%t6`.
+
+**Root cause:** `emit_definition` allocated reassigned parameter slots using `FunctionContext::txn_counter`, then reset that counter to zero after parameter binding. Body emission therefore reused names already defined in the entry prologue.
+
+**Fix:** reset the counter at definition entry, before parameter prologue emission, and keep it monotonic through the body. The LLVM backend regression compiles the real `sessions.bv` module and asserts local value names are unique in `session_revoke_entries` (`src/backend/llvm/tests.rs`).
+
 ## Raw Ptr<T> scalar index load/store CSE-aliased via inttoptr provenance loss -> stale read -- FIXED 2026-10-20
 
 **Symptom:** a top-N serving routine (recommender-app Task 8 oracle, examples/recommender/reference.bv `recommend_user`) returned already-rated items and ran to `topn` instead of stopping. A `picked[]` exclusion array (a raw `Malloc#`-backed `Ptr<Int>`) was correctly marked `[1,1,1,1]` (confirmed by a print inside the writing defn), yet a sibling defn's `rec_argbest` read `picked[3]` as 0 and re-selected item 3 every pass. Same memory, same function, different result across recursion frames.

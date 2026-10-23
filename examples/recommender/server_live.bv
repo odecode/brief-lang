@@ -3,14 +3,6 @@
 //===----------------------------------------------------------------------===//
 import "./server_state.bv";
 
-defn live_close(reactor: Reactor, slot: Int, code: Int) -> Bool {
-    let payload: GrowBuf = grow_new(2).put_u16_be(code);
-    let frame: GrowBuf = ws_encode(grow_new(4),true,8,false,0,payload.ptr,payload.len);
-    grow_free(payload);
-    Store#(reactor_row(reactor,slot)+112,1,8);
-    term io_queue(reactor,slot,frame);
-};
-
 defn live_key_valid(key: String) -> Bool {
     when key .^Length != 24 || key[22:24] != "==" { term false; };
     let alphabet: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -33,33 +25,33 @@ defn live_upgrade(state: ServerState, slot: Int, request: HttpRequest) -> Server
         io_header(request,"Sec-WebSocket-Version") == "13" &&
         live_connection_token(io_header(request,"Connection"),0) && live_key_valid(key);
     when !valid { io_http_reply(state.reactor,slot,400,"{\"error\":\"invalid-upgrade\"}"); term state; };
-    let account: AccountState = account_state(state.conn,state.sessions,api_token(request.path));
-    when !account.result.ok {
-        let error: ApiReply = api_error(account.result.error,state.sessions);
+    let token: String = api_token(request.path);
+    let owner: Int = session_account(state.sessions,token);
+    when owner <= 0 || server_owner_view(state.views,owner) .^Length == 0 {
+        let error: ApiReply = api_error("auth-failed",state.sessions);
         io_http_reply(state.reactor,slot,error.status,error.body); term state;
     };
     let row: Int = reactor_row(state.reactor,slot);
-    Store#(row+8,account.result.account.id,8); Store#(row+24,account.result.account.id,8);
+    Store#(row+8,owner,8); Store#(row+24,owner,8);
     Store#(row+16,1,8); Store#(row+64,2,8);
     let normalized: HttpRequest = HttpRequest { method: request.method, path: request.path,
         headers: "Sec-WebSocket-Key: "+key, body: "" };
     io_queue(state.reactor,slot,ws_handshake_response(normalized));
-    term state;
+    term server_track_live_session(state,slot,owner,token);
 };
 
 defn live_text(state: ServerState, slot: Int, text: String) -> ServerState {
-    when !io_utf8(text,0) { live_close(state.reactor,slot,1007); term state; };
+    when !io_utf8(text,0) { io_ws_close(state.reactor,slot,1007); term state; };
     api_trace(text,"");
-    let live_started: Int = trace_clock();
-    let input: ApiInput = api_input(text);
     let owner: Int = Load#(reactor_row(state.reactor,slot)+24,8);
-    let authenticated: ApiInput = ApiInput { ok: input.ok, username: "", password: "",
-        token: server_owner_token(state.sessions,owner), item: input.item, rating: input.rating };
-    let reply: ApiReply = api_rate(state.conn,state.sessions,authenticated,state.model.population.nitems,server_timestamp());
-    when reply.status != 200 { io_queue(state.reactor,slot,ws_encode_text(reply.body)); term state; };
-    let updated: ServerState = server_after_reply(state,reply);
-    trace_stage("live_dispatch",live_started);
-    term updated;
+    let fd: Int = Load#(reactor_row(state.reactor,slot),8);
+    let token: String = server_live_session_token(state,slot,fd,0);
+    when token .^Length == 0 { io_ws_close(state.reactor,slot,1008); term state; };
+    let command: Result<RatingCommand,String> = protocol_decode_command(text);
+    when is_err(command) { io_queue(state.reactor,slot,ws_encode_text("{\"error\":\"validation\"}")); term state; };
+    let dispatched: ServerAdmissionResult = server_dispatch_admission(state,owner,token,unwrap(command));
+    when !dispatched.accepted { io_queue(state.reactor,slot,ws_encode_text(dispatched.body)); };
+    term dispatched.state;
 };
 
 defn live_close_payload_code(payload: String) -> Int {
@@ -76,7 +68,7 @@ defn live_control(state: ServerState, slot: Int, frame: WsFrame, message: WsMess
     let data: Int = (message.payload as Data) as Int;
     when frame.opcode == 8 {
         let error: Int = live_close_payload_code(message.payload);
-        when error != 0 { live_close(state.reactor,slot,error); term state; };
+        when error != 0 { io_ws_close(state.reactor,slot,error); term state; };
         Store#(reactor_row(state.reactor,slot)+112,1,8);
         io_queue(state.reactor,slot,ws_encode(grow_new(128),true,8,false,0,data+8,message.payload .^Length));
         term state;
@@ -89,15 +81,15 @@ defn live_fragment(state: ServerState, slot: Int, frame: WsFrame, message: WsMes
     let row: Int = reactor_row(state.reactor,slot);
     let pending: Int = Load#(row+104,8);
     when (frame.opcode == 0 && pending == 0) || (frame.opcode == 1 && pending != 0) {
-        live_close(state.reactor,slot,1002); term state;
+        io_ws_close(state.reactor,slot,1002); term state;
     };
     when frame.opcode == 1 && frame.fin { term live_text(state,slot,message.payload); };
     let length: Int = Load#(row+96,8);
-    when message.payload .^Length > SERVER_INPUT_LIMIT - length { live_close(state.reactor,slot,1009); term state; };
+    when message.payload .^Length > SERVER_INPUT_LIMIT - length { io_ws_close(state.reactor,slot,1009); term state; };
     let memory: Int = Load#(row+88,8);
     when memory == 0 {
         memory = Malloc#(SERVER_INPUT_LIMIT) as Int;
-        when memory == 0 { reactor_remove(state.reactor,slot); term state; };
+        when memory == 0 { reactor_remove(state.reactor,slot); term server_forget_live_session(state,slot); };
         Store#(row+88,memory,8);
     };
     Copy#((memory+length) as Ptr,(((message.payload as Data) as Int)+8) as Ptr,message.payload .^Length);
@@ -110,7 +102,7 @@ defn live_fragment(state: ServerState, slot: Int, frame: WsFrame, message: WsMes
 
 defn live_frame(state: ServerState, slot: Int, frame: WsFrame, message: WsMessage) -> ServerState {
     when frame.opcode >= 8 { term live_control(state,slot,frame,message); };
-    when frame.opcode == 2 { live_close(state.reactor,slot,1003); term state; };
+    when frame.opcode == 2 { io_ws_close(state.reactor,slot,1003); term state; };
     term live_fragment(state,slot,frame,message);
 };
 
@@ -121,16 +113,16 @@ defn live_frames(state: ServerState, slot: Int, budget: Int) -> ServerState {
     when input.len < 2 { term state; };
     let decoded: Result<WsFrame,String> = ws_decode(input,0);
     when is_err(decoded) {
-        when unwrap_err(decoded) != "incomplete" { live_close(state.reactor,slot,1002); };
+        when unwrap_err(decoded) != "incomplete" { io_ws_close(state.reactor,slot,1002); };
         term state;
     };
     let frame: WsFrame = unwrap(decoded);
     when !frame.masked || (Load#(input.ptr,1) & 112) != 0 ||
         (frame.opcode > 2 && frame.opcode < 8) || frame.opcode > 10 ||
         (frame.opcode >= 8 && (!frame.fin || frame.payload_len > 125)) {
-        live_close(state.reactor,slot,1002); term state;
+        io_ws_close(state.reactor,slot,1002); term state;
     };
-    when frame.payload_len > SERVER_INPUT_LIMIT - frame.header_len { live_close(state.reactor,slot,1009); term state; };
+    when frame.payload_len > SERVER_INPUT_LIMIT - frame.header_len { io_ws_close(state.reactor,slot,1009); term state; };
     when frame.header_len + frame.payload_len > input.len { term state; };
     let message: WsMessage = ws_message(input,0);
     io_consume(state.reactor,slot,message.consumed);

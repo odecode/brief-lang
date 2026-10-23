@@ -6,6 +6,55 @@ fn empty_program() -> Vec<TopLevel> {
     vec![]
 }
 
+#[test]
+fn mutable_parameter_allocas_keep_unique_ssa_names_in_the_body() {
+    let source = include_str!("../../../examples/recommender/sessions.bv");
+    let (items, universe) = crate::library::parse_and_check(
+        "examples/recommender/sessions.bv",
+        source,
+    )
+    .expect("session module should parse and typecheck");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    let start = ir
+        .find("define i64 @session_revoke_entries(")
+        .expect("session_revoke_entries should be emitted");
+    let function = &ir[start..start + ir[start..].find("\n}").expect("function should close")];
+    let mut definitions = std::collections::HashSet::new();
+    for line in function.lines() {
+        let Some((name, _)) = line.trim().split_once(" = ") else {
+            continue;
+        };
+        if name.starts_with('%') {
+            assert!(definitions.insert(name), "duplicate local LLVM value {name}:\n{function}");
+        }
+    }
+}
+
+#[test]
+fn reactive_rebinding_of_an_unpacked_object_commits_member_slots() {
+    let source = include_str!("../../../examples/recommender/server.bv");
+    let (items, universe) = crate::library::parse_and_check(
+        "examples/recommender/server.bv",
+        source,
+    )
+    .expect("recommender server should parse and typecheck");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    let start = ir
+        .find("define void @txn_serve(")
+        .expect("serve reactor node should be emitted");
+    let function = &ir[start..start + ir[start..].find("\n}").expect("function should close")];
+    let assignment = function
+        .split_once("call i64 @server_step(")
+        .map(|(_, tail)| tail)
+        .expect("serve node should call server_step");
+    assert!(
+        assignment.contains("getelementptr i8, ptr") && assignment.contains("store "),
+        "rebinding the unpacked server object must copy returned members into state slots:\n{function}"
+    );
+}
+
 /// A minimal eligible accel kernel: `a[i] = i` under `[i < N]` with a host
 /// bookkeeping write (`count = count + 1`).
 fn accel_kernel_program() -> Vec<TopLevel> {

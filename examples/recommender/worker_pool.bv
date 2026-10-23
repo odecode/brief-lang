@@ -16,6 +16,7 @@ import "std/os/fs.bv";
 import "std/env.bv";
 import "std/matrix.bv";
 import "std/rating_population.bv";
+import "./account_state.bv";
 import { buf_slice_string } from "std/net/http.bv";
 import "std/string_c.bv";
 
@@ -239,6 +240,9 @@ defn worker_child_handle(request: WorkerMessage, role: String, state: WorkerMode
                 response: worker_child_error(request,"database-unavailable",unwrap_err(reopened),true) }; };
             state.persistence = unwrap(reopened);
         };
+        when request.kind == "login" || request.kind == "register" || request.kind == "hydrate" {
+            term WorkerChildStep { state: state, response: worker_child_account_request(state.persistence,request) };
+        };
         let handled: PersistenceWorkerStep = persistence_worker_handle(state.persistence,request);
         state.persistence = handled.worker;
         when request.kind == "shutdown" && state.persistence.ready {
@@ -248,6 +252,61 @@ defn worker_child_handle(request: WorkerMessage, role: String, state: WorkerMode
         term WorkerChildStep { state: state, response: handled.reply };
     };
     term WorkerChildStep { state: state, response: worker_child_response(request,role,state) };
+};
+
+defn worker_child_account_request(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    when request.tag.profile.server_epoch != worker.server_epoch ||
+        (request.kind == "hydrate" && protocol_text(protocol_member(request.payload,"database_identity")) != worker.database_identity) {
+        term worker_child_error(request,"worker-identity","The account request does not match this worker's database identity.",false);
+    };
+    when request.kind == "register" { term worker_child_register(worker,request); };
+    when request.kind == "login" { term worker_child_login(worker,request); };
+    term worker_child_hydrate(worker,request);
+};
+
+defn worker_child_register(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let account: AccountResult = register(worker.conn,protocol_text(protocol_member(request.payload,"username")),
+        protocol_text(protocol_member(request.payload,"password")));
+    when !account.ok { term worker_child_error(request,account.error,
+        "Account creation could not be completed; check the credentials and database, then retry.",false); };
+    let fields: List<(String,JsonValue)> = [("account_id",IntVal(account.account.id)),("username",StrVal(account.account.username))];
+    term WorkerMessage { kind: "registered", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_login(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let authenticated: LoginResult = login(worker.conn,sessions_new(),protocol_text(protocol_member(request.payload,"username")),
+        protocol_text(protocol_member(request.payload,"password")));
+    when !authenticated.result.ok { term worker_child_error(request,authenticated.result.error,
+        "Username or password does not match; check the credentials and retry.",authenticated.result.error == "database"); };
+    let identity: AccountState = account_state(worker.conn,authenticated.sessions,authenticated.token);
+    when !identity.result.ok { term worker_child_error(request,identity.result.error,
+        "The account profile could not be loaded; retry sign in.",identity.result.error == "database"); };
+    let ratings: List<ProfileRating> = worker_child_profile_ratings(identity.ratings,0,[]);
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(ratings);
+    when is_err(encoded) { term worker_child_error(request,"profile-invalid","The account profile exceeds the supported rating bounds.",false); };
+    let fields: List<(String,JsonValue)> = [("account_id",IntVal(identity.result.account.id)),
+        ("username",StrVal(identity.result.account.username)),("token",StrVal(authenticated.token)),("ratings",unwrap(encoded))];
+    term WorkerMessage { kind: "authenticated", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_hydrate(worker: PersistenceWorker, request: WorkerMessage) -> WorkerMessage {
+    let issued: SessionIssue = session_issue(sessions_new(),request.tag.profile.account_id,0);
+    when !issued.ok { term worker_child_error(request,"session","Cannot create a temporary profile lookup token; retry hydration.",true); };
+    let state: AccountState = account_state(worker.conn,issued.sessions,issued.token);
+    when !state.result.ok { term worker_child_error(request,state.result.error,
+        "The account profile could not be loaded; retry hydration.",state.result.error == "database"); };
+    let ratings: List<ProfileRating> = worker_child_profile_ratings(state.ratings,0,[]);
+    let encoded: Result<JsonValue,String> = protocol_ratings_value(ratings);
+    when is_err(encoded) { term worker_child_error(request,"profile-invalid","The account profile exceeds the supported rating bounds.",false); };
+    let fields: List<(String,JsonValue)> = [("username",StrVal(state.result.account.username)),("ratings",unwrap(encoded))];
+    term WorkerMessage { kind: "hydrated", tag: request.tag, payload: Object(fields) };
+};
+
+defn worker_child_profile_ratings(rows: List<AccountRating>, idx: Int, ratings: List<ProfileRating>) -> List<ProfileRating> {
+    when idx >= rows .^Length { term ratings; };
+    let row: AccountRating = rows[idx];
+    let rating: List<ProfileRating> = [ProfileRating { item_id: row.item_id, rating: row.rating }];
+    term worker_child_profile_ratings(rows,idx+1,ratings+rating);
 };
 
 defn worker_child_send_message(fd: Int, message: WorkerMessage) -> Int {

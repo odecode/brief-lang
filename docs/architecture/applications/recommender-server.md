@@ -1,8 +1,9 @@
 # Recommender backend server
 
 `examples/recommender/server.bv` is the native reactor entry. It creates the
-schema, performs guarded baseline bootstrap and constructs a consistent engine
-snapshot before listening. There is no authored main function. The perpetual
+base schema and durable rating-receipt table, performs guarded baseline
+bootstrap and constructs a consistent engine snapshot before listening. There
+is no authored main function. The perpetual
 serve node calls one poll sweep at a time. All application/protocol/client code
 is Briev; PostgreSQL is external infrastructure.
 
@@ -20,9 +21,17 @@ unversioned paths remain aliases. Registration returns protocol version and
 type fields. Login also returns the opaque process-local token, account ID,
 username and this process's random server epoch. The epoch is preserved across
 server-state copies and changes on restart. GET /v1/state?token=... returns a
-versioned profile envelope with that owner's identity and ratings; `/state`
-remains an alias. POST /rating accepts token/item_id/rating and performs an
-account-scoped upsert. GET /movies lists the zero-based movie IDs. GET
+versioned profile envelope with that owner's identity, ratings, current in-memory
+revision and retained operation summaries; `/state` remains an alias. POST
+/v1/operations/status?token=... returns in-memory status for up to 64
+requested operation IDs. Uncertain operations are reconciled against durable
+receipts by the persistence child when it is idle; while it is busy, the reactor
+returns its cached status snapshot.
+POST /v1/operations/{id}/retry and `/discard` queue resolution for a
+definitively failed operation. POST /v1/logout?token=... revokes only that process-local
+session (`/logout` is an alias), closes live channels opened with that token,
+and leaves other sessions for the account valid. POST /rating accepts
+token/item_id/rating and performs an account-scoped upsert. GET /movies lists the zero-based movie IDs. GET
 /recommendations?token=... returns cold_start:true below five distinct ratings,
 or recommendations ordered by descending score and ascending item ID.
 POST /admin/refresh schedules a snapshot rebuild; this demo endpoint has no
@@ -30,14 +39,25 @@ separate admin-auth scheme. OPTIONS responds with permissive CORS headers.
 
 GET /v1/live?token=... (also `/live`) requires a version-13 WebSocket handshake with a valid
 16-byte nonce. After upgrade, JSON text accepts item_id/rating. A token in the
-frame never changes its connection owner. Successful HTTP or live ratings push
-the owner's updated state to all of that owner's open channels only. Validation
-errors go to the submitting channel. Ping receives Pong; Close is echoed.
+frame never changes its connection owner. The reactor binds each live channel to
+the exact token used at upgrade; logout closes channels for that token, while
+other sessions for the same account remain usable. Successful HTTP or live
+ratings publish accepted, recommendation, and save events to that owner's open
+channels only. HTTP fallback POST `/v1/ratings?token=...` returns 202 with the
+accepted event. Validation errors go to the submitting channel. Ping receives
+Pong; Close is echoed.
 Masked client frames, fragmented text and interleaved control frames are
 supported. Invalid RSV/opcode/masking/length/UTF-8/fragment sequences close with
 the appropriate protocol code. Binary messages are unsupported (1003).
 
 ## Ownership and scheduling
+
+The current integration runs one persistence child and one prediction child.
+Each channel permits one outstanding request, so at most one new rating is
+admitted globally at a time; excess work receives 503 and can be retried. The
+reactor polls both channels nonblocking and does not execute login, persistence,
+or prediction on the rating request path. Worker counts remain explicit startup
+configuration points for later scaling.
 
 server_io.bv owns bounded raw input/output buffers. It reads or sends at most
 one syscall's bytes per connection per sweep. EAGAIN/EINTR preserve progress.

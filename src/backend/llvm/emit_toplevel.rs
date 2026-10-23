@@ -3496,6 +3496,12 @@ impl LlvmBackend {
     }
 
     pub(super) fn emit_definition(&mut self, out: &mut String, d: &crate::ast::Definition, needs_state: bool) {
+        // 2026-10-23: reset before parameter prologue emission. Mutable
+        // parameters allocate their entry slots from txn_counter; resetting
+        // again after binding them reused those SSA names in the function
+        // body. Undo only when parameter slots use a separate allocator whose
+        // namespace is carried through body emission.
+        self.fun.txn_counter = 0;
         self.fun.pending_cleanup.clear();
         self.fun.clear_locals();
         // 2026-10-21: a definition owns its commit context. A specialization
@@ -3683,7 +3689,6 @@ impl LlvmBackend {
                 self.fun.let_binding_types.insert(n.clone(), t.clone());
             }
         }
-        self.fun.txn_counter = 0;
         self.fun.terminated = false;
         // 2026-06-26: in_callable_txn must be true so Statement::Term in the
         // defn body emits a ret instruction (emit_stmt.rs line 78). Without

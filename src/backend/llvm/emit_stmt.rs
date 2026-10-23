@@ -20,6 +20,68 @@ fn is_enum_handle_type(backend: &LlvmBackend, ty: &Type) -> bool {
     }
 }
 
+/// Commit a whole-object assignment to a top-level unpacked object instance.
+/// Such objects have no `%State` handle slot: their members live in the type's
+/// shared columns at the instance's recorded row. Ordinary local aggregate
+/// assignments stay on the existing local-binding path.
+fn emit_unpacked_instance_rebind(
+    backend: &mut LlvmBackend,
+    out: &mut String,
+    indent: &str,
+    name: &str,
+    value: &TypedRegister,
+) -> bool {
+    let (Type::Custom(type_name) | Type::Applied(type_name, _)) = &value.ty else {
+        return false;
+    };
+    if backend.fun.let_bindings.contains_key(name)
+        || !backend.ctx.instance_rows.contains_key(name)
+        || !backend.ctx.struct_types.contains_key(type_name)
+    {
+        return false;
+    }
+    let type_prefix = format!("{}.", type_name);
+    if !backend.ctx.field_index_map.keys().any(|slot| slot.starts_with(&type_prefix)) {
+        return false;
+    }
+
+    // 2026-10-23: top-level reactive object rebinds must copy the returned
+    // members into the unpacked instance row. Before this, the RHS ran but
+    // the root name had no state slot, so the new object was silently lost.
+    // Retire this path only if object instances gain a first-class aggregate
+    // slot in `%State` and ordinary assignment emission handles it.
+    let members = backend.ctx.struct_types.get(type_name).cloned().unwrap_or_default();
+    let mut stores = Vec::new();
+    for (member, _) in members {
+        let slot = format!("{}.{}", type_name, member);
+        let Some(&index) = backend.ctx.field_index_map.get(&slot) else { continue; };
+        let offset = backend.lookup_field_offset(type_name, &member);
+        stores.push((index, offset));
+    }
+    stores.sort_by_key(|(index, _)| *index);
+    if stores.is_empty() {
+        return false;
+    }
+
+    let row = backend.ctx.instance_rows.get(name).cloned().unwrap_or_else(|| "0".to_string());
+    let row = if backend.ctx.boxed_offsets.contains_key(type_name) {
+        value.name.clone()
+    } else {
+        row
+    };
+    let object = backend.fun.gen_reg();
+    backend.emit_inttoptr(out, indent, &object, &value.name);
+    for (index, offset) in stores {
+        let source = backend.fun.gen_reg();
+        writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, source, object, offset).ok();
+        let (target, _, field_ty) = backend.emit_instance_column_row(out, indent, index, &row);
+        let member_value = backend.fun.gen_reg();
+        writeln!(out, "{}{} = load {}, ptr {}", indent, member_value, field_ty, source).ok();
+        writeln!(out, "{}store {} {}, ptr {}", indent, field_ty, member_value, target).ok();
+    }
+    true
+}
+
 /// Emit LLVM IR for a statement. Returns the last expression's register.
 /// 2026-07-31 (A5): emit a sequence of statements (an obj member body).
 pub fn emit_statement_sequence(
@@ -926,6 +988,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             let val = backend.emit_contextual_expr(out, rhs, expected.as_ref(), indent);
             match lhs {
                 Expr::Identifier(name) => {
+                    if emit_unpacked_instance_rebind(backend, out, indent, name, &val) {
+                        return TypedRegister { name: val.name, ty: Type::void() };
+                    }
                     // 2026-08-07 (object instance pools): a bare member
                     // target in an UNPACKED member body writes the instance's
                     // top-level slot — `total = 1` in `st`'s member → the

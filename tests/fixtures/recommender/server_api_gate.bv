@@ -26,6 +26,9 @@ node run [tick < 1][tick == 1] {
     let signed_in: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
     let token: String = api_input(signed_in.body).token;
     sessions = signed_in.sessions;
+    let signed_in_second: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
+    let second_token: String = api_input(signed_in_second.body).token;
+    sessions = signed_in_second.sessions;
     let auth_contract: Bool = str_find(registered.body,"\"type\":\"registered\"") >= 0 &&
         str_find(signed_in.body,"\"type\":\"authenticated\"") >= 0 &&
         str_find(signed_in.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
@@ -40,13 +43,17 @@ node run [tick < 1][tick == 1] {
     let state: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
     let logout: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/logout?token="+token,""),0.5,1,API_GATE_EPOCH);
     let after_logout: ApiReply = api_dispatch(conn,logout.sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let other_session: ApiReply = api_dispatch(conn,logout.sessions,model,api_gate_request("GET","/v1/state?token="+second_token,""),0.5,1,API_GATE_EPOCH);
+    let repeated_logout: ApiReply = api_dispatch(conn,logout.sessions,model,api_gate_request("POST","/v1/logout?token="+token,""),0.5,1,API_GATE_EPOCH);
     let malformed: Bool = !api_input("{\"rating\":3} junk").ok && !api_input("{\"rating\":3,\"rating\":4}").ok && api_input("{\"rating\":3.5}").rating == -1;
     let state_contract: Bool = str_find(state.body,"\"type\":\"state\"") >= 0 &&
         str_find(state.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
         str_find(state.body,"\"username\":\"alice\"") >= 0 && str_find(state.body,"\"ratings\":") >= 0;
     let logout_contract: Bool = logout.status == 200 && str_find(logout.body,"\"type\":\"logged-out\"") >= 0 &&
-        after_logout.status == 401 && session_account(logout.sessions,token) == 0;
-    let valid: Bool = registered.status == 200 && signed_in.status == 200 && token .^Length == 32 &&
+        after_logout.status == 401 && repeated_logout.status == 401 && other_session.status == 200 &&
+        session_account(logout.sessions,token) == 0 && session_account(logout.sessions,second_token) == 1;
+    let valid: Bool = registered.status == 200 && signed_in.status == 200 && signed_in_second.status == 200 &&
+        token .^Length == 32 && second_token .^Length == 32 && token != second_token &&
         auth_contract && cold.body == "{\"cold_start\":true}" && rated &&
         str_find(recs.body,"recommendations") >= 0 && state_contract && malformed && logout_contract;
     println!("api_gate={} auth_contract={} state_contract={} logout_contract={} recs={}",valid,auth_contract,state_contract,logout_contract,recs.body);
