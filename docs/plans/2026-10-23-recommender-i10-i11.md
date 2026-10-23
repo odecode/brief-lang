@@ -1,7 +1,7 @@
 # Recommender I10/I11 integration
 
-**Date:** 2026-10-23  
-**Status:** implementation complete; Cargo test confirmation pending  
+**Date:** 2026-10-23
+**Status:** implementation complete; Cargo test confirmation pending
 **Branch:** `recommender-proof-of-concept`
 
 ## Scope
