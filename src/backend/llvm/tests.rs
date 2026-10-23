@@ -3389,11 +3389,14 @@ fn test_range_metadata_suppressed_for_written_field() {
     // field loads. The inline `!range !{0, bound}` reload emitted by
     // emit_precondition_check is sound (fresh read inside the guard's safe path)
     // and is allowed to remain.
-    let module_level_range_on_x_load = output.contains("!range !50")
-        || output.contains("!range !51");
+    let module_level_range_on_x_load = output.lines().any(|line| {
+        line.split_once("!range !")
+            .and_then(|(_, suffix)| suffix.chars().next())
+            .is_some_and(|first| first.is_ascii_digit())
+    });
     assert!(!module_level_range_on_x_load,
         "precondition-derived !range must not attach to loads of a written field\n{output}");
-    assert!(!output.contains("!5 = !{ i64 -9223372036854775808, i64 1 }"),
+    assert!(!output.contains(" = !{ i64 -9223372036854775808, i64 1 }"),
         "the module-level range node for the written field must not be emitted\n{output}");
 }
 
@@ -9758,6 +9761,27 @@ fn test_webstack_int_literal_emits_target_width() {
         "Int literal must emit at i32 for wasm32; got:\n{ir}");
     assert!(!ir.contains("add i64 0, 1"),
         "Int literal must not hardcode i64; got:\n{ir}");
+}
+
+#[test]
+fn test_wasm32_int_constant_global_and_load_use_target_width() {
+    let src = r#"
+const ITEM_LIMIT: Int = 1682;
+defn below_limit(value: Int) -> Bool { term value < ITEM_LIMIT; };
+node start [true][true] { term below_limit(1); };
+"#;
+    let tokens = crate::lexer::tokenize(src).unwrap();
+    let mut parser = crate::parser::Parser::new(tokens, src);
+    let items = parser.parse_program().unwrap();
+    let mut backend = LlvmBackend::new()
+        .with_webstack(true)
+        .with_int_bits(32)
+        .with_target_triple("wasm32-unknown-wasi")
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let ir = backend.generate(&items, None);
+    assert!(ir.contains("@ITEM_LIMIT = constant i32 1682"), "constant global must use wasm32 Int width:\n{ir}");
+    assert!(ir.contains("load i32, ptr @ITEM_LIMIT"), "constant reference must use the declared target width:\n{ir}");
+    assert!(!ir.contains("load i64, ptr @ITEM_LIMIT"), "constant reads cannot hardcode i64 on wasm32:\n{ir}");
 }
 
 #[test]

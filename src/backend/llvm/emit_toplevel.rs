@@ -3946,6 +3946,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         field_llvm_ty: &str,
         lo: i64,
         hi: i64,
+        metadata_counter: &mut usize,
     ) -> Option<usize> {
         // Extract the integer width from the LLVM type ("i8"/"i16"/"i32"/"i64").
         // 2026-09-02 (plan fundamental-parent-membership): range metadata is
@@ -3973,7 +3974,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         if hi > max_signed || lo < min_signed {
             return None;
         }
-        let mi = range_meta.len() + 50;
+        let mi = super::reserve_metadata_ids(metadata_counter, 1);
         range_meta.push(format!("!{} = !{{ {} {}, {} {} }}", mi, field_llvm_ty, lo, field_llvm_ty, hi));
         Some(mi)
     }
@@ -4096,16 +4097,18 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         let written_fields = self.ctx.transition_graph.as_ref()
             .map(|g| g.nodes.iter().flat_map(|n| n.write_set.iter().cloned()).collect::<HashSet<String>>())
             .unwrap_or_default();
-        for (f, &(lo, hi)) in &self.ctx.range_bounds {
+        let mut contract_ranges: Vec<_> = self.ctx.range_bounds.iter().collect();
+        contract_ranges.sort_by(|left, right| left.0.cmp(right.0));
+        for (f, &(lo, hi)) in contract_ranges {
             if hi < i64::MAX && !written_fields.contains(f) {
-                // 2026-07-18: Offset by 50 to avoid collision with TBAA metadata nodes
-                // (!0 through ~!20). LLVM metadata IDs must be unique across the module.
+                // 2026-10-22: share the module allocator with TBAA/loop
+                // nodes; fixed offsets overlapped as the type universe grew.
                 // 2026-08-01: bounds emitted in the field's LLVM integer width
                 // (range metadata must match the load type — see emit_range_metadata).
                 let field_llvm = self.ctx.field_types.get(
                     self.ctx.field_index_map.get(f).copied().unwrap_or(0),
                 ).cloned().unwrap_or_else(|| "i64".to_string());
-                if let Some(mi) = Self::emit_range_metadata(range_meta, &field_llvm, lo, hi) {
+                if let Some(mi) = Self::emit_range_metadata(range_meta, &field_llvm, lo, hi, &mut self.ctx.metadata_counter) {
                     self.ctx.field_to_meta_idx.insert(f.clone(), mi);
                 }
             }
@@ -4117,14 +4120,16 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         // precondition required. This is information the type system
         // provides for free that LLVM uses to eliminate bounds checks.
         if let Some(ref universe) = self.ctx.type_universe {
-            for (field_name, &idx) in &self.ctx.field_index_map {
+            let mut fields: Vec<_> = self.ctx.field_index_map.iter().collect();
+            fields.sort_by(|left, right| left.0.cmp(right.0));
+            for (field_name, &idx) in fields {
                 let briev_ty = self.ctx.field_briev_types.get(idx);
                 let Some(briev_ty) = briev_ty else { continue; };
                 let Some(range_bounds) = Self::type_driven_range(universe, briev_ty) else { continue; };
                 // Only add if no contract-driven range already exists
                 // (contract ranges are tighter and take priority).
                 if !self.ctx.field_to_meta_idx.contains_key(field_name) {
-                    // 2026-07-18: Offset by 50 to avoid TBAA node collision.
+                    // 2026-10-22: the module allocator prevents TBAA collisions.
                     // 2026-08-01: bounds emitted in the field's LLVM width —
                     // `!{ i64 0, i64 256 }` on a load i8 (Bool/UInt8/Int8)
                     // crashes clang. Skip when the bound is vacuous for the
@@ -4132,7 +4137,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
                     let field_llvm = self.ctx.field_types.get(idx)
                         .cloned().unwrap_or_else(|| "i64".to_string());
                     if let Some(mi) = Self::emit_range_metadata(
-                        range_meta, &field_llvm, range_bounds.0, range_bounds.1,
+                        range_meta, &field_llvm, range_bounds.0, range_bounds.1, &mut self.ctx.metadata_counter,
                     ) {
                         self.ctx.field_to_meta_idx.insert(field_name.clone(), mi);
                     }

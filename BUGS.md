@@ -10873,3 +10873,118 @@ operations remain eager. Native -O0/-O2 and LLVM verifier regressions are in
 Conditional expression-block writes also require entry-slot discovery for locals
 and mutable native ABI parameters. Logical merges discard RHS-only pointer,
 state-pointer and last-value cache entries to preserve SSA dominance.
+
+## Recommender clock failure reads unwritten timespec (2026-10-22)
+
+I01 instrumentation review found `server_time(clock_id)` loading the allocated
+timespec before checking the clock_gettime syscall result. An invalid clock ID
+therefore read memory the syscall had not initialized. The failure guard now
+frees the allocation and returns -1 before either load. The new trace helper
+uses the same ordering. Regression: `responsiveness_trace_gate.bv` calls
+`server_time(-1)` and checks the error sentinel. Native gate passes with tracing
+disabled and enabled (2026-10-22).
+`server_timestamp` also preserves a failed clock's -1 instead of dividing it to
+zero, so rating persistence rejects the invalid timestamp rather than storing it.
+
+## Print macros skipped nested statement and operand positions (2026-10-22)
+
+The recommender worker contract's foreach/guard failure diagnostic reached LLVM
+as PluginIntercept and panicked. Print expansion had partial private walkers:
+foreach/match bodies, container/operand positions and behavioral members could
+escape resolution. The new exhaustive mutable postorder AST visitor processes
+children before print replacement, preserving nested receiver/argument expansion.
+The print plugin uses it and returns nested format errors. Print# retains typed
+dispatch; its unused annotation table and partial walkers are retired.
+Regression coverage includes nested diagnostics, unknown-plugin children,
+malformed nested formats, exactly-once postorder mutation and read/mutable
+coverage agreement. See docs/architecture/ast-traversal.md and the dated plan.
+
+## 2026-10-22 — WASM codec imports dead native assembly through closed reflection (OPEN)
+
+**Symptom:** building the I02 browser codec fixture for wasm32 reaches the
+stdlib `Prefetch` assembly wrapper, which has no wasm32 lowering. The fixture
+does not call that wrapper. Bypassing that check also showed native
+`stdout_flush` and its Linux `briev_syscall` call in emitted IR.
+
+**Root cause:** compile-time reflection set `DefnLiveness.keep_all` for every
+target. JSON integer and finite-number checks use closed value inspections such
+as `.^^Bytes`; these inspect receiver metadata and cannot look up a callable.
+Keeping all imported definitions defeats target-specific dead-code elimination.
+
+**Fix:** closed `Size`, `Bytes`, `Alignment`, and `Type` inspections traverse
+receiver dependencies without setting `keep_all`. Unknown reflection targets
+retain the existing conservative behavior. Regression tests cover all four
+closed targets, receiver-call reachability, and the fallback. The emitted-call
+soundness net remains enabled.
+
+## 2026-10-22 — collection arrows retain unused task runtime (OPEN)
+
+**Symptom:** a WASM program using JSON collection updates emits task scheduling,
+`event_strict_trap` and its Linux `briev_syscall` helper despite containing no
+event operation.
+
+**Root cause:** liveness seeded the complete task/event helper family for every
+`ArrowAssign`. Collection writes share this syntax with event-wire writes, so
+ordinary list mutation pulled in unrelated target-specific code.
+
+**Fix:** remove the statement-level task/event seed and let the emitted-call
+fixpoint derive backend-generated event calls. The regression checks ordinary
+arrow writes do not retain unused task/event helpers. See
+`docs/plans/2026-10-22-event-trap-liveness.md`.
+
+## 2026-10-22 — wasm32 typed Int constant emits an i64 load (OPEN)
+
+**Symptom:** comparing a Briev `Int` field against a typed Int constant emits
+`icmp i32 ..., i64 ...` on wasm32, and `llc` rejects the module.
+
+**Root cause:** constant globals used the target-independent protocol width,
+and identifier reads hardcoded `load i64`. Flexible Int is i32 on wasm32.
+
+**Fix:** use the backend's target-derived `llvm_type` for constant globals,
+aliases and loads, and retain the declared Briev type in the loaded register.
+The wasm32 regression covers declaration and read. See
+`docs/plans/2026-10-22-wasm-constant-width.md`.
+
+## 2026-10-22 — LLVM metadata reservations overlap on large programs (FIXED in working tree)
+
+The recommender server emitted both a TBAA type node and StateAliasScope as
+`!99`; clang rejected it with “Metadata id is already used.” Range nodes began
+at !50 and loop/invariant-load nodes at !100, so these families could also
+overlap. Function resets additionally cleared pending module metadata.
+
+All generated nodes now use one module counter after the registered TBAA
+prefix. Pending definitions survive function reset/snapshot operations and
+reset only per emission round. Regression tests cover large universes, late
+structural registration, and cross-function metadata lifetime. See
+`docs/plans/2026-10-22-module-metadata-allocation.md` for verification evidence.
+
+## 2026-10-23 — multibyte view text shifts later directives (FIXED in working tree)
+
+**Symptom:** generated browser HTML becomes malformed when UTF-8 text appears
+before a later `b-*` directive. ASCII-only templates remain intact.
+
+**Root cause:** `ViewCompiler::inject_ids_inner` advanced a byte offset by one
+after copying a Unicode scalar, then used that offset to slice the UTF-8 source.
+The cursor stopped at a non-character boundary and later tag processing drifted.
+
+**Fix:** copy the next scalar from the current byte boundary and advance by its
+UTF-8 byte length. The focused regression places accented, CJK and multibyte
+punctuation before two injected directive tags. See
+`docs/plans/2026-10-09-fullstack-stdlib-and-net-stack.md` for the I09 discovery.
+
+## 2026-10-23 — recommender browser account API used a different contract (FIXED in working tree)
+
+**Symptom:** `/movies` returned successfully, but browser registration and sign-in
+failed, and authenticated profile hydration expected fields that the server did
+not return.
+
+**Root cause:** the browser called `/v1/register`, `/v1/login` and `/v1/state`,
+while native dispatch only recognized unversioned paths. The server's login
+response also lacked the protocol version, message type, account identity and
+process epoch required by the browser client.
+
+**Fix:** normalize the optional `/v1/` prefix at route dispatch, preserve one
+random server epoch through state copies, and return versioned authentication
+and profile envelopes while retaining legacy identity fields and routes. The
+server API gate now exercises versioned registration, sign-in and state reads.
+See `docs/plans/2026-10-23-recommender-account-api-integration.md`.

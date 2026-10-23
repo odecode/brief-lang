@@ -23,6 +23,19 @@ defn session_account(store: SessionStore, token: String) -> Int {
     term session_find(store, token, 0);
 };
 
+defn session_revoke_entries(entries: List<AccountSession>, token: String, idx: Int,
+    remaining: List<AccountSession>) -> List<AccountSession> {
+    when idx >= entries .^Length { term remaining; };
+    when entries[idx].token != token { remaining <- entries[idx]; };
+    term session_revoke_entries(entries,token,idx+1,remaining);
+};
+
+defn session_revoke(store: SessionStore, token: String) -> SessionStore {
+    when token .^Length != 32 || session_account(store,token) == 0 { term store; };
+    let remaining: List<AccountSession> = [];
+    term SessionStore { entries: session_revoke_entries(store.entries,token,0,remaining) };
+};
+
 // 2026-10-21: use existing pure-Briev file/syscall wrappers for entropy.
 // Partial reads and EINTR must not publish an uninitialized token suffix.
 // Every acquired descriptor/allocation is closed/freed on both success/failure.

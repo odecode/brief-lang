@@ -2613,9 +2613,8 @@ impl LlvmBackend {
         // GEP+load per iteration per pointer field.
         // See docs/plans/2026-07-29-frontend-ir-quality-improvements.md §B.
         if matches!(briev_ty, Type::Ptr(_) | Type::PtrConst(_)) {
-            let md_idx = self.fun.metadata_counter;
-            self.fun.metadata_counter += 1;
-            writeln!(self.fun.pending_metadata, "!{} = !{{}}", md_idx).ok();
+            let md_idx = super::reserve_metadata_ids(&mut self.ctx.metadata_counter, 1);
+            writeln!(self.ctx.pending_metadata, "!{} = !{{}}", md_idx).ok();
             write!(out, ", !invariant.load !{}", md_idx).ok();
         }
         writeln!(out).ok();

@@ -306,3 +306,12 @@ BUGS.md and docs/plans/2026-10-21-recommender-server.md. Compiler fix is prepare
 on its own main-based branch. Interpreter changes are excluded by explicit user
 instruction. Final native/property/library verification is recorded in the task
 plan; no throughput/latency claim is made before task 16.
+
+I09 view compiler UTF-8 cursor (2026-10-23): generated recommender HTML exposed
+a view compiler cursor bug. Copying a multibyte scalar advanced the byte offset
+by one, corrupting later injected directive tags. `ViewCompiler::inject_ids_inner`
+now advances by `char::len_utf8()`, with a regression that puts accented, CJK
+and punctuation text before directives. The human runs Cargo tests/rebuild per
+WORKFLOW.md; the existing WSL `brievc` binary predates this Rust edit. I09 keeps
+static template punctuation ASCII until the rebuilt compiler verifies Unicode
+output.

@@ -11,22 +11,19 @@ use std::collections::HashMap;
 struct LogicalInputs<'a> { left: &'a Expr, right: &'a Expr, exit: bool }
 
 struct LogicalScope {
-    pointers: HashMap<String, String>,
-    fields: HashMap<usize, (String, String)>,
     values: HashMap<String, String>,
 }
 
 impl LlvmBackend {
     fn logical_scope(&self) -> LogicalScope {
-        LogicalScope { pointers: self.fun.canonical_ptrs.clone(),
-            fields: self.fun.state_ptr_cache.clone(), values: self.fun.last_val_temps.clone() }
+        LogicalScope { values: self.fun.last_val_temps.clone() }
     }
 
     fn merge_logical_scope(&mut self, before: LogicalScope) {
         // 2026-10-22: RHS-only registers do not dominate the skipped edge.
         // Keep only unchanged incoming caches; invalidations stay invalidated.
-        self.fun.canonical_ptrs.retain(|key, value| before.pointers.get(key) == Some(value));
-        self.fun.state_ptr_cache.retain(|key, value| before.fields.get(key) == Some(value));
+        // The recommender integration predates main's pointer caches. Keep its
+        // existing context surface; main's isolated fix also scopes those caches.
         self.fun.last_val_temps.retain(|key, value| before.values.get(key) == Some(value));
         self.fun.last_val_types.retain(|key, _| self.fun.last_val_temps.contains_key(key));
     }

@@ -140,13 +140,20 @@ defn model_restore(path: String, revision: String, baseline: Int, items: Int) ->
     let read: Result<String,Int> = read_file(path);
     when is_err(read) { term Err(store_error("No readable recommendation snapshot; rebuild it from the database.")); };
     let image: String = unwrap(read);
+    let restored: Result<ServerModel,PgResult> = model_restore_image(image,revision,baseline,items);
+    Free#(((image as Data) as Int) as Ptr);
+    term restored;
+};
+
+// 2026-10-22: worker installation already owns a bounded immutable image read;
+// validate/decode those exact bytes instead of reopening a mutable path and
+// duplicating up to 512 MiB. Keep path-based restore as a compatibility wrapper.
+// Remove this image entry point only if every caller has equally bounded bytes.
+defn model_restore_image(image: String, revision: String, baseline: Int, items: Int) -> Result<ServerModel,PgResult> {
     when !model_image_valid(image,revision,baseline,items) {
-        Free#(((image as Data) as Int) as Ptr);
         term Err(store_error("Recommendation snapshot is stale, incompatible or damaged; rebuild it from the database."));
     };
-    let model: ServerModel = model_decode(image);
-    Free#(((image as Data) as Int) as Ptr);
-    term Ok(model);
+    term Ok(model_decode(image));
 };
 
 defn model_rename(source: String, target: String) -> Int {

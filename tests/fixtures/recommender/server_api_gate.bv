@@ -4,6 +4,8 @@
 import "../../../examples/recommender/server_api.bv";
 import "std/env.bv";
 
+const API_GATE_EPOCH: String = "0123456789abcdef0123456789abcdef";
+
 defn api_gate_request(method: String, path: String, body: String) -> HttpRequest {
     term HttpRequest { method: method, path: path, headers: "", body: body };
 };
@@ -20,21 +22,34 @@ node run [tick < 1][tick == 1] {
     when is_err(loaded) { println!("model failure={}",unwrap_err(loaded).err_msg); endprogram 1; };
     let model: ServerModel = unwrap(loaded);
     let sessions: SessionStore = sessions_new();
-    let registered: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/register","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1);
-    let signed_in: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1);
+    let registered: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/register","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
+    let signed_in: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/login","{\"username\":\"alice\",\"password\":\"secret\"}"),0.5,1,API_GATE_EPOCH);
     let token: String = api_input(signed_in.body).token;
     sessions = signed_in.sessions;
-    let cold: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1);
+    let auth_contract: Bool = str_find(registered.body,"\"type\":\"registered\"") >= 0 &&
+        str_find(signed_in.body,"\"type\":\"authenticated\"") >= 0 &&
+        str_find(signed_in.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
+        str_find(signed_in.body,"\"account_id\":1") >= 0;
+    let cold: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1,API_GATE_EPOCH);
     let rated: Bool = true;
     foreach item in 0..5 {
-        let reply: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/rating","{\"token\":"+api_quote(token)+",\"item_id\":"+item as String+",\"rating\":4}"),0.5,1);
+        let reply: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/rating","{\"token\":"+api_quote(token)+",\"item_id\":"+item as String+",\"rating\":4}"),0.5,1,API_GATE_EPOCH);
         when reply.status != 200 { rated = false; };
     };
-    let recs: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1);
-    let state: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/state?token="+token,""),0.5,1);
+    let recs: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/recommendations?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let state: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let logout: ApiReply = api_dispatch(conn,sessions,model,api_gate_request("POST","/v1/logout?token="+token,""),0.5,1,API_GATE_EPOCH);
+    let after_logout: ApiReply = api_dispatch(conn,logout.sessions,model,api_gate_request("GET","/v1/state?token="+token,""),0.5,1,API_GATE_EPOCH);
     let malformed: Bool = !api_input("{\"rating\":3} junk").ok && !api_input("{\"rating\":3,\"rating\":4}").ok && api_input("{\"rating\":3.5}").rating == -1;
-    let valid: Bool = registered.status == 200 && signed_in.status == 200 && token .^Length == 32 && cold.body == "{\"cold_start\":true}" && rated && str_find(recs.body,"recommendations") >= 0 && str_find(state.body,"alice") >= 0 && malformed;
-    println!("api_gate={} recs={} state={}",valid,recs.body,state.body);
+    let state_contract: Bool = str_find(state.body,"\"type\":\"state\"") >= 0 &&
+        str_find(state.body,"\"server_epoch\":\""+API_GATE_EPOCH+"\"") >= 0 &&
+        str_find(state.body,"\"username\":\"alice\"") >= 0 && str_find(state.body,"\"ratings\":") >= 0;
+    let logout_contract: Bool = logout.status == 200 && str_find(logout.body,"\"type\":\"logged-out\"") >= 0 &&
+        after_logout.status == 401 && session_account(logout.sessions,token) == 0;
+    let valid: Bool = registered.status == 200 && signed_in.status == 200 && token .^Length == 32 &&
+        auth_contract && cold.body == "{\"cold_start\":true}" && rated &&
+        str_find(recs.body,"recommendations") >= 0 && state_contract && malformed && logout_contract;
+    println!("api_gate={} auth_contract={} state_contract={} logout_contract={} recs={}",valid,auth_contract,state_contract,logout_contract,recs.body);
     model_free(model); pg_close(conn);
     when !valid { endprogram 1; };
     tick = 1; endprogram;

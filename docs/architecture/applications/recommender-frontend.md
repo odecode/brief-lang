@@ -1,11 +1,38 @@
 # Recommender browser frontend
 
-`examples/recommender/app.rbv` provides registration/login, a movie catalogue,
-account-owned ratings, a five-distinct-rating cold-start gate, and the latest
-WebSocket recommendation set. Movie numbers displayed in the UI are one-based;
-the HTTP/WebSocket protocol uses zero-based item IDs. Updating an existing
-rating does not count as another distinct movie. Logout closes the channel,
-cancels the owned reconnect timer and clears account state.
+`examples/recommender/app.rbv` provides asynchronous registration/login,
+account hydration, a movie catalogue, account-owned ratings, a five-distinct-
+rating cold-start gate, and the latest WebSocket recommendation set. Movie
+numbers displayed in the UI are one-based; the HTTP/WebSocket protocol uses
+zero-based item IDs. Updating an existing rating does not count as another
+distinct movie.
+
+Account requests use `POST /v1/register` and `POST /v1/login`. The native
+server accepts those routes and their unversioned aliases. Login returns the
+protocol version, authenticated account identity, session token and process
+epoch; the following `/v1/state` response carries a versioned profile envelope.
+The server epoch remains stable through state copies and changes after restart,
+so browser profile checks are scoped to the live server process.
+
+The browser keeps an operation record per save. It paints that rating locally
+before sending, marks it pending, and submits over WebSocket when the live
+channel is open. Otherwise it sends the same operation ID through asynchronous
+HTTP. A transport failure becomes uncertain and is reconciled by operation
+status; the browser never silently replays a possibly accepted write. Definite
+rejections remain unsent, while accepted, saved, failed, retrying, discarding,
+and discarded states are tracked separately. Save confirmation only changes
+save status; it does not render recommendations. Recommendations update only
+when a prediction matches the current profile revision, and the previous list
+stays visible while that prediction is pending.
+
+Login, profile hydration, catalogue reads, saves, operation resolution and
+reconnect are asynchronous HTTP requests. The host keeps bounded request
+handles outside WASM's String ABI; completion events are checked against the
+current session generation before their bodies are applied. Logout explicitly
+asks before leaving unresolved operations, cancels owned requests and the live
+channel, invalidates stale callbacks, cancels the reconnect timer and clears
+account state. A `beforeunload` warning is active while local operations remain
+unresolved.
 
 ## Run locally (Linux/WSL)
 
@@ -36,12 +63,13 @@ and refresh ownership. Run database gates only against a dedicated test DB.
 ## Host and lifetime boundaries
 
 The browser prelude supplies portable casting/formatting and iterator modules,
-without Linux process/environment/syscall lanes. `std/web/fetch.bv` retains
-`fetch` and adds HTTP verb helpers over `fetch_method`. Requests return response
-text synchronously because the current WASM String ABI cannot consume Promises;
-JSON serialization/parsing remains Briev code. HTTP error bodies reach the app
-for application diagnostics. This synchronous boundary can block the UI while
-waiting for a response; asynchronous request ABI design is separate work.
+without Linux process/environment/syscall lanes. `std/web/fetch.bv` retains the
+legacy synchronous `fetch` helpers for compatibility and adds bounded async
+request handles for interactive flows. Promise objects never cross the WASM
+String ABI: JavaScript stores the response, then dispatches a window event with
+the numeric handle. The Briev app copies the body and releases the handle.
+HTTP error bodies retain their status and reach Briev for application-level
+diagnostics.
 
 `std/web/websocket.bv` wraps per-channel host handles. Each channel owns a bounded
 FIFO (128 text messages / 1 MiB UTF-8), its error and event name. Queued browser
@@ -75,6 +103,19 @@ Build `tests/fixtures/collection_snapshot.rbv --split` and pass the resulting
 WASM to `tests/web_collection_snapshot.mjs` for persistent initialized state,
 Unicode, more than 1023 items, snapshot reuse and reset. Native JSON encoding
 has its own fixture, and browser JSON is checked with actual generated WASM.
+
+`tests/fixtures/recommender/browser_pending_peer.mjs` runs the generated app
+against a controllable in-page HTTP/WebSocket peer. It covers optimistic paint,
+accepted/saved/predicted ordering in both orders, duplicate events, delayed HTTP
+fallback, failed writes, cancellation on confirmed logout, the reload warning,
+and stale login generations. Run it after building the app with Playwright and
+Edge or Chromium available:
+
+```bash
+node tests/fixtures/recommender/browser_pending_peer.mjs target/recommender-I09
+```
+
+It is a mocked browser gate; it does not establish real server integration.
 
 The manual Chrome gate against the native backend covers registration/login,
 duplicate-rating counting, five distinct ratings, cold-start visibility, latest

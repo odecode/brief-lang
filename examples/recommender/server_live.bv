@@ -49,13 +49,17 @@ defn live_upgrade(state: ServerState, slot: Int, request: HttpRequest) -> Server
 
 defn live_text(state: ServerState, slot: Int, text: String) -> ServerState {
     when !io_utf8(text,0) { live_close(state.reactor,slot,1007); term state; };
+    api_trace(text,"");
+    let live_started: Int = trace_clock();
     let input: ApiInput = api_input(text);
     let owner: Int = Load#(reactor_row(state.reactor,slot)+24,8);
     let authenticated: ApiInput = ApiInput { ok: input.ok, username: "", password: "",
         token: server_owner_token(state.sessions,owner), item: input.item, rating: input.rating };
     let reply: ApiReply = api_rate(state.conn,state.sessions,authenticated,state.model.population.nitems,server_timestamp());
     when reply.status != 200 { io_queue(state.reactor,slot,ws_encode_text(reply.body)); term state; };
-    term server_after_reply(state,reply);
+    let updated: ServerState = server_after_reply(state,reply);
+    trace_stage("live_dispatch",live_started);
+    term updated;
 };
 
 defn live_close_payload_code(payload: String) -> Int {

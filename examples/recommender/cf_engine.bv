@@ -648,6 +648,17 @@ defn knn_aggregate(cand: IntVec, csim: Vector, cdev: Vector, n: Int, k: Int)
     ivec_free(used);
     term (accum, eta);
 };
+
+// 2026-10-22: active prediction scans every catalogue item using one worker-
+// owned candidate workspace. Reset only the used prefix so ties and selection
+// order exactly match knn_aggregate while avoiding per-item marker allocation.
+defn knn_aggregate_reuse(csim: Vector, cdev: Vector, used: IntVec, n: Int, k: Int)
+    [n >= 0 && k >= 0 && n <= csim.len && n <= cdev.len && n <= used.len][true]
+    -> (Float, Float)
+{
+    knn_zero(used,n,0);
+    term knn_select(csim,cdev,used,n,knn_min(n,k),0,0.0,0.0);
+};
 defn knn_cap(n: Int) [n >= 0][term >= 1] -> Int {
     when n <= 0 { term 1; };
     term n;

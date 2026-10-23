@@ -1,0 +1,2446 @@
+{
+  "url": "http://localhost:18083/app.html?api=http://127.0.0.1:18082",
+  "username": "i01_4_1792656754619514009",
+  "initial": "100",
+  "samples": 10,
+  "warmups": 3,
+  "new_rating_samples": 1,
+  "errors": [],
+  "network": [
+    {
+      "method": "GET",
+      "path": "/app.html"
+    },
+    {
+      "method": "GET",
+      "path": "/app.css"
+    },
+    {
+      "method": "GET",
+      "path": "/app.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/app.wasm"
+    },
+    {
+      "method": "POST",
+      "path": "/login"
+    },
+    {
+      "method": "GET",
+      "path": "/movies"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    }
+  ],
+  "protocol": [
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.html",
+      "timestamp": 672159.248795,
+      "id": "8663371A7C379D42B384417D4566EB96",
+      "type": "Document"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672159.259847,
+      "id": "8663371A7C379D42B384417D4566EB96",
+      "type": "Document"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.css",
+      "timestamp": 672159.27235,
+      "id": "19772.2",
+      "type": "Stylesheet"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.mjs",
+      "timestamp": 672159.28655,
+      "id": "19772.4",
+      "type": "Script"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672159.307676,
+      "id": "19772.2",
+      "type": "Stylesheet"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672159.406231,
+      "id": "19772.4",
+      "type": "Script"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.wasm",
+      "timestamp": 672159.407823,
+      "id": "19772.5",
+      "type": "Fetch"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/favicon.ico",
+      "timestamp": 672159.41966,
+      "id": "19772.6",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672159.429218,
+      "id": "19772.5",
+      "type": "Fetch"
+    },
+    {
+      "stage": "response",
+      "status": 404,
+      "timestamp": 672159.449546,
+      "id": "19772.6",
+      "type": "Other"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/login",
+      "timestamp": 672159.648705,
+      "id": "19772.7",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/login",
+      "timestamp": 672159.652798,
+      "id": "2DDD82B637CDD7A5E8EA938E540C60E5",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672159.659465,
+      "id": "2DDD82B637CDD7A5E8EA938E540C60E5",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672176.211403,
+      "id": "19772.7",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/movies",
+      "timestamp": 672176.213257,
+      "id": "19772.8",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672176.390189,
+      "id": "19772.8",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672178.123079,
+      "id": "19772.9",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672178.186891,
+      "id": "19772.9",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672178.359379,
+      "id": "19772.11",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672178.361566,
+      "id": "83FE0E93836B7732D6FF954FF704245D",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672178.366486,
+      "id": "83FE0E93836B7732D6FF954FF704245D",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672192.648116,
+      "id": "19772.11",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672192.648531,
+      "id": "19772.12",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672192.703602,
+      "id": "19772.12",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672192.847427,
+      "id": "19772.13",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672192.849589,
+      "id": "FEB8827084D5446E19C4627E4D22E8B3",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672192.854015,
+      "id": "FEB8827084D5446E19C4627E4D22E8B3",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672207.661662,
+      "id": "19772.13",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672207.662094,
+      "id": "19772.14",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672207.718962,
+      "id": "19772.14",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672207.854654,
+      "id": "19772.15",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672207.857165,
+      "id": "A3EEDBD0C900CEDB3DA23A91F3B0A50D",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672207.861797,
+      "id": "A3EEDBD0C900CEDB3DA23A91F3B0A50D",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672223.723957,
+      "id": "19772.15",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672223.724398,
+      "id": "19772.16",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672223.778417,
+      "id": "19772.16",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672223.91079,
+      "id": "19772.17",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672223.913058,
+      "id": "6C7820CC2500CD1E8B3FB2668D9025C2",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672223.917693,
+      "id": "6C7820CC2500CD1E8B3FB2668D9025C2",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672238.855981,
+      "id": "19772.17",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672238.85641,
+      "id": "19772.18",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672238.911634,
+      "id": "19772.18",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672239.051611,
+      "id": "19772.19",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672239.05413,
+      "id": "33A332D5315454A3813569DDB29B859B",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672239.060219,
+      "id": "33A332D5315454A3813569DDB29B859B",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672254.968255,
+      "id": "19772.19",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672254.968629,
+      "id": "19772.20",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672255.022034,
+      "id": "19772.20",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672255.139033,
+      "id": "19772.21",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672255.141289,
+      "id": "AD7B8F5A91D4EBBBEB6349433898F6BD",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672255.146287,
+      "id": "AD7B8F5A91D4EBBBEB6349433898F6BD",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672271.499834,
+      "id": "19772.21",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672271.50023,
+      "id": "19772.22",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672271.553715,
+      "id": "19772.22",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672271.679886,
+      "id": "19772.23",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672271.682245,
+      "id": "1BB0C02346C402D7A55B278E5B298880",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672271.687338,
+      "id": "1BB0C02346C402D7A55B278E5B298880",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672287.291669,
+      "id": "19772.23",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672287.29279,
+      "id": "19772.24",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672287.345667,
+      "id": "19772.24",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672287.469083,
+      "id": "19772.25",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672287.471338,
+      "id": "A3DC90B3D6F79C043C353874E09DD64B",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672287.475798,
+      "id": "A3DC90B3D6F79C043C353874E09DD64B",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672302.755296,
+      "id": "19772.25",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672302.756377,
+      "id": "19772.26",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672302.81677,
+      "id": "19772.26",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672302.944199,
+      "id": "19772.27",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672302.946464,
+      "id": "71054127ED08FBD58BA0D3C379269765",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672302.952853,
+      "id": "71054127ED08FBD58BA0D3C379269765",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672317.27205,
+      "id": "19772.27",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672317.272479,
+      "id": "19772.28",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672317.326197,
+      "id": "19772.28",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672317.44858,
+      "id": "19772.29",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672317.450924,
+      "id": "ABFB74C7F5079A9E24A675CBCA5F9999",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672317.45565,
+      "id": "ABFB74C7F5079A9E24A675CBCA5F9999",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672332.163882,
+      "id": "19772.29",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672332.164282,
+      "id": "19772.30",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672332.222334,
+      "id": "19772.30",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672332.355963,
+      "id": "19772.31",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672332.358224,
+      "id": "F170FD730D83F38A5CC5B049A6A64DFB",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672332.364897,
+      "id": "F170FD730D83F38A5CC5B049A6A64DFB",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672347.655115,
+      "id": "19772.31",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672347.655576,
+      "id": "19772.32",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672347.710221,
+      "id": "19772.32",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672347.829647,
+      "id": "19772.33",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672347.831891,
+      "id": "D20FD8F63C29D918B1C3CCB17B5364F7",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672347.837082,
+      "id": "D20FD8F63C29D918B1C3CCB17B5364F7",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672362.313786,
+      "id": "19772.33",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672362.314269,
+      "id": "19772.34",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672362.379935,
+      "id": "19772.34",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672362.500153,
+      "id": "19772.35",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672362.502304,
+      "id": "D20A6738E521B905BA505387A66C3276",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672362.507179,
+      "id": "D20A6738E521B905BA505387A66C3276",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672376.873654,
+      "id": "19772.35",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672376.874075,
+      "id": "19772.36",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672376.946301,
+      "id": "19772.36",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672377.073332,
+      "id": "19772.37",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672377.075613,
+      "id": "5E891E394797E3D06C036BD6CC49AEB0",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672377.080504,
+      "id": "5E891E394797E3D06C036BD6CC49AEB0",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672393.054946,
+      "id": "19772.37",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672393.055316,
+      "id": "19772.38",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672393.110463,
+      "id": "19772.38",
+      "type": "XHR"
+    }
+  ],
+  "evidence": [
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 202
+    },
+    {
+      "operation": "",
+      "stage": "dom_recommendations",
+      "ms": 202
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 401.89999997615814,
+      "path": "/login",
+      "method": "POST"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 16965,
+      "path": "/login",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 16966.600000023842,
+      "path": "/movies",
+      "method": "GET"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 17143.799999952316,
+      "path": "/movies",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 18876.399999976158,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 18945.100000023842,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 18976.799999952316
+    },
+    {
+      "operation": "",
+      "stage": "dom_ratings",
+      "ms": 18978
+    },
+    {
+      "operation": "",
+      "stage": "dom_recommendations",
+      "ms": 18979.199999928474
+    },
+    {
+      "operation": "",
+      "stage": "long_task",
+      "ms": 18986.199999928474,
+      "start": 395.6999999284744,
+      "duration": 18586
+    },
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 19034.799999952316
+    },
+    {
+      "operation": "",
+      "stage": "dom_recommendations",
+      "ms": 19034.799999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "click",
+      "ms": 19111.899999976158,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "http_start",
+      "ms": 19112.600000023842,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "http_end",
+      "ms": 33401.60000002384,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "http_start",
+      "ms": 33401.799999952316,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "http_end",
+      "ms": 33457.199999928474,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "dom_notice",
+      "ms": 33489.699999928474
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "dom_ratings",
+      "ms": 33489.699999928474
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "dom_recommendations",
+      "ms": 33489.699999928474
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "live_receive",
+      "ms": 33493.199999928474,
+      "recommendations": [
+        {
+          "item_id": 103,
+          "score": 5
+        },
+        {
+          "item_id": 266,
+          "score": 5
+        },
+        {
+          "item_id": 397,
+          "score": 5
+        },
+        {
+          "item_id": 623,
+          "score": 5
+        },
+        {
+          "item_id": 680,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "dom_notice",
+      "ms": 33494.89999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "dom_recommendations",
+      "ms": 33494.89999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "long_task",
+      "ms": 33495.5,
+      "start": 19110.399999976158,
+      "duration": 14380
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_1",
+      "stage": "paint_opportunity",
+      "ms": 33498.199999928474,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 1 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 104Movie 267Movie 398Movie 624Movie 681\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "click",
+      "ms": 33600.299999952316,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "http_start",
+      "ms": 33600.699999928474,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "http_end",
+      "ms": 48415.199999928474,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "http_start",
+      "ms": 48415.39999997616,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "http_end",
+      "ms": 48472.5,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "dom_notice",
+      "ms": 48504.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "dom_ratings",
+      "ms": 48504.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "dom_recommendations",
+      "ms": 48504.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "live_receive",
+      "ms": 48507,
+      "recommendations": [
+        {
+          "item_id": 376,
+          "score": 5
+        },
+        {
+          "item_id": 564,
+          "score": 5
+        },
+        {
+          "item_id": 699,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 796,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "dom_notice",
+      "ms": 48508.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "dom_recommendations",
+      "ms": 48508.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "long_task",
+      "ms": 48508.60000002384,
+      "start": 33599,
+      "duration": 14906
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_2",
+      "stage": "paint_opportunity",
+      "ms": 48510.299999952316,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 2 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 377Movie 565Movie 700Movie 701Movie 797\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "click",
+      "ms": 48607.39999997616,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "http_start",
+      "ms": 48607.89999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "http_end",
+      "ms": 64477.5,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "http_start",
+      "ms": 64477.699999928474,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "http_end",
+      "ms": 64532,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "dom_notice",
+      "ms": 64566.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "dom_ratings",
+      "ms": 64566.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "dom_recommendations",
+      "ms": 64566.299999952316
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "live_receive",
+      "ms": 64569.39999997616,
+      "recommendations": [
+        {
+          "item_id": 563,
+          "score": 5
+        },
+        {
+          "item_id": 593,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 775,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "dom_notice",
+      "ms": 64571
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "dom_recommendations",
+      "ms": 64571.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "long_task",
+      "ms": 64571.5,
+      "start": 48607.199999928474,
+      "duration": 15960
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_3",
+      "stage": "paint_opportunity",
+      "ms": 64573.39999997616,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 3 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 564Movie 594Movie 701Movie 726Movie 776\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "click",
+      "ms": 64663.60000002384,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "http_start",
+      "ms": 64664,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "http_end",
+      "ms": 79609.5,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "http_start",
+      "ms": 79609.69999992847,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "http_end",
+      "ms": 79665.19999992847,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "dom_notice",
+      "ms": 79700
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "dom_ratings",
+      "ms": 79700
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "dom_recommendations",
+      "ms": 79700
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "live_receive",
+      "ms": 79703.19999992847,
+      "recommendations": [
+        {
+          "item_id": 694,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 890,
+          "score": 5
+        },
+        {
+          "item_id": 1028,
+          "score": 5
+        },
+        {
+          "item_id": 1065,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "dom_notice",
+      "ms": 79704.5
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "dom_recommendations",
+      "ms": 79704.5
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "long_task",
+      "ms": 79704.89999997616,
+      "start": 64663.39999997616,
+      "duration": 15038
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_4",
+      "stage": "paint_opportunity",
+      "ms": 79706.79999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 4 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 695Movie 726Movie 891Movie 1029Movie 1066\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "click",
+      "ms": 79804.39999997616,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "http_start",
+      "ms": 79804.79999995232,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "http_end",
+      "ms": 95721.79999995232,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "http_start",
+      "ms": 95722,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "http_end",
+      "ms": 95775.60000002384,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "dom_notice",
+      "ms": 95806.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "dom_ratings",
+      "ms": 95806.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "dom_recommendations",
+      "ms": 95806.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "live_receive",
+      "ms": 95809.39999997616,
+      "recommendations": [
+        {
+          "item_id": 694,
+          "score": 5
+        },
+        {
+          "item_id": 890,
+          "score": 5
+        },
+        {
+          "item_id": 1086,
+          "score": 5
+        },
+        {
+          "item_id": 1105,
+          "score": 5
+        },
+        {
+          "item_id": 1130,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "dom_notice",
+      "ms": 95810.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "dom_recommendations",
+      "ms": 95810.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "long_task",
+      "ms": 95811.19999992847,
+      "start": 79804,
+      "duration": 16003
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_5",
+      "stage": "paint_opportunity",
+      "ms": 95813.10000002384,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 5 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 695Movie 891Movie 1087Movie 1106Movie 1131\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "click",
+      "ms": 95892,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "http_start",
+      "ms": 95892.39999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "http_end",
+      "ms": 112253.39999997616,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "http_start",
+      "ms": 112253.60000002384,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "http_end",
+      "ms": 112307.19999992847,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "dom_notice",
+      "ms": 112337.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "dom_ratings",
+      "ms": 112337.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "dom_recommendations",
+      "ms": 112337.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "live_receive",
+      "ms": 112339.69999992847,
+      "recommendations": [
+        {
+          "item_id": 103,
+          "score": 5
+        },
+        {
+          "item_id": 266,
+          "score": 5
+        },
+        {
+          "item_id": 397,
+          "score": 5
+        },
+        {
+          "item_id": 623,
+          "score": 5
+        },
+        {
+          "item_id": 680,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "dom_notice",
+      "ms": 112341
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "dom_recommendations",
+      "ms": 112341
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "long_task",
+      "ms": 112341.29999995232,
+      "start": 95891.79999995232,
+      "duration": 16446
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_6",
+      "stage": "paint_opportunity",
+      "ms": 112342.79999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 1 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 104Movie 267Movie 398Movie 624Movie 681\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "click",
+      "ms": 112432.5,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "http_start",
+      "ms": 112433.19999992847,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "http_end",
+      "ms": 128045.19999992847,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "http_start",
+      "ms": 128046.10000002384,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "http_end",
+      "ms": 128099.19999992847,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "dom_notice",
+      "ms": 128129
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "dom_ratings",
+      "ms": 128129
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "dom_recommendations",
+      "ms": 128129
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "live_receive",
+      "ms": 128131.69999992847,
+      "recommendations": [
+        {
+          "item_id": 376,
+          "score": 5
+        },
+        {
+          "item_id": 564,
+          "score": 5
+        },
+        {
+          "item_id": 699,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 796,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "dom_notice",
+      "ms": 128133.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "dom_recommendations",
+      "ms": 128133.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "long_task",
+      "ms": 128134.10000002384,
+      "start": 112432.39999997616,
+      "duration": 15697
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_7",
+      "stage": "paint_opportunity",
+      "ms": 128135.79999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 2 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 377Movie 565Movie 700Movie 701Movie 797\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "click",
+      "ms": 128221.79999995232,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "http_start",
+      "ms": 128222.29999995232,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "http_end",
+      "ms": 143508.79999995232,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "http_start",
+      "ms": 143509.69999992847,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "http_end",
+      "ms": 143570.29999995232,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "dom_notice",
+      "ms": 143599.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "dom_ratings",
+      "ms": 143599.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "dom_recommendations",
+      "ms": 143599.69999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "live_receive",
+      "ms": 143602.10000002384,
+      "recommendations": [
+        {
+          "item_id": 563,
+          "score": 5
+        },
+        {
+          "item_id": 593,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 775,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "dom_notice",
+      "ms": 143603.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "dom_recommendations",
+      "ms": 143603.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "long_task",
+      "ms": 143603.79999995232,
+      "start": 128220.69999992847,
+      "duration": 15380
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_8",
+      "stage": "paint_opportunity",
+      "ms": 143605.39999997616,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 3 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 564Movie 594Movie 701Movie 726Movie 776\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "click",
+      "ms": 143695.69999992847,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "http_start",
+      "ms": 143697.39999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "http_end",
+      "ms": 158025.60000002384,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "http_start",
+      "ms": 158025.79999995232,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "http_end",
+      "ms": 158079.69999992847,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "dom_notice",
+      "ms": 158106
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "dom_ratings",
+      "ms": 158106
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "dom_recommendations",
+      "ms": 158106
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "live_receive",
+      "ms": 158108.29999995232,
+      "recommendations": [
+        {
+          "item_id": 694,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 890,
+          "score": 5
+        },
+        {
+          "item_id": 1028,
+          "score": 5
+        },
+        {
+          "item_id": 1065,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "dom_notice",
+      "ms": 158110
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "dom_recommendations",
+      "ms": 158110
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "long_task",
+      "ms": 158110.39999997616,
+      "start": 143695.5,
+      "duration": 14411
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_9",
+      "stage": "paint_opportunity",
+      "ms": 158112.29999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 4 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 695Movie 726Movie 891Movie 1029Movie 1066\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "click",
+      "ms": 158200.79999995232,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "http_start",
+      "ms": 158201.89999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "http_end",
+      "ms": 172917.39999997616,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "http_start",
+      "ms": 172917.60000002384,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "http_end",
+      "ms": 172975.89999997616,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "dom_notice",
+      "ms": 173005.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "dom_ratings",
+      "ms": 173005.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "dom_recommendations",
+      "ms": 173005.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "live_receive",
+      "ms": 173007.89999997616,
+      "recommendations": [
+        {
+          "item_id": 694,
+          "score": 5
+        },
+        {
+          "item_id": 890,
+          "score": 5
+        },
+        {
+          "item_id": 1086,
+          "score": 5
+        },
+        {
+          "item_id": 1105,
+          "score": 5
+        },
+        {
+          "item_id": 1130,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "dom_notice",
+      "ms": 173009.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "dom_recommendations",
+      "ms": 173009.10000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "long_task",
+      "ms": 173009.60000002384,
+      "start": 158199.79999995232,
+      "duration": 14806
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_10",
+      "stage": "paint_opportunity",
+      "ms": 173011.5,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 5 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 695Movie 891Movie 1087Movie 1106Movie 1131\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "click",
+      "ms": 173107.39999997616,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "http_start",
+      "ms": 173109.19999992847,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "http_end",
+      "ms": 188408.69999992847,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "http_start",
+      "ms": 188408.79999995232,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "http_end",
+      "ms": 188463.79999995232,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "dom_notice",
+      "ms": 188494.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "dom_ratings",
+      "ms": 188494.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "dom_recommendations",
+      "ms": 188494.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "live_receive",
+      "ms": 188497,
+      "recommendations": [
+        {
+          "item_id": 103,
+          "score": 5
+        },
+        {
+          "item_id": 266,
+          "score": 5
+        },
+        {
+          "item_id": 397,
+          "score": 5
+        },
+        {
+          "item_id": 623,
+          "score": 5
+        },
+        {
+          "item_id": 680,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "dom_notice",
+      "ms": 188498.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "dom_recommendations",
+      "ms": 188498.5
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "long_task",
+      "ms": 188498.79999995232,
+      "start": 173107.19999992847,
+      "duration": 15388
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_11",
+      "stage": "paint_opportunity",
+      "ms": 188500.79999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 1 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 104Movie 267Movie 398Movie 624Movie 681\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "click",
+      "ms": 188581,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "http_start",
+      "ms": 188582.89999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "http_end",
+      "ms": 203067.39999997616,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "http_start",
+      "ms": 203067.5,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "http_end",
+      "ms": 203133.5,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "dom_notice",
+      "ms": 203162.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "dom_ratings",
+      "ms": 203162.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "dom_recommendations",
+      "ms": 203162.39999997616
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "live_receive",
+      "ms": 203165.29999995232,
+      "recommendations": [
+        {
+          "item_id": 376,
+          "score": 5
+        },
+        {
+          "item_id": 564,
+          "score": 5
+        },
+        {
+          "item_id": 699,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 796,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "dom_notice",
+      "ms": 203166.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "dom_recommendations",
+      "ms": 203166.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "long_task",
+      "ms": 203167,
+      "start": 188580.79999995232,
+      "duration": 14582
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_12",
+      "stage": "paint_opportunity",
+      "ms": 203169.5,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 2 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 377Movie 565Movie 700Movie 701Movie 797\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "click",
+      "ms": 203252.19999992847,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "http_start",
+      "ms": 203253.39999997616,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "http_end",
+      "ms": 217627.19999992847,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "http_start",
+      "ms": 217627.39999997616,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "http_end",
+      "ms": 217699.79999995232,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "dom_notice",
+      "ms": 217730.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "dom_ratings",
+      "ms": 217730.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "dom_recommendations",
+      "ms": 217730.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "live_receive",
+      "ms": 217733.19999992847,
+      "recommendations": [
+        {
+          "item_id": 563,
+          "score": 5
+        },
+        {
+          "item_id": 593,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 775,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "dom_notice",
+      "ms": 217734.19999992847
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "dom_recommendations",
+      "ms": 217734.29999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "long_task",
+      "ms": 217734.60000002384,
+      "start": 203252,
+      "duration": 14479
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_13",
+      "stage": "paint_opportunity",
+      "ms": 217736.79999995232,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 3 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. ",
+      "rating_count": 100,
+      "recommendations": "Your next good film\n        Movie 564Movie 594Movie 701Movie 726Movie 776\n      ",
+      "recommendations_visible": true
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "click",
+      "ms": 217825.5,
+      "purpose": "new_rating"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "http_start",
+      "ms": 217826.60000002384,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "http_end",
+      "ms": 233808.5,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "http_start",
+      "ms": 233808.60000002384,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "http_end",
+      "ms": 233864,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "dom_notice",
+      "ms": 233892.79999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "dom_ratings",
+      "ms": 233892.79999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "dom_recommendations",
+      "ms": 233892.79999995232
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "live_receive",
+      "ms": 233895.5,
+      "recommendations": [
+        {
+          "item_id": 375,
+          "score": 5
+        },
+        {
+          "item_id": 593,
+          "score": 5
+        },
+        {
+          "item_id": 700,
+          "score": 5
+        },
+        {
+          "item_id": 725,
+          "score": 5
+        },
+        {
+          "item_id": 775,
+          "score": 5
+        }
+      ]
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "dom_notice",
+      "ms": 233897.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "dom_recommendations",
+      "ms": 233897.60000002384
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "long_task",
+      "ms": 233897.89999997616,
+      "start": 217825.19999992847,
+      "duration": 16068
+    },
+    {
+      "operation": "browser_f5ca60d61f654be2aa3fbd6150789f96_14",
+      "stage": "paint_opportunity",
+      "ms": 233899.10000002384,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 1: 3 / 5. Movie 2: 2 / 5. Movie 3: 3 / 5. Movie 4: 4 / 5. Movie 5: 5 / 5. Movie 6: 1 / 5. Movie 7: 2 / 5. Movie 8: 3 / 5. Movie 9: 4 / 5. Movie 10: 5 / 5. Movie 11: 1 / 5. Movie 12: 2 / 5. Movie 13: 3 / 5. Movie 14: 4 / 5. Movie 15: 5 / 5. Movie 16: 1 / 5. Movie 17: 2 / 5. Movie 18: 3 / 5. Movie 19: 4 / 5. Movie 20: 5 / 5. Movie 21: 1 / 5. Movie 22: 2 / 5. Movie 23: 3 / 5. Movie 24: 4 / 5. Movie 25: 5 / 5. Movie 26: 1 / 5. Movie 27: 2 / 5. Movie 28: 3 / 5. Movie 29: 4 / 5. Movie 30: 5 / 5. Movie 31: 1 / 5. Movie 32: 2 / 5. Movie 33: 3 / 5. Movie 34: 4 / 5. Movie 35: 5 / 5. Movie 36: 1 / 5. Movie 37: 2 / 5. Movie 38: 3 / 5. Movie 39: 4 / 5. Movie 40: 5 / 5. Movie 41: 1 / 5. Movie 42: 2 / 5. Movie 43: 3 / 5. Movie 44: 4 / 5. Movie 45: 5 / 5. Movie 46: 1 / 5. Movie 47: 2 / 5. Movie 48: 3 / 5. Movie 49: 4 / 5. Movie 50: 5 / 5. Movie 51: 1 / 5. Movie 52: 2 / 5. Movie 53: 3 / 5. Movie 54: 4 / 5. Movie 55: 5 / 5. Movie 56: 1 / 5. Movie 57: 2 / 5. Movie 58: 3 / 5. Movie 59: 4 / 5. Movie 60: 5 / 5. Movie 61: 1 / 5. Movie 62: 2 / 5. Movie 63: 3 / 5. Movie 64: 4 / 5. Movie 65: 5 / 5. Movie 66: 1 / 5. Movie 67: 2 / 5. Movie 68: 3 / 5. Movie 69: 4 / 5. Movie 70: 5 / 5. Movie 71: 1 / 5. Movie 72: 2 / 5. Movie 73: 3 / 5. Movie 74: 4 / 5. Movie 75: 5 / 5. Movie 76: 1 / 5. Movie 77: 2 / 5. Movie 78: 3 / 5. Movie 79: 4 / 5. Movie 80: 5 / 5. Movie 81: 1 / 5. Movie 82: 2 / 5. Movie 83: 3 / 5. Movie 84: 4 / 5. Movie 85: 5 / 5. Movie 86: 1 / 5. Movie 87: 2 / 5. Movie 88: 3 / 5. Movie 89: 4 / 5. Movie 90: 5 / 5. Movie 91: 1 / 5. Movie 92: 2 / 5. Movie 93: 3 / 5. Movie 94: 4 / 5. Movie 95: 5 / 5. Movie 96: 1 / 5. Movie 97: 2 / 5. Movie 98: 3 / 5. Movie 99: 4 / 5. Movie 100: 5 / 5. Movie 101: 4 / 5. ",
+      "rating_count": 101,
+      "recommendations": "Your next good film\n        Movie 376Movie 594Movie 701Movie 726Movie 776\n      ",
+      "recommendations_visible": true
+    }
+  ]
+}

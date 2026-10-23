@@ -4,11 +4,13 @@
 import "./server_api.bv";
 import "./server_io.bv";
 import "./model_worker.bv";
+import "./sessions.bv";
 import { stdout_flush } from "std/cast_lanes.bv";
 
 obj OwnerView { owner: Int; recommendations: String; };
 obj ServerState {
     reactor: Reactor; conn: PgConn; model: ServerModel; sessions: SessionStore;
+    server_epoch: String;
     views: List<OwnerView>; lambda: Float; refresh: Bool; next_refresh: Int; interval: Int; worker: RefreshWorker;
 };
 
@@ -16,23 +18,36 @@ defn server_time(clock_id: Int) -> Int {
     let memory: Int = Malloc#(16) as Int;
     when memory == 0 { term -1; };
     let result: Int = syscall(228,clock_id,memory);
+    // 2026-10-22: a failed clock call leaves timespec unwritten. Check before
+    // reading it; retain this guard if clock allocation is later centralized.
+    when result < 0 { Free#(memory as Ptr); term -1; };
     let now: Int = Load#(memory,8)*1000 + Load#(memory+8,8)/1000000;
     Free#(memory as Ptr);
-    when result < 0 { term -1; };
     term now;
 };
 
 defn server_clock() -> Int { term server_time(1); };
-defn server_timestamp() -> Int { term server_time(0)/1000; };
+defn server_timestamp_from_millis(milliseconds: Int) -> Int {
+    when milliseconds < 0 { term -1; };
+    term milliseconds/1000;
+};
+
+defn server_timestamp() -> Int { term server_timestamp_from_millis(server_time(0)); };
 
 defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, lambda: Float, interval: Int) -> ServerState {
     let views: List<OwnerView> = [];
+    // 2026-10-23: one random process identity scopes protocol profile revisions
+    // across account sessions; preserve it across snapshots and state copies.
+    // Undo by removing the field only when the server protocol owns an epoch.
+    let epoch: String = session_random_token();
     term ServerState { reactor: reactor, conn: conn, model: model, sessions: sessions_new(),
+        server_epoch: epoch,
         views: views, lambda: lambda, refresh: false, next_refresh: server_clock()+interval, interval: interval, worker: worker_idle() };
 };
 
 defn server_with(state: ServerState, sessions: SessionStore, views: List<OwnerView>, refresh: Bool) -> ServerState {
     term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: sessions,
+        server_epoch: state.server_epoch,
         views: views, lambda: state.lambda, refresh: refresh, next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
 };
 
@@ -61,7 +76,9 @@ defn server_owner_token(sessions: SessionStore, owner: Int) -> String {
 };
 
 defn server_update_owner(state: ServerState, owner: Int) -> ServerState {
+    let identity_started: Int = trace_clock();
     let account: AccountState = account_state(state.conn,state.sessions,server_owner_token(state.sessions,owner));
+    trace_stage("prediction_identity_db",identity_started);
     let body: String = "{\"error\":\"auth-failed\"}";
     when account.result.ok { body = api_recommendations(state.model,account,state.lambda); };
     when !account.result.ok && account.result.error != "auth-failed" { body = "{\"error\":\"database\"}"; };
@@ -73,13 +90,14 @@ defn server_update_owner(state: ServerState, owner: Int) -> ServerState {
 // all materialized owners only AFTER the replacement model is complete.
 // Replace this per-owner cache only with another population-independent read path.
 defn server_cached_state(state: ServerState, request: HttpRequest) -> ApiReply {
+    let identity_started: Int = trace_clock();
     let account: AccountState = account_state(state.conn,state.sessions,api_token(request.path));
+    trace_stage("state_identity_db",identity_started);
     when !account.result.ok { term api_error(account.result.error,state.sessions); };
     let body: String = server_owner_view(state.views,account.result.account.id);
     when body .^Length == 0 { term api_error("session",state.sessions); };
     when api_path(request.path) == "/recommendations" { term api_reply(200,body,state.sessions); };
-    term api_reply(200,"{\"account\":{\"id\":" + account.result.account.id as String + ",\"username\":" +
-        api_quote(account.result.account.username) + "},\"ratings\":" + api_ratings(account) + "," + body[1:body .^Length],state.sessions);
+    term api_reply(200,api_protocol_state(account,state.server_epoch,state.model,body),state.sessions);
 };
 
 defn server_channel_owned(row: Int, owner: Int) -> Bool {
@@ -87,6 +105,7 @@ defn server_channel_owned(row: Int, owner: Int) -> Bool {
 };
 
 defn server_push(state: ServerState, owner: Int) -> Bool {
+    let push_started: Int = trace_clock();
     let body: String = server_owner_view(state.views,owner);
     foreach slot in 0..state.reactor.capacity {
         let row: Int = reactor_row(state.reactor,slot);
@@ -94,6 +113,7 @@ defn server_push(state: ServerState, owner: Int) -> Bool {
             io_queue(state.reactor,slot,ws_encode_text(body));
         };
     };
+    trace_stage("push_queue",push_started);
     term true;
 };
 
@@ -108,6 +128,7 @@ defn server_refresh(state: ServerState) -> ServerState {
 
 defn server_snapshot_state(state: ServerState, model: ServerModel, worker: RefreshWorker, queued: Bool, deadline: Int) -> ServerState {
     term ServerState { reactor: state.reactor, conn: state.conn, model: model, sessions: state.sessions,
+        server_epoch: state.server_epoch,
         views: state.views, lambda: state.lambda, refresh: queued, next_refresh: deadline, interval: state.interval, worker: worker };
 };
 

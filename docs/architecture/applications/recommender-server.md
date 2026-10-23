@@ -15,16 +15,20 @@ LAMBDA_MILLI to 500 (0..1000 means lambda 0..1); REFRESH_SECONDS to 300.
 exist and be writable for durable reuse and refresh worker handoff.
 Invalid configuration or failed bootstrap fails startup with a concrete error.
 
-POST /register and /login accept username/password JSON strings; login returns
-an opaque process-local token. POST /rating accepts token/item_id/rating and
-performs an account-scoped upsert. GET /movies lists the zero-based movie IDs.
-GET /state?token=... returns that owner's identity, ratings and recommendation
-state. GET /recommendations?token=... returns cold_start:true below five distinct
-ratings, or recommendations ordered by descending score and ascending item ID.
+POST /v1/register and /v1/login accept username/password JSON strings; the
+unversioned paths remain aliases. Registration returns protocol version and
+type fields. Login also returns the opaque process-local token, account ID,
+username and this process's random server epoch. The epoch is preserved across
+server-state copies and changes on restart. GET /v1/state?token=... returns a
+versioned profile envelope with that owner's identity and ratings; `/state`
+remains an alias. POST /rating accepts token/item_id/rating and performs an
+account-scoped upsert. GET /movies lists the zero-based movie IDs. GET
+/recommendations?token=... returns cold_start:true below five distinct ratings,
+or recommendations ordered by descending score and ascending item ID.
 POST /admin/refresh schedules a snapshot rebuild; this demo endpoint has no
 separate admin-auth scheme. OPTIONS responds with permissive CORS headers.
 
-GET /live?token=... requires a version-13 WebSocket handshake with a valid
+GET /v1/live?token=... (also `/live`) requires a version-13 WebSocket handshake with a valid
 16-byte nonce. After upgrade, JSON text accepts item_id/rating. A token in the
 frame never changes its connection owner. Successful HTTP or live ratings push
 the owner's updated state to all of that owner's open channels only. Validation
@@ -66,6 +70,15 @@ excluded from candidates, preventing self-neighbor duplication. Active user
 similarities are computed once for that update, while item similarities and
 neighbor means come from the immutable served cache. Serving a recommendation
 reads its owner's materialized result rather than rebuilding matrices.
+
+The current serial path remains the numerical reference. I06's standalone
+`active_profile.bv` candidate is being compared with that replacement-row
+calculation before worker integration. `prediction_scratch.bv` owns one bounded
+allocation for unchanged population base similarities and reusable active
+profile/candidate/top-k buffers. Its model is borrowed and immutable; each
+installed generation gets its own worker-local workspace, released before its
+model. The typed prediction boundary consumes I02's `PredictionRequest` and
+returns `RecommendationResult`; I08 owns process dispatch and publication.
 
 Explicit and periodic refreshes fork a Linux worker. The child closes inherited
 reactor and PostgreSQL descriptors WITHOUT sending protocol shutdown messages,
@@ -117,3 +130,29 @@ dedicated test database. Do not run concurrent copies against that database.
 The runner also executes the three tests in recommender_server_properties.rs:
 128 proptest cases each for properties 5, 7 and 20, using a native Briev probe.
 Interpreter checks are excluded by the user's explicit instruction.
+
+## Responsiveness baseline instrumentation (I01)
+
+`RECOMMENDER_TRACE=1` enables `trace.bv` diagnostics on the existing synchronous
+path. `TRACE` lines contain an optional bounded ASCII operation ID, stage, and
+monotonic microsecond endpoints. HTTP test drivers supply `X-Recommender-Trace`;
+browser POST and live test drivers may supply an otherwise ignored `trace_id`
+JSON field. IDs carry no authentication/idempotency meaning. Credentials and
+session tokens are never logged. Unrelated requests clear the serial context.
+
+Stages separate account database reads, rating write/protocol wait, active-profile
+construction, candidate prediction scan, ranking/release, push queueing and request
+dispatch. Queued output is not proof of delivery or browser paint. Server-clock
+durations are never subtracted from browser/client clock values. Tracing is opt-in;
+wire responses and write-before-predict behavior remain unchanged in I01.
+
+The reproducible drivers and resource/clock caveats are in
+`benchmarks/recommender_responsiveness/README.md`. Their DB/ports/cache/artifacts
+are separate from the user's app. I02's future consistency contract does not
+establish that the asynchronous production path is already implemented.
+
+The frozen [v1 responsiveness contract](recommender-responsiveness-contract-v1.md)
+defines I02's portable types/codecs, framing, persistence transition policy and
+the interfaces required by I03–I17. It explicitly separates current behavior from
+the future admission/worker/browser cutover. Its native/WASM contract fixtures
+must pass when those boundaries change.

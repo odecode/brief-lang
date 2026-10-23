@@ -3,6 +3,7 @@
 //===----------------------------------------------------------------------===//
 import "./server_model.bv";
 import "./reactor.bv";
+import "./worker_lifecycle.bv";
 import { mktemp_file } from "std/os/temp.bv";
 
 obj RefreshWorker { pid: Int; path: String; owners: List<Int>; };
@@ -15,18 +16,18 @@ defn worker_idle() -> RefreshWorker {
 
 defn worker_exit(code: Int) -> Bool { syscall(60,code); term false; };
 
-// 2026-10-21: fork copies memory but shares inherited socket descriptions.
-// Raw close is essential: pg_close would send Terminate on the PARENT session.
-// Child owns a fresh PG session and never returns to the reactor. Parent-death
-// signaling prevents abandoned CPU builds; recheck closes the pre-prctl race.
+// 2026-10-22: use the shared worker child guard/descriptor close path. Fork
+// shares socket descriptions, so inherited PostgreSQL sockets are raw-closed;
+// pg_close would send Terminate on the PARENT session. Recheck after PDEATHSIG
+// setup closes the pre-prctl parent-death race.
 defn worker_child(config: RefreshConfig, reactor: Reactor, inherited: PgConn) -> Bool {
-    let guarded: Int = syscall(157,1,15);
-    when guarded < 0 || syscall(110) != config.parent { term worker_exit(1); };
-    syscall(3,inherited.sock.fd); syscall(3,reactor.listener);
+    when !worker_child_parent_guard(config.parent) { term worker_exit(1); };
+    let inherited_fds: List<Int> = [inherited.sock.fd,reactor.listener];
     foreach slot in 0..reactor.capacity {
         let fd: Int = Load#(reactor_row(reactor,slot),8);
-        when fd >= 0 { syscall(3,fd); };
+        when fd >= 0 { inherited_fds <- fd; };
     };
+    when !worker_child_close_inherited(inherited_fds) { term worker_exit(1); };
     let conn: PgConn = pg_connect(2130706433,5432,config.user,config.database,"");
     when conn.pid < 0 || conn.sock.fd < 0 { term worker_exit(1); };
     let params: List<String> = [config.schema];

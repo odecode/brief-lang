@@ -1,0 +1,13 @@
+{
+  "worker": 32739,
+  "save_while_refresh_blocked": {
+    "operation": "native_17_0",
+    "initial_ratings": 5,
+    "actual_ratings": 5,
+    "post_ms": 1265.856876,
+    "get_ms": 42.941741,
+    "flow_ms": 1308.7986170000001
+  },
+  "test_child_reaped": true,
+  "old_snapshot_retained": true
+}

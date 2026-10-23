@@ -41,9 +41,13 @@ defn server_boot() -> ServerState {
         model_free(unwrap(model)); pg_close(conn);
         server_fatal("Cannot open the listener (errno "+reactor.listener as String+"); choose an available PORT and check descriptor limits.");
     };
+    let server: ServerState = server_new(reactor,conn,unwrap(model),(lambda_milli as Float)/1000.0,refresh_seconds*1000);
+    when server.server_epoch .^Length != 32 {
+        server_fatal("Cannot create a secure server session epoch; check system entropy availability.");
+    };
     println!("Recommender listening on port {} with {} connection slots",port,capacity);
     stdout_flush();
-    term server_new(reactor,conn,unwrap(model),(lambda_milli as Float)/1000.0,refresh_seconds*1000);
+    term server;
 };
 
 let server: ServerState = server_boot();

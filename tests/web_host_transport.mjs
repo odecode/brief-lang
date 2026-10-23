@@ -4,9 +4,14 @@
 // Browser-host behavioral regression, runnable with Node; no app or live server.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { ReadableStream } from 'node:stream/web';
 const source = fs.readFileSync(new URL('../lib/glue/web/web.js', import.meta.url), 'utf8');
 const calls = [];
 globalThis.window = new EventTarget();
+globalThis.CustomEvent = class extends Event {
+  constructor(type, options = {}) { super(type); this.detail = options.detail; }
+};
+globalThis.document = { baseURI: 'http://localhost/' };
 window.location = { search: '?api=http%3A%2F%2Flocalhost%3A8080' };
 window.setTimeout = setTimeout;
 window.clearTimeout = clearTimeout;
@@ -33,6 +38,13 @@ globalThis.WebSocket = class extends EventTarget {
   open() { this.readyState = 1; this.dispatchEvent(new Event('open')); }
 };
 const host = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const response = (text, status = 200) => ({
+  status,
+  headers: { get: () => null },
+  body: new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); }
+  })
+});
 for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'HEAD']) {
   assert.equal(host.fetch_method('ok', method, '{"value":"é"}', 'application/json'), '{"ok":true}');
   assert.equal(calls.at(-1).args[2], false);
@@ -97,4 +109,98 @@ host.event_cancel(host.event_after('test-timer', 5));
 host.event_after('test-timer', 0);
 await new Promise(resolve => setTimeout(resolve, 20));
 assert.equal(timers, 1);
-console.log('HTTP verbs/errors, WebSocket FIFO/isolation/limits/lifecycle and timer cancellation pass');
+
+// The async ABI never returns a Promise and keeps UI work runnable while a
+// request is pending. Completion events carry the owned handle exactly once.
+let finishSlow;
+globalThis.fetch = () => new Promise(resolve => { finishSlow = resolve; });
+const asyncNotices = [];
+window.addEventListener('http_done', event => asyncNotices.push(event.detail));
+const slow = host.http_async_start('/slow', 'GET', '', '{}', 'http_done');
+assert.equal(slow, 1);
+assert.equal(host.http_async_status(slow), 1);
+let painted = false;
+queueMicrotask(() => { painted = true; });
+await Promise.resolve();
+assert.equal(painted, true);
+finishSlow(response('ready'));
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.deepEqual(asyncNotices, [slow]);
+assert.equal(host.http_async_status(slow), 2);
+assert.equal(host.http_async_http_status(slow), 200);
+assert.equal(host.http_async_body(slow), 'ready');
+assert.equal(host.http_async_body(slow), 'ready');
+host.http_async_release(slow);
+assert.equal(host.http_async_status(slow), 0);
+
+// HTTP errors remain complete transport responses, with request metadata intact.
+let postInit;
+globalThis.fetch = async (_url, init) => { postInit = init; return response('{"error":"unauthorized"}', 401); };
+const denied = host.http_async_start('/private', 'POST', '{"x":1}',
+  '{"content_type":"application/json"}', 'http_done');
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(postInit.method, 'POST');
+assert.equal(postInit.body, '{"x":1}');
+assert.equal(postInit.headers['Content-Type'], 'application/json');
+assert.equal(host.http_async_status(denied), 2);
+assert.equal(host.http_async_http_status(denied), 401);
+assert.equal(host.http_async_body(denied), '{"error":"unauthorized"}');
+assert.deepEqual(asyncNotices, [slow, denied]);
+host.http_async_release(denied);
+
+// Stream bounds are enforced before response text is retained.
+globalThis.fetch = async () => ({ status: 200, headers: { get: () => null }, body: new ReadableStream({
+  start(controller) { controller.enqueue(new TextEncoder().encode('12345')); controller.close(); }
+}) });
+const tooLarge = host.http_async_start('/large', 'GET', '', '{"max_bytes":4}', 'http_done');
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(host.http_async_status(tooLarge), 3);
+assert.equal(host.http_async_error(tooLarge), 'response-too-large');
+assert.deepEqual(asyncNotices, [slow, denied, tooLarge]);
+host.http_async_release(tooLarge);
+
+// Cancellation and release suppress a completion already in flight.
+let finishCancelled;
+globalThis.fetch = () => new Promise(resolve => { finishCancelled = resolve; });
+const cancelled = host.http_async_start('/cancel', 'GET', '', '{}', 'http_done');
+await Promise.resolve();
+host.http_async_cancel(cancelled);
+assert.equal(host.http_async_status(cancelled), 4);
+finishCancelled(response('ignored'));
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.deepEqual(asyncNotices, [slow, denied, tooLarge]);
+host.http_async_release(cancelled);
+let finishReleased;
+globalThis.fetch = () => new Promise(resolve => { finishReleased = resolve; });
+const released = host.http_async_start('/release', 'GET', '', '{}', 'http_done');
+await Promise.resolve();
+host.http_async_release(released);
+finishReleased(response('ignored'));
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.deepEqual(asyncNotices, [slow, denied, tooLarge]);
+
+// Timeout is a notified failure; it never looks like a successful empty body.
+globalThis.fetch = () => new Promise(() => {});
+const timedOut = host.http_async_start('/timeout', 'GET', '', '{"timeout_ms":5}', 'http_done');
+await new Promise(resolve => setTimeout(resolve, 10));
+assert.equal(host.http_async_status(timedOut), 3);
+assert.equal(host.http_async_error(timedOut), 'timeout');
+assert.deepEqual(asyncNotices, [slow, denied, tooLarge, timedOut]);
+host.http_async_release(timedOut);
+
+// Invalid options, methods, URL schemes and GET bodies fail synchronously.
+assert.equal(host.http_async_start('/x', 'GET', '', 'null', 'http_done'), -1);
+assert.equal(host.http_async_start('/x', 'TRACE', '', '{}', 'http_done'), -2);
+assert.equal(host.http_async_start('javascript:alert(1)', 'GET', '', '{}', 'http_done'), -3);
+assert.equal(host.http_async_start('/x', 'GET', 'body', '{}', 'http_done'), -1);
+host.web_set_unload_warning(true);
+const unloadPending = new Event('beforeunload', { cancelable: true });
+Object.defineProperty(unloadPending, 'returnValue', { writable: true, value: undefined });
+window.dispatchEvent(unloadPending);
+assert.equal(unloadPending.defaultPrevented, true);
+host.web_set_unload_warning(false);
+const unloadClear = new Event('beforeunload', { cancelable: true });
+Object.defineProperty(unloadClear, 'returnValue', { writable: true, value: undefined });
+window.dispatchEvent(unloadClear);
+assert.equal(unloadClear.defaultPrevented, false);
+console.log('HTTP compatibility, async bounds/lifecycle/paint, unload warning, WebSocket FIFO and timers pass');

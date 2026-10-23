@@ -8,6 +8,16 @@ frgn fetch(url: String) -> String : fetch_url from "glue/web/web.js";
 // response means transport failure (HTTP errors retain their response body).
 frgn fetch_method(url: String, method: String, body: String, content_type: String) -> String from "glue/web/web.js";
 
+// Asynchronous HTTP uses integer handles and window completion events. The
+// host keeps Promises private; callers poll status and copy a completed body.
+frgn http_async_start(url: String, method: String, body: String, options_json: String, event_name: String) -> Int from "glue/web/web.js";
+frgn http_async_status(handle: Int) -> Int from "glue/web/web.js";
+frgn http_async_http_status(handle: Int) -> Int from "glue/web/web.js";
+frgn http_async_body(handle: Int) -> String from "glue/web/web.js";
+frgn http_async_error(handle: Int) -> String from "glue/web/web.js";
+frgn http_async_cancel(handle: Int) -> Void from "glue/web/web.js";
+frgn http_async_release(handle: Int) -> Void from "glue/web/web.js";
+
 defn http_get(url: String) -> String {
     term fetch_method(url,"GET","","");
 };

@@ -5,8 +5,10 @@
 // 7+ fields at every inline txn boundary (see dispatch.rs emit_inline_txn_body).
 //
 // Why three contexts instead of one:
-//   CompilerContext — global, read-only during codegen. Holds AST definitions,
-//     target spec, FFI signatures, type info. Never modified once codegen starts.
+//   CompilerContext — module lifetime. Holds stable AST/type/target facts and
+//     module emission state. 2026-10-22: metadata allocation/definitions remain
+//     mutable across functions; cloning or resetting them per function loses
+//     LLVM's module-wide ID and definition invariants.
 //   FunctionContext — per-function, mutable. Holds SSA counter, local bindings,
 //     phi state, arena slots. Cloned at inline boundaries; restored after.
 //   BlockContext — per-basic-block, lightweight. Tracks current label and
@@ -33,10 +35,10 @@ use std::collections::{HashMap, HashSet};
 
 // ── CompilerContext ───────────────────────────────────────────────────
 //
-// Global compilation context — immutable once code generation begins.
-// Holds everything that does not change between functions/transactions.
-// Previously part of the LlvmBackend god object; extracted to prevent
-// accidental mutation during per-function codegen.
+// Module context: stable compilation facts and mutable emission state.
+// 2026-10-22: metadata IDs and definitions span functions/transactions. Keep
+// them here so function resets cannot erase definitions or reuse numeric IDs;
+// move them only if another module-lifetime owner replaces this context.
 #[derive(Debug, Clone)]
 pub struct CompilerContext {
     // Target & Spec
@@ -136,9 +138,14 @@ pub struct CompilerContext {
     /// Used by load_field_type() to look up !range metadata by field index.
     pub idx_to_field_name: HashMap<usize, String>,
     // 2026-07-04: Metadata ID for the !StateAliasScope used by !noalias
-    // on Ptr<T> volatile accesses. Set during IR emission, then read-only
-    // by intrinsics.rs volatile_load#/volatile_store# emission.
+    // on Ptr<T> volatile accesses. 2026-10-22: reserve it with the module
+    // allocator before emission; no fixed ID can bound an evolving universe.
     pub state_alias_scope_md: usize,
+    // 2026-10-22: LLVM metadata IDs and definitions belong to the module.
+    // Fixed reservations overlapped on large type universes; function resets
+    // also dropped pending nodes. All non-TBAA nodes share this allocator.
+    pub metadata_counter: usize,
+    pub pending_metadata: String,
     pub exit_condition: Option<Box<Expr>>,
     pub has_natural_exit: bool,
     /// 2026-08-11 (view wiring): state fields referenced by the web view's
@@ -618,6 +625,8 @@ impl CompilerContext {
             accel_resident_ok: false,
             accel_cpu_fallback: None,
             state_alias_scope_md: 0,
+            metadata_counter: 0,
+            pending_metadata: String::new(),
             exit_condition: None,
             has_natural_exit: false,
             view_bound_fields: std::collections::HashSet::new(),
@@ -905,7 +914,6 @@ fn collect_free_stmts(
 pub struct FunctionContext {    // SSA register counters — NEVER rewound (prevents %t{N} collisions)
     pub txn_counter: usize,
     pub within_counter: usize,
-    pub metadata_counter: usize,
     /// Arena bump counter for unique per-allocation register names
     pub arena_counter: usize,
 
@@ -1105,7 +1113,6 @@ pub struct FunctionContext {    // SSA register counters — NEVER rewound (prev
     pub is_static_bound: bool,
 
     // Accumulators flushed per-function
-    pub pending_metadata: String,
     // 2026-07-03: Full Statement blocks hoisted from body, not just field+intrinsic
     // pairs. Allows hoisting guards whose swan song references let-bindings (e.g.
     // `energy` in nbody) by re-emitting the entire guard body post-loop.
@@ -1314,7 +1321,6 @@ impl FunctionContext {
         FunctionContext {
             txn_counter: 0,
             within_counter: 0,
-            metadata_counter: 100,
             arena_counter: 0,
             let_bindings: HashMap::new(),
             let_binding_types: HashMap::new(),
@@ -1366,7 +1372,6 @@ impl FunctionContext {
             arena_slots: None,
             field_prealloc_info: HashMap::new(),
             is_static_bound: false,
-            pending_metadata: String::new(),
             pending_post_hoist: Vec::new(),
             swan_song_locals: std::collections::HashSet::new(),
             pending_cleanup: Vec::new(),
@@ -1479,7 +1484,6 @@ impl FunctionContext {
         self.phi_induction_reg = None;
         self.arena_slots = None;
         self.field_prealloc_info.clear();
-        self.pending_metadata.clear();
         self.pending_cleanup.clear();
         self.chimera_map.clear();
     }
@@ -1560,12 +1564,10 @@ impl FunctionGuard {
         let txn_ct = fun.txn_counter;
         let arena_ct = fun.arena_counter;
         let within_ct = fun.within_counter;
-        let md_ct = fun.metadata_counter;
         *fun = self.saved;
         fun.txn_counter = txn_ct;
         fun.arena_counter = arena_ct;
         fun.within_counter = within_ct;
-        fun.metadata_counter = md_ct;
     }
 }
 
