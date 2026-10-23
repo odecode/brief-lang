@@ -10953,7 +10953,7 @@ aliases and loads, and retain the declared Briev type in the loaded register.
 The wasm32 regression covers declaration and read. See
 `docs/plans/2026-10-22-wasm-constant-width.md`.
 
-## 2026-10-22 — LLVM metadata reservations overlap on large programs (FIXED in working tree)
+## 2026-10-22 — LLVM metadata reservations overlap on large programs (FIXED 2026-10-22)
 
 The recommender server emitted both a TBAA type node and StateAliasScope as
 `!99`; clang rejected it with “Metadata id is already used.” Range nodes began
@@ -10966,7 +10966,7 @@ reset only per emission round. Regression tests cover large universes, late
 structural registration, and cross-function metadata lifetime. See
 `docs/plans/2026-10-22-module-metadata-allocation.md` for verification evidence.
 
-## 2026-10-23 — multibyte view text shifts later directives (FIXED in working tree)
+## 2026-10-23 — multibyte view text shifts later directives (FIXED 2026-10-23)
 
 **Symptom:** generated browser HTML becomes malformed when UTF-8 text appears
 before a later `b-*` directive. ASCII-only templates remain intact.
@@ -10980,7 +10980,7 @@ UTF-8 byte length. The focused regression places accented, CJK and multibyte
 punctuation before two injected directive tags. See
 `docs/plans/2026-10-09-fullstack-stdlib-and-net-stack.md` for the I09 discovery.
 
-## 2026-10-23 — recommender browser account API used a different contract (FIXED in working tree)
+## 2026-10-23 — recommender browser account API used a different contract (FIXED 2026-10-23)
 
 **Symptom:** `/movies` returned successfully, but browser registration and sign-in
 failed, and authenticated profile hydration expected fields that the server did
@@ -10996,3 +10996,19 @@ random server epoch through state copies, and return versioned authentication
 and profile envelopes while retaining legacy identity fields and routes. The
 server API gate now exercises versioned registration, sign-in and state reads.
 See `docs/plans/2026-10-23-recommender-account-api-integration.md`.
+
+## 2026-10-23 — reactive rebinding of an unpacked top-level object dropped returned members (FIXED 2026-10-23)
+
+**Symptom:** `txn_serve` called `server_step(state)` but subsequent loop turns
+continued using stale object members. LLVM had no `%State` handle slot for the
+top-level unpacked object, so ordinary identifier assignment silently fell
+through without committing the returned value.
+
+**Fix:** the LLVM statement emitter now recognizes registered unpacked
+instances, resolves member slots from the instance metadata, and commits each
+returned member into the corresponding row. Local bindings, unrelated fallback
+behavior, and boxed member offsets remain handled by their existing paths.
+Regression compiles the recommender server and checks that `server_step` is
+followed by stores to the unpacked server's registered member slots
+(`reactive_rebinding_of_an_unpacked_object_commits_member_slots` in
+`src/backend/llvm/tests.rs`).
