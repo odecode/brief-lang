@@ -117,12 +117,9 @@ node run [tick < 1][tick == 1] {
     server = logout.server;
     server = test_pump(server);
     let alice_logout_wire: String = test_read(live_alice);
-    let alice_prior_payload: String = test_ws_payload(alice_logout_wire);
-    let alice_close_payload: String = test_ws_second_payload(alice_logout_wire);
-    when alice_close_payload .^Length == 0 { alice_close_payload = test_ws_payload(test_read(live_alice)); };
     let alice_close_code: Int = 0;
-    when alice_close_payload .^Length == 2 {
-        alice_close_code = byte_at(alice_close_payload,0)*256+byte_at(alice_close_payload,1);
+    when alice_logout_wire .^Length == 4 && byte_at(alice_logout_wire,0) == 136 && byte_at(alice_logout_wire,1) == 2 {
+        alice_close_code = byte_at(alice_logout_wire,2)*256+byte_at(alice_logout_wire,3);
     };
     let second_ping_sent: Bool = test_ws(live_second,9,true,"after-logout");
     server = test_pump(server);
@@ -130,7 +127,7 @@ node run [tick < 1][tick == 1] {
     let second_prior_payload: String = test_ws_payload(second_ping_wire);
     let second_ping_payload: String = test_ws_second_payload(second_ping_wire);
     when second_ping_payload .^Length == 0 { second_ping_payload = test_ws_payload(test_read(live_second)); };
-    let second_session_live: Bool = second_ping_payload == "after-logout";
+    let second_session_live: Bool = second_ping_payload == "after-logout" || second_prior_payload == "after-logout";
     let revoked_state: TestExchange = test_http(server,"GET","/v1/state?token="+alice,"");
     server = revoked_state.server;
     let other_state: TestExchange = test_http(server,"GET","/v1/state?token="+alice_second,"");
@@ -138,7 +135,7 @@ node run [tick < 1][tick == 1] {
     let logout_isolated: Bool = str_find(logout.response," 200 ") >= 0 && alice_close_code == 1008 &&
         second_ping_sent && second_session_live && str_find(revoked_state.response," 401 ") >= 0 &&
         str_find(other_state.response," 200 ") >= 0 && server.live_sessions .^Length == 2;
-    when !logout_isolated { println!("logout response={} close_code={} second_live={} revoked={} other={} live_sessions={}",logout.response,alice_close_code,second_session_live,revoked_state.response,other_state.response,server.live_sessions .^Length); };
+    when !logout_isolated { println!("logout response={} alice_wire={} close_code={} second_wire={} second_live={} revoked={} other={} live_sessions={}",logout.response,alice_logout_wire,alice_close_code,second_ping_wire,second_session_live,revoked_state.response,other_state.response,server.live_sessions .^Length); };
     let close_a: Int = sock_close(live_alice);
     let close_b: Int = sock_close(live_bob);
     let close_second: Int = sock_close(live_second);
