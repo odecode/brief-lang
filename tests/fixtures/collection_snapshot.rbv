@@ -3,9 +3,12 @@
 //===----------------------------------------------------------------------===//
 let items: List<String> = ["héllo", "世界"];
 let empty_items: List<String> = [];
+obj SnapshotRow { id: Int; title: String; };
+let rows: List<SnapshotRow> = [];
 txn grow_items [items .^Length < 1100][items .^Length == 1100] {
     items = [];
     foreach idx in 0..1100 { items += [idx as String]; };
+    foreach idx in 0..12 { rows = rows+[SnapshotRow { id: idx, title: "Row "+(idx as String) }]; };
     term;
 };
 txn reset_items [items .^Length > 0][items .^Length == 0] { items = []; term; };
@@ -14,5 +17,6 @@ txn reset_items [items .^Length > 0][items .^Length == 0] { items = []; term; };
   <button b-trigger:click="reset_items">Reset</button>
   <ul><li b-each:item="items" b-key="item"><span b-text="item"></span></li></ul>
   <ul><li b-each:item="empty_items" b-key="item"><span b-text="item"></span></li></ul>
+  <ol><li b-each:row="rows" b-key="row.id"><span b-text="row.title"></span></li></ol>
 </view>
 when true { reside; };

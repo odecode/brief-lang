@@ -2725,7 +2725,7 @@ fn collect_extra_objects(items: &[briev_compiler::ast::TopLevel], resolver: &bri
         match ext.as_deref() {
             Some("c") | Some("cpp") | Some("cc") | Some("cxx") | Some("m") => {
                 let src = resolved_path();
-                let obj = compile_source_to_object(&src, &cache_dir)?;
+                let obj = compile_source_to_object(&src, &cache_dir, None)?;
                 objects.push(obj);
             }
             Some("so") | Some("dylib") | Some("a") | Some("o") => {
@@ -2749,7 +2749,7 @@ fn get_ffi_cache_dir() -> PathBuf {
 
 /// 2026-07-16: P4 — Compile a C/C++ source to a .o object file.
 /// Content-hash cached at ~/.cache/briev-compiler/ffi/<hash>.o.
-fn compile_source_to_object(source_path: &Path, cache_dir: &Path) -> Result<PathBuf, String> {
+fn compile_source_to_object(source_path: &Path, cache_dir: &Path, target_triple: Option<&str>) -> Result<PathBuf, String> {
     let content = std::fs::read(source_path)
         .map_err(|e| format!("cannot read '{}': {}", source_path.display(), e))?;
     // 2026-07-26: Include compiler flags in the cache key so flag changes
@@ -2757,6 +2757,9 @@ fn compile_source_to_object(source_path: &Path, cache_dir: &Path) -> Result<Path
     let mut hasher = blake3::Hasher::new();
     hasher.update(&content);
     hasher.update(b":flto:fPIC");
+    if let Some(triple) = target_triple {
+        hasher.update(triple.as_bytes());
+    }
     let hash = hasher.finalize();
     let cache_path = cache_dir.join(format!("{}.o", hash.to_hex()));
     if cache_path.exists() {
@@ -2768,8 +2771,15 @@ fn compile_source_to_object(source_path: &Path, cache_dir: &Path) -> Result<Path
         "cpp" | "cc" | "cxx" => "c++",
         _ => return Err(format!("unknown source extension '{}' for '{}'", ext, source_path.display())),
     };
-    let status = Command::new("clang")
-        .args([
+    let mut command = Command::new("clang");
+    let compile_triple = target_triple.filter(|triple| triple.contains("linux") || !triple.contains("unknown"));
+    if let Some(triple) = compile_triple {
+        command.arg(format!("--target={}", triple));
+    }
+    if let Some(triple) = compile_triple {
+        hasher.update(triple.as_bytes());
+    }
+    let status = command.args([
             "-O3", "-flto", "-march=native", "-ffast-math", "-fPIC",
             "-x", lang_flag,
             "-c",
@@ -2878,7 +2888,7 @@ fn compile_ll_to_binary(ll_path: &str, binary_path: &str, inputs: LinkInputs<'_>
         });
         if needs_runtime && !has_runtime {
             let cache_dir = get_ffi_cache_dir();
-            let obj = compile_source_to_object(&runtime_c, &cache_dir)?;
+            let obj = compile_source_to_object(&runtime_c, &cache_dir, Some(&triple))?;
             cmd.arg(obj.as_os_str());
         }
         for obj in extra_objects {
@@ -3086,10 +3096,21 @@ fn compile_ll_to_library(ll_path: &str, base: &str, _extra_objects: &[PathBuf]) 
 /// Uses `llc -march=wasm32 -filetype=obj` to produce a .o, then
 /// `wasm-ld` to link into .wasm. This avoids needing a wasm32 clang.
 fn compile_wasm(ll_path: &str, wasm_path: &str, exports: &[String]) -> Result<(), String> {
+    // 2026-10-25: llc alone does not eliminate self-tail recursion. Ordinary
+    // catalogue scans exhausted the WASM stack. Promote local slots and run
+    // LLVM's proof-preserving tail-call pass before instruction selection.
+    // Retire this stage only when the shared lowering guarantees bounded stack.
+    let lowered_path = format!("{}.lowered.ll", wasm_path);
+    let optimized = Command::new("opt")
+        .args(["-S", "-passes=mem2reg,tailcallelim", ll_path, "-o", &lowered_path])
+        .status().map_err(|error| format!("Could not run LLVM opt: {error}. Install llvm-tools or use --emit-ir-only."))?;
+    if !optimized.success() {
+        return Err(format!("LLVM could not lower '{ll_path}' for WebAssembly. Check the emitted IR diagnostics."));
+    }
     // Step 1: compile .ll to .wasm object file
     let obj_path = format!("{}.o", wasm_path);
     let mut assemble = Command::new("llc");
-    assemble.args(["-march=wasm32", "-filetype=obj", ll_path, "-o", &obj_path]);
+    assemble.args(["-march=wasm32", "-filetype=obj", &lowered_path, "-o", &obj_path]);
     let status = assemble.status()
         .map_err(|e| format!(
             "failed to invoke llc: {} (install llvm-tools or use --emit-ir-only)",
@@ -3101,7 +3122,8 @@ fn compile_wasm(ll_path: &str, wasm_path: &str, exports: &[String]) -> Result<()
     // Step 2: link .o to .wasm — export the reactive entry points the JS shim
     // calls (state_layout + every txn/definition). wasm-ld exports nothing by
     // default; without these the generated module is a dead object.
-    let mut link = Command::new("wasm-ld");
+    let linker = resolve_wasm_linker()?;
+    let mut link = Command::new(linker);
     link.args(["--no-entry", "--allow-undefined", "-o", wasm_path, &obj_path]);
     for name in exports {
         link.arg(format!("--export={}", name));
@@ -3117,8 +3139,34 @@ fn compile_wasm(ll_path: &str, wasm_path: &str, exports: &[String]) -> Result<()
     }
     // Clean up intermediate object
     let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&lowered_path);
     println!("wrote {}", wasm_path);
     Ok(())
+}
+
+/// Resolve the WebAssembly linker paired with the installed Clang toolchain.
+/// LLVM packages commonly install only a versioned `wasm-ld-N` executable;
+/// Clang reports the matching path without requiring the compiler to guess
+/// the LLVM version or depend on an unversioned symlink.
+fn resolve_wasm_linker() -> Result<String, String> {
+    if Command::new("wasm-ld").arg("--version").output().is_ok() {
+        return Ok("wasm-ld".to_string());
+    }
+    let output = Command::new("clang")
+        .arg("-print-prog-name=wasm-ld")
+        .output()
+        .map_err(|e| format!("failed to locate wasm-ld through clang: {}", e))?;
+    if !output.status.success() {
+        return Err("clang could not resolve its wasm-ld linker".to_string());
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() || path == "wasm-ld" || !std::path::Path::new(&path).is_file() {
+        return Err(format!(
+            "clang reported unavailable WebAssembly linker '{}'; install wasm-ld or use --emit-ir-only",
+            path
+        ));
+    }
+    Ok(path)
 }
 
 /// The effective view HTML: the `<view>` tag / `--html` value when present;
@@ -3618,12 +3666,12 @@ node go [done == false][done == true] {
         with_temp_file(content, |path| {
             let cache_dir = get_ffi_cache_dir();
             // First compilation
-            let result1 = compile_source_to_object(path, &cache_dir);
+            let result1 = compile_source_to_object(path, &cache_dir, None);
             assert!(result1.is_ok(), "first compile failed: {:?}", result1);
             let obj1 = result1.unwrap();
             assert!(obj1.exists(), "object file not created");
             // Same source → same hash → returns cached path (identical)
-            let result2 = compile_source_to_object(path, &cache_dir);
+            let result2 = compile_source_to_object(path, &cache_dir, None);
             assert!(result2.is_ok(), "second compile failed: {:?}", result2);
             let obj2 = result2.unwrap();
             assert_eq!(obj1, obj2, "cached path should match");
@@ -3640,7 +3688,7 @@ node go [done == false][done == true] {
     fn test_compile_source_to_object_bad_ext() {
         let path = Path::new("/tmp/test_bad_ext.xyz");
         std::fs::write(path, "hello").ok();
-        let result = compile_source_to_object(path, &get_ffi_cache_dir());
+        let result = compile_source_to_object(path, &get_ffi_cache_dir(), None);
         assert!(result.is_err(), "expected compile error for unknown extension");
         let _ = std::fs::remove_file(path);
     }

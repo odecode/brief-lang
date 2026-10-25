@@ -10,7 +10,13 @@ is Briev; PostgreSQL is external infrastructure.
 ## Configuration and wire API
 
 PostgreSQL is trust-authenticated on 127.0.0.1:5432 using PGUSER/PGDATABASE.
-UDATA_PATH defaults to u.data. PORT defaults to 8080; MAX_CONNECTIONS to 1024;
+UDATA_PATH defaults to u.data. UITEM_PATH defaults to u.item and supplies the
+MovieLens-100k movie titles. The server loads and validates this catalogue once
+before opening its listener; it requires exactly 1682 rows with IDs 1 through
+1682 in order and nonempty titles. `u.item` title bytes are ISO-8859-1 and are
+converted to UTF-8 before JSON serialization. Keep the data file local and
+configured; it is not copied into this repository. PORT defaults to 8080;
+MAX_CONNECTIONS to 1024;
 LAMBDA_MILLI to 500 (0..1000 means lambda 0..1); REFRESH_SECONDS to 300.
 `CACHE_PATH` defaults to `recommender.snapshot.bin`. Its directory must already
 exist and be writable for durable reuse and refresh worker handoff.
@@ -31,7 +37,9 @@ POST /v1/operations/{id}/retry and `/discard` queue resolution for a
 definitively failed operation. POST /v1/logout?token=... revokes only that process-local
 session (`/logout` is an alias), closes live channels opened with that token,
 and leaves other sessions for the account valid. POST /rating accepts
-token/item_id/rating and performs an account-scoped upsert. GET /movies lists the zero-based movie IDs. GET
+token/item_id/rating and performs an account-scoped upsert. GET /movies returns
+the ordered catalogue as `{movies:[{item_id,title},...]}`, using zero-based IDs
+and MovieLens titles. GET
 /recommendations?token=... returns cold_start:true below five distinct ratings,
 or recommendations ordered by descending score and ascending item ID.
 POST /admin/refresh schedules a snapshot rebuild; this demo endpoint has no
@@ -176,3 +184,23 @@ defines I02's portable types/codecs, framing, persistence transition policy and
 the interfaces required by I03–I17. It explicitly separates current behavior from
 the future admission/worker/browser cutover. Its native/WASM contract fixtures
 must pass when those boundaries change.
+
+## Crash recovery invariants (2026-10-25)
+
+The coordinator's returned object replaces its pooled state after every reactor
+firing; discarding that assignment loses authentication requests even when the
+worker and PostgreSQL complete them. Box/pool conversion uses each field's
+native width. Idle slots without live sessions preserve the existing state.
+Empty prediction models own both CSR boundary offsets. Worker shutdown follows
+the protocol's deadline-only payload and exits only after a successful stopped
+reply; a rejected request does not terminate the process.
+
+Catalogue responses use one owned growing buffer, released after the final
+String copy. Repeated immutable prefix copies previously retained approximately
+412 MiB for a single 85,469-byte MovieLens response.
+
+The real browser gate is `tests/fixtures/recommender/browser_live_server.mjs`.
+It verifies registration, login, live ratings, prediction during a blocked
+database save, and save confirmation without another recommendation render.
+Worker-process gates separately cover shutdown/reaping, crash/restart,
+generation changes, malformed messages and timeout behavior.

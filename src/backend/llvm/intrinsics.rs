@@ -409,9 +409,7 @@ pub fn emit_intrinsic_call(
             // `Count#` on a String operand = its CHAR count (the element
             // count of Iterable<Char>), not a declared `op Count`.
             let p = backend.string_ptr(out, indent, &arg_regs[0]);
-            writeln!(out, "{}{} = call i64 @briev_char_len({}ptr {})", indent, v,
-            if backend.ctx.defn_takes_state("briev_char_len") { "ptr %state, " } else { "" }, p).ok();
-            return BTypedRegister { name: v.to_string(), ty: Type::int() };
+            return emit_char_count_ptr(backend, out, v, &p, indent);
         }
         if !args.is_empty() {
             let recv = &args[0];
@@ -580,9 +578,19 @@ fn emit_char_count(
     }
     let reg = backend.emit_expr(out, &args[0], indent);
     let p = backend.string_ptr(out, indent, &reg);
-    writeln!(out, "{}{} = call i64 @briev_char_len({}ptr {})", indent, v,
-            if backend.ctx.defn_takes_state("briev_char_len") { "ptr %state, " } else { "" }, p).ok();
-    let narrowed = narrow_int_result(backend, out, v, indent);
+    emit_char_count_ptr(backend, out, v, &p, indent)
+}
+
+/// 2026-10-25: a declared character-count implementation returns its target
+/// Int width; the legacy external runtime returns i64. Respect the declaration
+/// on both intrinsic entry paths to avoid wasm indirect-call signature traps.
+fn emit_char_count_ptr(backend: &mut LlvmBackend, out: &mut String, v: &str, p: &str, indent: &str) -> BTypedRegister {
+    let ret = backend.ctx.defn_return_types.get("briev_char_len")
+        .and_then(|types| types.first()).map(|ty| backend.llvm_type(ty))
+        .unwrap_or_else(|| "i64".to_string());
+    let state = if backend.ctx.defn_takes_state("briev_char_len") { "ptr %state, " } else { "" };
+    writeln!(out, "{indent}{v} = call {ret} @briev_char_len({state}ptr {p})").ok();
+    let narrowed = if ret == "i64" { narrow_int_result(backend, out, v, indent) } else { v.to_string() };
     BTypedRegister { name: narrowed, ty: Type::int() }
 }
 

@@ -53,8 +53,14 @@ It also runs 128 proptest cases for each of properties 5, 7 and 20 through the
 native property probe. PostgreSQL gates reset only briev_server_api_gate and
 briev_server_loop_gate. Do not run copies concurrently against the same test DB.
 
+The runner also checks MovieLens `u.item` parsing, contiguous zero-based IDs,
+title JSON serialization, malformed catalogue rejection, and Latin-1-to-UTF-8
+conversion. Set `UITEM_PATH` when running the standalone catalogue gate to
+verify the complete local 1682-item dataset; without it, the gate uses parser
+samples only.
+
 Build the service with `brievc build examples/recommender/server.bv --out <dir>`;
-configure PGUSER, PGDATABASE and UDATA_PATH before running it. PORT defaults to
+configure PGUSER, PGDATABASE, UDATA_PATH and UITEM_PATH before running it. PORT defaults to
 8080, MAX_CONNECTIONS to 1024, LAMBDA_MILLI to 500 and REFRESH_SECONDS to 300.
 See docs/architecture/applications/recommender-server.md for the wire contract.
 

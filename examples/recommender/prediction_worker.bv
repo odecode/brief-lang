@@ -28,9 +28,9 @@ defn prediction_worker_handle(engine: ActiveProfileEngine, request: WorkerMessag
     let predicted: Result<RecommendationResult,String> = active_engine_predict(engine,query,lambda_milli as Float/1000.0);
     when is_err(predicted) { term prediction_worker_error(request,"prediction-failed",unwrap_err(predicted),false); };
     let encoded: Result<String,String> = protocol_encode_event(PredictedRatings(unwrap(predicted)));
-    when is_err(encoded) { term prediction_worker_error(request,"prediction-encode","The prediction result could not be encoded.",false); };
+    when is_err(encoded) { term prediction_worker_error(request,"prediction-encode",unwrap_err(encoded),false); };
     let payload: Result<JsonValue,String> = protocol_document(unwrap(encoded));
-    when is_err(payload) { term prediction_worker_error(request,"prediction-encode","The prediction result is not valid bounded JSON.",false); };
+    when is_err(payload) { term prediction_worker_error(request,"prediction-encode",unwrap_err(payload),false); };
     term WorkerMessage { kind: "result", tag: request.tag, payload: unwrap(payload) };
 };
 

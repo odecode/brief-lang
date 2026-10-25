@@ -139,6 +139,7 @@ pub enum ItemDirective {
     Trigger {
         event: String,
         txn: String,
+        params: Vec<String>,
     },
 }
 
@@ -856,11 +857,17 @@ impl ViewCompiler {
                 }
             } else if attr.starts_with("b-trigger:") || attr.starts_with("b-on:") {
                 let prefix = if attr.starts_with("b-trigger:") { "b-trigger:" } else { "b-on:" };
-                if let Some((txn, _)) = self.extract_trigger_value_from_tag(tag, prefix) {
+                if let Some((txn, params)) = self.extract_trigger_attribute(tag, attr, prefix) {
                     let event = self
-                        .extract_event_suffix(&tag_lower, prefix.trim_end_matches(':'))
+                        .extract_event_suffix(attr, prefix.trim_end_matches(':'))
                         .unwrap_or_else(|| "click".to_string());
-                    out.push(ItemBinding { marker, directive: ItemDirective::Trigger { event, txn } });
+                    let params: Vec<String> = params.into_iter().map(|(_, value)| value).collect();
+                    for param in &params {
+                        if let Err(message) = self.check_item_expr(param, item_name) {
+                            self.validation_errors.push(message);
+                        }
+                    }
+                    out.push(ItemBinding { marker, directive: ItemDirective::Trigger { event, txn, params } });
                 }
             } else if attr.starts_with("b-window:") {
                 // 2026-10-08 (popstate, container case): a `b-window:` on a
@@ -871,9 +878,9 @@ impl ViewCompiler {
                 // so the shim binds `window.addEventListener`. An informational
                 // note teaches the semantics: the likely author intent ("each
                 // item reacts to a window event") does not map to DOM reality.
-                let result = self.extract_trigger_value_from_tag(tag, "b-window:");
+                let result = self.extract_trigger_attribute(tag, attr, "b-window:");
                 let event = self
-                    .extract_event_suffix(&tag_lower, "b-window")
+                    .extract_event_suffix(attr, "b-window")
                     .unwrap_or_else(|| "click".to_string());
                 if let Some((txn_name, _params)) = result {
                     self.user_triggered_txns.insert(txn_name.clone());
@@ -901,7 +908,8 @@ impl ViewCompiler {
     /// violation.
     fn check_item_expr(&self, expr: &str, item_name: &str) -> Result<(), String> {
         let e = expr.trim();
-        if e == item_name || Self::is_item_field(e, item_name) {
+        if e == item_name || Self::is_item_field(e, item_name)
+            || e.parse::<f64>().is_ok() || e == "true" || e == "false" {
             return Ok(());
         }
         // Find the operator by scanning for its first character (no loop —
@@ -948,9 +956,8 @@ impl ViewCompiler {
 
     fn unsupported_item_msg(&self, expr: &str, item_name: &str) -> String {
         format!(
-            "item-scoped expression '{}' is unsupported in b-each (Phase 2a3) — \
-             only `{}` or `{} <op> <literal>` comparisons are rendered per item; \
-             state-field expressions land with the Phase 2b component plan",
+            "Cannot evaluate '{}' for each item. Use `{}`, a direct item field, \
+             a number or boolean, or a `{} <op> <literal>` comparison.",
             expr, item_name, item_name
         )
     }
@@ -1163,8 +1170,8 @@ if attr.starts_with("b-text") {
                 // extraction + validity inference (txn
                 // existence/contract/precondition); only the shim's listener
                 // target differs (`window` vs the element).
-                let result = self.extract_trigger_value_from_tag(tag, prefix);
-                let event = self.extract_event_suffix(&tag_lower, prefix.trim_end_matches(':'));
+                let result = self.extract_trigger_attribute(tag, attr, prefix);
+                let event = self.extract_event_suffix(attr, prefix.trim_end_matches(':'));
                 if let Some((txn_name, params)) = result {
                     // Track user-triggered transactions for linting
                     // These should have preconditions that account for non-deterministic user input
@@ -1447,6 +1454,16 @@ if attr.starts_with("b-text") {
             }
         }
         None
+    }
+
+    // 2026-10-25: select the current event attribute, not the first trigger
+    // with its scope prefix. Multiple window/element events must remain
+    // independent. Retire this slice when attributes have a parsed AST.
+    fn extract_trigger_attribute(&self, tag: &str, attribute: &str, prefix: &str)
+        -> Option<(String, Vec<(String, String)>)> {
+        let name = attribute.split('=').next()?;
+        let start = tag.to_lowercase().find(name)?;
+        self.extract_trigger_value_from_tag(&tag[start..], prefix)
     }
 
     fn extract_trigger_value_from_tag(
@@ -2288,6 +2305,21 @@ mod tests {
     // ── 2026-08-11 (Phase 2a3): b-each + b-key ────────────────────────
 
     #[test]
+    fn item_trigger_preserves_field_arguments() {
+        let mut compiler = ViewCompiler::new();
+        let (bindings, _, diagnostics) = compiler.compile(
+            r#"<ul><li b-each:row="rows" b-key="row.id"><button b-trigger:click="choose(row.id)">Choose</button></li></ul>"#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let Directive::Each { item_bindings, .. } = &bindings[0].directive else {
+            panic!("expected the item collection binding");
+        };
+        assert!(item_bindings.iter().any(|binding| matches!(
+            &binding.directive, ItemDirective::Trigger { params, .. } if params == &["row.id"]
+        )));
+    }
+
+    #[test]
     fn b_each_captures_item_bindings_and_marks_template() {
         let mut vc = ViewCompiler::new();
         let (bindings, _, diagnostics) = vc.compile(
@@ -2345,7 +2377,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.contains("unsupported in b-each") && d.contains("item == selected")),
+                .any(|d| d.contains("Cannot evaluate") && d.contains("item == selected")),
             "{:?}",
             diagnostics
         );
@@ -2580,6 +2612,18 @@ mod tests {
             vc.get_user_triggered_transactions().contains("sync_route"),
             "window trigger txn must be user-triggered"
         );
+    }
+
+    #[test]
+    fn distinct_events_on_one_element_keep_their_handlers() {
+        let mut compiler = ViewCompiler::new();
+        let (bindings, _, _) = compiler.compile(
+            r#"<section b-window:first="receive(1)" b-window:second="retry(2)" b-trigger:click="choose" b-trigger:input="edit"></section>"#);
+        let events: Vec<_> = bindings.iter().filter_map(|binding| match &binding.directive {
+            Directive::Trigger { event, txn, .. } => Some((event.as_str(), txn.as_str())),
+            _ => None,
+        }).collect();
+        assert_eq!(events, [("first", "receive"), ("second", "retry"), ("click", "choose"), ("input", "edit")]);
     }
 
     /// An element-scoped trigger keeps `scope = Element` (regression: the

@@ -51,8 +51,9 @@ defn server_http(state: ServerState, slot: Int) -> ServerState {
         io_http_reply(dispatched.state.reactor,slot,dispatched.status,dispatched.body);
         term dispatched.state;
     };
-    let reply: ApiReply = api_dispatch(state.conn,state.sessions,state.model,request,state.lambda,
-        server_timestamp(),state.server_epoch);
+    let runtime: ApiRuntime = ApiRuntime { catalogue: state.catalogue, lambda: state.lambda,
+        timestamp: server_timestamp(), server_epoch: state.server_epoch };
+    let reply: ApiReply = api_dispatch(state.conn,state.sessions,state.model,request,runtime);
     let updated: ServerState = server_after_reply(state,reply);
     trace_stage("http_dispatch",request_started);
     io_http_reply(state.reactor,slot,reply.status,reply.body);

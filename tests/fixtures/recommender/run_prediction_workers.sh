@@ -5,7 +5,7 @@ cd "$(dirname "$0")/../../.."
 BV=${BRIEVC:-./target/debug/brievc}
 OUT=${PREDICTION_WORKER_OUTPUT:-target/recommender-I08}
 mkdir -p "$OUT"
-for gate in prediction_pool_gate prediction_generation_gate worker_model_gate worker_contract_checks worker_process_gate responsiveness_frame_gate; do
+for gate in worker_empty_model_gate prediction_pool_gate prediction_generation_gate worker_model_gate worker_contract_checks worker_process_gate responsiveness_frame_gate; do
     "$BV" build "tests/fixtures/recommender/$gate.bv" --out "$OUT" >"$OUT/$gate.build.log" 2>&1
     GATE_TIMEOUT=60
     if [ "$gate" = worker_process_gate ]; then GATE_TIMEOUT=120; fi

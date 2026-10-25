@@ -112,6 +112,17 @@ defn test_upgrade(socket: Socket, token: String) -> Bool {
     term test_send(socket,"GET /live?token="+token+" HTTP/1.1\r\nHost: localhost\r\nUpgrade:\twebsocket \t\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version:\t13 \t\r\nSec-WebSocket-Key:\tdGhlIHNhbXBsZSBub25jZQ== \t\r\n\r\n");
 };
 
+defn test_catalogue_rows(idx: Int, count: Int, movies: List<CatalogueMovie>) -> MovieCatalogue {
+    when idx >= count { term MovieCatalogue { ok: true, movies: movies, error: "" }; };
+    let movie: CatalogueMovie = CatalogueMovie { item_id: idx, title: "Test movie "+(idx as String) };
+    term test_catalogue_rows(idx+1,count,movies+[movie]);
+};
+
+defn test_catalogue(count: Int) -> MovieCatalogue {
+    let empty: List<CatalogueMovie> = [];
+    term test_catalogue_rows(0,count,empty);
+};
+
 defn test_server() -> ServerState {
     let conn: PgConn = pg_connect(2130706433,5432,get_env("PGUSER"),get_env("PGDATABASE"),"");
     when conn.pid < 0 { println!("test database unavailable"); test_abort(); };
@@ -127,7 +138,7 @@ defn test_server() -> ServerState {
     when is_err(loaded) { println!("test model failed={}",unwrap_err(loaded).err_msg); test_abort(); };
     let reactor: Reactor = reactor_open(0,16);
     when reactor.listener < 0 { test_abort(); };
-    let initial: ServerState = server_new(reactor,conn,unwrap(loaded),0.5,3600000);
+    let initial: ServerState = server_new(reactor,conn,unwrap(loaded),test_catalogue(8),0.5,3600000);
     // 2026-10-25: loopback login and rating gates exercise the same required
     // worker startup as the real server; server_new intentionally stays pure.
     let started: Result<ServerState,String> = server_workers_start(initial);

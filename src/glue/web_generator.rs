@@ -480,13 +480,20 @@ impl GlueWebGenerator {
                 .collect::<String>()
         };
         let host_module_src = self.host_module_src.as_str();
+        let heap_source = include_str!("web_heap.js");
 
         format!(
             r#"// dom-shim.mjs — Auto-generated GLUE web runtime for {app_name}
 // Reads WASM linear memory at known state offsets.
 
 {host_fns_js}{host_module_src}
+{heap_source}
 export class WasmDomRuntime {{
+  // 2026-10-25: repeated snapshots preserve unchanged text nodes and observers.
+  _setText(element, value) {{
+    const text = value == null ? "" : String(value);
+    if (element.textContent !== text) element.textContent = text;
+  }}
   constructor(wasmBytes) {{
     this._handles = [null];
     this._bindingTable = [];
@@ -501,7 +508,7 @@ export class WasmDomRuntime {{
     this._generationOffset = {generation_offset};
     this._flushBufferOffset = {flush_buffer_offset};
     this._maxFlushEntries = {max_flush_entries};
-    this._heapPtr = 0;
+    this._heap = createWebHeap(() => this._memory || this._instance?.exports.memory);
     // 2026-10-08 (Phase 3.1 stranger probe): keep the init promise so
     // createApp can await it — reading `_instance.exports` before init
     // resolved threw "Cannot read properties of null (reading 'exports')".
@@ -538,25 +545,16 @@ export class WasmDomRuntime {{
       __web_flush_state: (updatesPtr, count) => {{
         this._applyFlush(updatesPtr, count);
       }},
-      // LLVM lowers libc malloc to an env import on wasm32. The runtime
-      // owns a bump allocator so user host boundaries do not depend on Emscripten.
-      malloc: (size) => this._malloc(size),
+      // 2026-10-25: LLVM can lower copies/fills to libc imports too. Share
+      // the checked allocator with every host memory door; retire only when
+      // the module supplies its own complete allocator ABI.
+      ...this._heap,
 {imports_js}
     }};
   }}
 
   _malloc(size) {{
-    const need = (Number(size) + 7) & ~7;
-    const memory = this._memory || this._instance?.exports.memory;
-    if (!memory) throw new Error("malloc before WebAssembly memory was ready");
-    if (!this._heapPtr) this._heapPtr = memory.buffer.byteLength;
-    if (this._heapPtr + need > memory.buffer.byteLength) {{
-      const pages = Math.ceil((this._heapPtr + need - memory.buffer.byteLength) / 65536);
-      memory.grow(pages);
-    }}
-    const ptr = this._heapPtr;
-    this._heapPtr += need;
-    return ptr;
+    return this._heap.malloc(size);
   }}
 
   _loadStateLayout() {{
@@ -660,12 +658,7 @@ export class WasmDomRuntime {{
   }}
 
   _allocateStatic(size) {{
-    // Fallback: bump-allocate from a known free region.
-    // Overridden by the WASM module's malloc when available.
-    if (!this._heapPtr) this._heapPtr = 65536;
-    const ptr = this._heapPtr;
-    this._heapPtr += size;
-    return ptr;
+    return this._malloc(size);
   }}
 
   _startRenderLoop() {{
@@ -814,13 +807,13 @@ export async function createApp(wasmBytes) {{
                     crate::view_compiler::ItemDirective::Trigger { .. } => ("trigger", ""),
                 };
                 let extra = match &ib.directive {
-                    crate::view_compiler::ItemDirective::Trigger { event, txn } => {
-                        format!(", event: {event:?}, txn: {txn:?}")
+                    crate::view_compiler::ItemDirective::Trigger { event, txn, params } => {
+                        format!(", event: {event:?}, txn: {txn:?}, params: {params:?}")
                     }
                     crate::view_compiler::ItemDirective::Class { pairs } => {
                         let cls: Vec<String> = pairs
                             .iter()
-                            .map(|(cls_name, cls_expr)| format!("({cls_name:?}, {cls_expr:?})"))
+                            .map(|(cls_name, cls_expr)| format!("[{cls_name:?}, {cls_expr:?}]"))
                             .collect();
                         format!(", cls: [{}]", cls.join(", "))
                     }
@@ -870,7 +863,7 @@ export async function createApp(wasmBytes) {{
              const __sp = Number(BigInt.asUintN(32, BigInt(__word)));\
              const __len = Number(dv.getBigInt64(__sp, true));\
              const __bytes = new Uint8Array(this._memory.buffer, __sp + 8, __len);\
-             const item = String.fromCharCode(...__bytes);".to_string()
+             const item = new TextDecoder().decode(__bytes);".to_string()
         } else {
             "const item = Number(dv.getBigInt64(snapPtr + 8 + i * 8, true));".to_string()
         };
@@ -917,15 +910,15 @@ export async function createApp(wasmBytes) {{
              \x20           const v = itemValue(expr.trim(), item);\n\
              \x20           return String(v === undefined ? item : v);\n\
              \x20         }};\n
-             \x20         const applyItem = (el, item) => {{\n\
+             \x20         const applyItem = (el, item, bind = false) => {{ el.__brievItem = item;\n\
              \x20           for (const ib of itemBindings) {{\n\
              \x20             const target = ib.marker === 0 ? el : el.querySelector('[data-itm=\"' + ib.marker + '\"]');\n\
              \x20             if (!target) continue;\n\
-             \x20             if (ib.kind === \"text\") target.textContent = evalItem(ib.expr, item);\n\
-             \x20             else if (ib.kind === \"show\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
+             \x20             if (ib.kind === \"text\") this._setText(target, evalItem(ib.expr, item));\n\
+             \x20             else if (ib.kind === \"class\") {{ for (const [name, expr] of ib.cls) target.classList.toggle(name, Boolean(evalItem(expr, item))); }} else if (ib.kind === \"show\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
              \x20             else if (ib.kind === \"when\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
              \x20             else if (ib.kind === \"trigger\") {{\n\
-             \x20               target.addEventListener(ib.event, () => this._txn(ib.txn)(item));\n\
+             \x20               if (bind) target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
              \x20             }}\n\
              \x20           }}\n\
              \x20         }};\n\
@@ -945,10 +938,10 @@ export async function createApp(wasmBytes) {{
               \x20             if (!el2) {{\n\
               \x20               el2 = document.createElement(tagName);\n\
               \x20               el2.innerHTML = templateInner;\n\
-              \x20               applyItem(el2, item);\n\
+              \x20               applyItem(el2, item, true);\n\
               \x20               rendered.set(key, el2);\n\
              \x20             }}\n\
-             \x20             if (el2 !== cursor) container.insertBefore(el2, cursor);\n\
+             \x20             applyItem(el2, item); if (el2 !== cursor) container.insertBefore(el2, cursor);\n\
              \x20             cursor = el2.nextElementSibling;\n\
              \x20           }}\n\
              \x20           for (const [key, el2] of rendered) {{\n\
@@ -1045,7 +1038,7 @@ export async function createApp(wasmBytes) {{
                 format!(
                     "this._registerViewEffect({handle}, (value) => {{\n\
                      \x20         const el = {el};\n\
-                     \x20         if (el) el.textContent = {apply_value};\n\
+                     \x20         if (el) this._setText(el, {apply_value});\n\
                      \x20       }});"
                 )
             }
@@ -1063,7 +1056,7 @@ export async function createApp(wasmBytes) {{
                 format!(
                     "this._registerViewEffect({handle}, (value) => {{\n\
                      \x20         const el = {el};\n\
-                     \x20         if (el) el.style.display = ({hidden} ? !({cond}) : ({cond})) ? 'none' : '';\n\
+                     \x20         if (el) el.style.display = ({hidden} ? ({cond}) : !({cond})) ? 'none' : '';\n\
                      \x20       }});",
                     hidden = if hidden { "true" } else { "false" },
                     cond = cond
@@ -1182,7 +1175,10 @@ export async function createApp(wasmBytes) {{
                     String::new()
                 } else {
                     let args: Vec<String> = params.iter().map(|(_, v)| v.clone()).collect();
-                    format!(", {}", args.join(", "))
+                    // 2026-10-25: _txn owns the state argument. Static event
+                    // arguments start at position zero; a leading comma makes
+                    // the entire module invalid. Revisit only if that ABI changes.
+                    args.join(", ")
                 };
                 if *scope == crate::view_compiler::TriggerScope::Window {
                     // The shim boots asynchronously, so `load`/DOMContentLoaded
@@ -1266,13 +1262,13 @@ export async function createApp(wasmBytes) {{
                             crate::view_compiler::ItemDirective::Trigger { .. } => ("trigger", ""),
                         };
                         let extra = match &ib.directive {
-                            crate::view_compiler::ItemDirective::Trigger { event, txn } => {
-                                format!(", event: {event:?}, txn: {txn:?}")
+                            crate::view_compiler::ItemDirective::Trigger { event, txn, params } => {
+                                format!(", event: {event:?}, txn: {txn:?}, params: {params:?}")
                             }
                             crate::view_compiler::ItemDirective::Class { pairs } => {
                                 let cls: Vec<String> = pairs
                                     .iter()
-                                    .map(|(cls_name, cls_expr)| format!("({cls_name:?}, {cls_expr:?})"))
+                                    .map(|(cls_name, cls_expr)| format!("[{cls_name:?}, {cls_expr:?}]"))
                                     .collect();
                                 format!(", cls: [{}]", cls.join(", "))
                             }
@@ -1299,8 +1295,8 @@ export async function createApp(wasmBytes) {{
                      \x20         const templateInner = {template_html:?};\n\
                      \x20         anchor.remove();\n\
                      \x20         const itemBindings = {ibs_js};\n\
-                     \x20         const evalItem = (expr, item) => {{\n\
-                     \x20           if (expr === {item_name:?}) return Boolean(item);\n\
+                     \x20         const itemValue = (token, item) => token === {item_name:?} ? item : token === \"true\" ? true : token === \"false\" ? false : Number(token); const evalItem = (expr, item) => {{\n\
+                     \x20           const direct = itemValue(expr.trim(), item); if (!Number.isNaN(direct)) return direct;\n\
                      \x20           for (const op of [\"==\", \"!=\", \"<=\", \">=\", \"<\", \">\"]) {{\n\
                      \x20             const i = expr.indexOf(op);\n\
                      \x20             if (i < 0) continue;\n\
@@ -1318,18 +1314,18 @@ export async function createApp(wasmBytes) {{
                      \x20           }}\n\
                      \x20           return Boolean(item);\n\
                      \x20         }};\n\
-                     \x20         const applyItem = (el, item) => {{\n\
+                     \x20         const applyItem = (el, item, bind = false) => {{ el.__brievItem = item;\n\
                      \x20           for (const ib of itemBindings) {{\n\
                      \x20             const target = ib.marker === 0 ? el : el.querySelector('[data-itm=\"' + ib.marker + '\"]');\n\
                      \x20             if (!target) continue;\n\
                      \x20             if (ib.kind === \"text\") {{\n\
-                     \x20               target.textContent = String(item);\n\
+                     \x20               this._setText(target, item);\n\
                      \x20             }} else if (ib.kind === \"class\") {{\n\
                      \x20               for (const [clsName, clsExpr] of (ib.cls || [])) {{\n\x20                 target.classList.toggle(clsName, evalItem(clsExpr, item));\n\x20               }}\n\
                      \x20             }} else if (ib.kind === \"show\" || ib.kind === \"when\") {{\n\
                      \x20               target.style.display = evalItem(ib.expr, item) ? \"\" : \"none\";\n\
                      \x20             }} else if (ib.kind === \"trigger\") {{\n\
-                     \x20               target.addEventListener(ib.event, () => this._txn(ib.txn)(item));\n\
+                     \x20               if (bind) target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
                      \x20             }}\n\
                      \x20           }}\n\
                      \x20         }};\n\
@@ -1348,10 +1344,10 @@ export async function createApp(wasmBytes) {{
                      \x20             if (!el) {{\n\
                      \x20               el = document.createElement(tagName);\n\
                      \x20               el.innerHTML = templateInner;\n\
-                     \x20               applyItem(el, item);\n\
+                     \x20               applyItem(el, item, true);\n\
                      \x20               rendered.set(key, el);\n\
                      \x20             }}\n\
-                     \x20             if (el !== cursor) container.insertBefore(el, cursor);\n\
+                     \x20             applyItem(el, item); if (el !== cursor) container.insertBefore(el, cursor);\n\
                      \x20             cursor = el.nextElementSibling;\n\
                      \x20           }}\n\
                      \x20           for (const [key, el] of rendered) {{\n\
@@ -1373,7 +1369,7 @@ export async function createApp(wasmBytes) {{
                 // Each expr is a bounded single-field form (validated at view
                 // compile): dynamic pairs register on the root field's handle
                 // (evaluated on flush); literal-only pairs apply once at init.
-                 let mut js = String::from("(() => {\n        const el = {el};\n        if (!el) return;\n");
+                 let mut js = format!("(() => {{\n        const el = {el};\n        if (!el) return;\n");
                  for (cls_name, expr) in pairs {
                      match self.bounded_root(expr) {
                          Some((root, None)) if !root.is_empty() => {
@@ -1985,7 +1981,7 @@ mod tests {
             "text binding must register a view effect on the count field; got:\n{}", output.dom_shim);
         assert!(output.dom_shim.contains("document.getElementById(\"counter\")"),
             "text binding must target its element; got:\n{}", output.dom_shim);
-        assert!(output.dom_shim.contains("el.textContent = value"),
+        assert!(output.dom_shim.contains("this._setText(el, value)"),
             "text binding must set textContent; got:\n{}", output.dom_shim);
         assert!(output.dom_shim.contains("addEventListener(\"click\"")
             && output.dom_shim.contains("this._txn(\"increment\")"),
@@ -2270,6 +2266,7 @@ mod tests {
                         directive: ItemDirective::Trigger {
                             event: "click".to_string(),
                             txn: "select_item".to_string(),
+                            params: Vec::new(),
                         },
                     },
                     ItemBinding {
@@ -2312,7 +2309,7 @@ mod tests {
         assert!(shim.contains("getBigInt64(valPtr + i * 8"),
             "each must read i64 slots from WASM:\n{shim}");
         assert!(shim.contains("txn: \"select_item\"")
-            && shim.contains("this._txn(ib.txn)(item)"),
+            && shim.contains("[el.__brievItem]"),
             "item trigger must call the txn with the item:\n{shim}");
         assert!(shim.contains("data-itm=\\\""),
             "marker-1 inner elements resolved in the clone:\n{shim}");
@@ -2320,6 +2317,23 @@ mod tests {
             && shim.contains("container.insertBefore(el, cursor)")
             && !shim.contains("container.appendChild(el)"),
             "keyed reconciliation must leave unchanged vector nodes in place:\n{shim}");
+    }
+
+    #[test]
+    fn trigger_arguments_start_at_the_first_position() {
+        use crate::view_compiler::{Binding, Directive, TriggerScope};
+        let generator = make_empty_generator();
+        for scope in [TriggerScope::Element, TriggerScope::Window] {
+            let binding = Binding {
+                element_id: "button".into(),
+                directive: Directive::Trigger {
+                    event: "click".into(), txn: "choose".into(), scope,
+                    params: vec![("value".into(), "3".into()), ("flag".into(), "true".into())],
+                },
+            };
+            let js = generator.binding_to_js(&binding);
+            assert!(js.contains("this._txn(\"choose\")(3, true)"), "{js}");
+        }
     }
 
     #[test]
@@ -2401,10 +2415,10 @@ mod tests {
             vec![frgn],
         );
         let out = g.generate().unwrap();
-        assert!(out.dom_shim.contains("malloc: (size) => this._malloc(size)"),
+        assert!(out.dom_shim.contains("...this._heap"),
             "wasm32 malloc import missing:\n{}", out.dom_shim);
         assert!(out.dom_shim.contains("_malloc(size)"),
-            "bump allocator missing:\n{}", out.dom_shim);
+            "checked allocator missing:\n{}", out.dom_shim);
         assert!(out.dom_shim.contains("document.readyState"),
             "missed readiness-event recovery missing:\n{}", out.dom_shim);
     }

@@ -166,14 +166,22 @@ defn worker_child_persistence_open(epoch: String) -> Result<PersistenceWorker,St
 };
 
 defn worker_model_empty() -> Result<WorkerModelState,String> {
-    let population: RatingPopulation = RatingPopulation { user_off: ivec_new(1), user_item: ivec_new(1),
-        user_val: vec_new(1), item_off: ivec_new(1), item_user: ivec_new(1), item_val: vec_new(1),
+    // 2026-10-25: even an empty one-row CSR needs two initialized offsets.
+    // Workspace construction reads both bounds and mean-presence flags before
+    // the first model arrives. Retire this seed only with optional model state.
+    let population: RatingPopulation = RatingPopulation { user_off: ivec_new(2), user_item: ivec_new(1),
+        user_val: vec_new(1), item_off: ivec_new(2), item_user: ivec_new(1), item_val: vec_new(1),
         nusers: 1, nitems: 1, nnz: 0 };
+    ivec_set(population.user_off,0,0); ivec_set(population.user_off,1,0);
+    ivec_set(population.item_off,0,0); ivec_set(population.item_off,1,0);
     let means: Means = Means { user_mean: vec_new(1), item_mean: vec_new(1),
         user_has: ivec_new(1), item_has: ivec_new(1), global: 0.0 };
+    vec_set(means.user_mean,0,0.0); vec_set(means.item_mean,0,0.0);
+    ivec_set(means.user_has,0,0); ivec_set(means.item_has,0,0);
     let cache: SimCache = SimCache { user_sim: mat_new(1,1), item_sim: mat_new(1,1),
         user_mean: means.user_mean, item_mean: means.item_mean, nusers: 1, nitems: 1,
         sig: PopSignature { nnz: 0, mtime: 0 } };
+    mat_set(cache.user_sim,0,0,0.0); mat_set(cache.item_sim,0,0,0.0);
     let accounts: List<Int> = [];
     let model: ServerModel = ServerModel { population: population, means: means, cache: cache,
         accounts: accounts, baseline_users: 0, revision: "" };
@@ -228,7 +236,7 @@ defn worker_child_loop(fd: Int, frame: Int, role: String, state: WorkerModelStat
     let step: WorkerChildStep = worker_child_handle(request,role,state);
     let sent: Int = worker_child_send_message(fd,step.response);
     when sent <= 0 { term 8; };
-    when request.kind == "shutdown" { term 0; };
+    when request.kind == "shutdown" && step.response.kind == "stopped" { term 0; };
     term worker_child_loop(fd,frame,role,step.state);
 };
 
@@ -245,7 +253,7 @@ defn worker_child_handle(request: WorkerMessage, role: String, state: WorkerMode
         };
         let handled: PersistenceWorkerStep = persistence_worker_handle(state.persistence,request);
         state.persistence = handled.worker;
-        when request.kind == "shutdown" && state.persistence.ready {
+        when handled.reply.kind == "stopped" && state.persistence.ready {
             persistence_worker_close(state.persistence);
             state.persistence.ready = false;
         };

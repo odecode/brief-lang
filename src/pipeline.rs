@@ -1452,6 +1452,24 @@ mod tests {
         assert!(result.is_ok(), "browser root import should typecheck: {result:?}");
     }
 
+    #[test]
+    fn match_empty_list_arm_uses_the_declared_collection_result_type() {
+        let dir = tempfile::tempdir().expect("temporary project directory");
+        let root = dir.path().join("match_list.bv");
+        let source = "import \"std/json.bv\";\ndefn protocol_array(value: JsonValue) -> List<JsonValue> { match value { Array(values) => values, _ => [] } };\ndefn protocol_fields() -> List<(String,JsonValue)> { term [(\"x\",Null())]; };";
+        std::fs::write(&root, source).unwrap();
+        let opts = BuildOptions {
+            file_path: root.to_string_lossy().to_string(),
+            stdlib_path: Some(crate::resource_root().join("lib").to_string_lossy().to_string()),
+            ..BuildOptions::default()
+        };
+        let (items, universe) = parse_and_check(root.to_str().unwrap(), source, &opts)
+            .expect("typed match with an empty List arm");
+        let mut backend = crate::backend::llvm::LlvmBackend::new().with_type_universe(universe);
+        let ir = backend.generate(&items, None);
+        assert!(!ir.is_empty(), "codegen must emit the checked program");
+    }
+
     fn bind(element_id: &str, target: &str) -> Binding {
         Binding {
             element_id: element_id.to_string(),
@@ -1539,6 +1557,7 @@ mod tests {
                     directive: ItemDirective::Trigger {
                         event: "click".to_string(),
                         txn: "remove_item".to_string(),
+                        params: Vec::new(),
                     },
                 }],
                 key_expr: "item".to_string(),

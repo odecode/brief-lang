@@ -242,8 +242,10 @@ defn worker_test_recovery(epoch: String) -> Bool {
     when !pending.exit.reaped || !pending.exit.signaled || pending.exit.signal != 9 || !pending.exit.restart ||
         pending.channel.fd != -1 || !no_zombie || held.restarted || !restarted.restarted { term false; };
     let second: WorkerStarted = worker_wait_started(restarted.channel,100000);
+    println!("worker_restart_ready={} fd={} terminal={}",second.passed,second.channel.fd,second.channel.terminal);
     when !second.passed { term false; };
     let request: WorkerExchange = worker_exchange(second.channel,worker_test_shutdown(epoch));
+    println!("worker_restart_shutdown={} kind={} error={}",request.passed,request.response.kind,protocol_text(protocol_member(request.response.payload,"error")));
     when !request.passed || request.response.kind != "stopped" { term false; };
     let stopped: WorkerPollResult = worker_poll_until_exit(WorkerChild { pid: request.channel.pid,
         channel_fd: request.channel.fd, deadline_ms: 20000, attempt: 2, restart_limit: 1 },10000);

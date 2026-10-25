@@ -37,6 +37,13 @@ defn server_boot() -> ServerState {
     when path .^Length == 0 { path = "u.data"; };
     let loaded: BaselineLoad = baseline_bootstrap(conn,path);
     when !loaded.ok { pg_close(conn); server_fatal(loaded.err_msg); };
+    let catalogue_path: String = get_env("UITEM_PATH");
+    when catalogue_path .^Length == 0 { catalogue_path = "u.item"; };
+    let catalogue: MovieCatalogue = catalogue_load(catalogue_path,1682);
+    when !catalogue.ok {
+        pg_close(conn);
+        server_fatal(catalogue.error+" The title catalogue must contain every MovieLens item in ID order.");
+    };
     let model: Result<ServerModel,PgResult> = model_load(conn,943,1682);
     when is_err(model) { pg_close(conn); server_fatal("Cannot build the recommendation snapshot: "+unwrap_err(model).err_msg); };
     let reactor: Reactor = reactor_open(port,capacity);
@@ -44,7 +51,8 @@ defn server_boot() -> ServerState {
         model_free(unwrap(model)); pg_close(conn);
         server_fatal("Cannot open the listener (errno "+reactor.listener as String+"); choose an available PORT and check descriptor limits.");
     };
-    let initial: ServerState = server_new(reactor,conn,unwrap(model),(lambda_milli as Float)/1000.0,refresh_seconds*1000);
+    let initial: ServerState = server_new(reactor,conn,unwrap(model),catalogue,
+        (lambda_milli as Float)/1000.0,refresh_seconds*1000);
     let workers: Result<ServerState,String> = server_workers_start(initial);
     when is_err(workers) { model_free(unwrap(model)); pg_close(conn); reactor_close(reactor);
         server_fatal("Cannot start the bounded persistence and prediction workers: "+unwrap_err(workers)); };

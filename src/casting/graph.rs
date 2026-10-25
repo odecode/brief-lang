@@ -216,11 +216,11 @@ impl CastingGraph {
         self.set_lane("Data", "Float", LaneKind::Bitcast);
         self.set_lane("Float", "Data", LaneKind::Bitcast);
         // ── Data ⇄ String ──────────────────────────────────────────
-        // 2026-08-01 (B2): Data→String is the ENCODING DOOR — a CastFrom(Data)
-        // callback (UTF8 wrap default, materializing the [len][bytes] header by
-        // construction; sub-protocols override via register_cast_from_data). It
-        // is NOT a bitcast: wrapping must produce a header-prefixed buffer.
-        self.set_lane("Data", "String", LaneKind::CastFromBitCallback);
+        // 2026-10-25: Data carries the universal representation handle. When
+        // that handle already points to a String's [len][bytes] storage, the
+        // conversion is a representation-preserving pointer cast. Raw Bit→
+        // String remains the encoding door below the Data hub.
+        self.set_lane("Data", "String", LaneKind::IntToPtr);
         // String→Data: the CONTENT VIEW — a String value IS a ptr to
         // [len][bytes], so the cast yields the buffer address (ptrtoint, one
         // instruction). Zero-length/identity at the register level; never
@@ -1476,8 +1476,8 @@ mod tests {
     #[test]
     fn test_bit_to_string() {
         // 2026-08-01 (B2): Bit → String (the ENCODING DOOR) now routes through
-        // Data: Bit→Data is a bitcast, then Data→String is the CastFrom(Data)
-        // callback (UTF8 wrap default materializing the [len][bytes] header).
+        // Data: Bit→Data is a bitcast, then Data→String is the encoding door
+        // from the Bit category, which materializes the String representation.
         let graph = CastingGraph::new();
         let path = graph.find_path("Bit", "", "String", "");
         assert!(path.is_some());

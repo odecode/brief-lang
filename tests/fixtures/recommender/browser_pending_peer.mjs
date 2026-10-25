@@ -40,10 +40,11 @@ const stateBody = JSON.stringify({ v: 1, type: 'state', profile: profile(5), use
   ratings: [0, 1, 2, 3, 4].map(item_id => ({ item_id, rating: 3 })), model_generation: '1',
   operations: [], next_after_revision: '5', through_revision: '5' });
 
+const page = await browser.newPage();
+page.setDefaultTimeout(15000);
 try {
-  const page = await browser.newPage();
   const pageErrors = [];
-  page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('pageerror', error => { pageErrors.push(error.message); console.error(error.stack); });
   page.on('console', message => { if (message.type() === 'error') pageErrors.push(message.text()); });
   await page.addInitScript(() => {
     const nativeFetch = window.fetch.bind(window);
@@ -88,7 +89,7 @@ try {
   await page.waitForFunction(() => window.__pendingPeer.requests.some(request => request.url.endsWith('/movies')));
   const catalogueIndex = await page.evaluate(() => window.__pendingPeer.requests.findIndex(request => request.url.endsWith('/movies')));
   await page.evaluate(({ index, body }) => window.__pendingPeer.respond(index, 200, body), { index: catalogueIndex,
-    body: JSON.stringify({ movies: Array.from({ length: 8 }, (_, item_id) => ({ item_id })) }) });
+    body: JSON.stringify({ movies: Array.from({ length: 1682 }, (_, item_id) => ({ item_id, title: `Movie ${item_id + 1}` })) }) });
   await page.getByText('Live', { exact: true }).waitFor();
 
   const initial = event('recommendations', 5, { model_generation: '1', job_id: '1', attempt: 1,
@@ -96,10 +97,10 @@ try {
   await page.evaluate(text => window.__pendingPeer.message(text), JSON.stringify(initial));
   await page.getByText('Movie 41', { exact: true }).waitFor();
 
-  await page.locator('#movie').fill('6');
-  await page.locator('#stars').fill('4');
+  await page.locator('.movie-list li').filter({ has: page.getByText('Movie 6', { exact: true }) }).getByRole('button').click();
+  await page.getByRole('button', { name: '4 stars', exact: true }).click();
   await page.locator('#save-rating').click();
-  await page.getByText('(pending save)', { exact: false }).waitFor();
+  await page.locator('#ratings').getByText('· saving', { exact: false }).waitFor();
   await page.waitForFunction(() => window.__pendingPeer.sent.length === 1);
   const firstCommand = await page.evaluate(() => window.__pendingPeer.sent[0]);
   assert.equal(firstCommand.item_id, 5);
@@ -121,8 +122,8 @@ try {
   assert.equal(await page.locator('#recommendations li').count(), 1);
 
   await page.evaluate(() => window.__pendingPeer.sockets.at(-1).close());
-  await page.locator('#movie').fill('7');
-  await page.locator('#stars').fill('5');
+  await page.locator('.movie-list li').filter({ has: page.getByText('Movie 7', { exact: true }) }).getByRole('button').click();
+  await page.getByRole('button', { name: '5 stars', exact: true }).click();
   await page.locator('#save-rating').click();
   await page.waitForFunction(() => window.__pendingPeer.requests.some(request => request.url.includes('/v1/ratings')));
   const submitIndex = await page.evaluate(() => window.__pendingPeer.requests.findIndex(request => request.url.includes('/v1/ratings')));
@@ -147,8 +148,8 @@ try {
 
   await page.evaluate(() => window.__pendingPeer.sockets.at(-1).close());
   const submitCountBeforeFailure = await page.evaluate(() => window.__pendingPeer.requests.filter(request => request.url.includes('/v1/ratings')).length);
-  await page.locator('#movie').fill('8');
-  await page.locator('#stars').fill('2');
+  await page.locator('.movie-list li').filter({ has: page.getByText('Movie 8', { exact: true }) }).getByRole('button').click();
+  await page.getByRole('button', { name: '2 stars', exact: true }).click();
   await page.locator('#save-rating').click();
   await page.waitForFunction(count => window.__pendingPeer.requests.filter(request => request.url.includes('/v1/ratings')).length > count, submitCountBeforeFailure);
   const failedSubmit = await page.evaluate(() => window.__pendingPeer.requests.map((request, index) => ({ request, index }))
@@ -188,6 +189,11 @@ try {
   await page.waitForFunction(() => window.__pendingPeer.requests.filter(request => request.url.includes('/v1/state')).length >= 2);
   assert.deepEqual(pageErrors, []);
   console.log('browser pending peer: optimistic paint, event ordering, duplicates, HTTP fallback, failure, cancellation and stale session pass');
+} catch (error) {
+  console.error(await page.locator('.movie-list li').evaluateAll(rows => rows.map(row => row.__brievItem)));
+  console.error(await page.locator("body").innerText());
+  console.error(await page.evaluate(async () => { const api = await import("./app.mjs"); return window.__pendingPeer.requests.map((r, i) => ({ url: r.url, status: api.http_async_status(i + 1), body: api.http_async_body(i + 1), error: api.http_async_error(i + 1) })); }));
+  throw error;
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

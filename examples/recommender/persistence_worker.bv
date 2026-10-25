@@ -55,14 +55,19 @@ defn persistence_worker_abandon(worker: PersistenceWorker) -> PersistenceWorker 
 };
 
 defn persistence_worker_handle(worker: PersistenceWorker, request: WorkerMessage) -> PersistenceWorkerStep {
-    when !worker.ready || !worker_message_valid(request) || request.tag.profile.server_epoch != worker.server_epoch ||
-        protocol_text(protocol_member(request.payload,"database_identity")) != worker.database_identity {
+    when !worker.ready || !worker_message_valid(request) || request.tag.profile.server_epoch != worker.server_epoch {
+        term persistence_worker_error_step(worker,request,"worker-identity","The persistence request does not match this worker's database identity.",false,false);
+    };
+    // 2026-10-25: shutdown is an epoch-scoped control message with only a
+    // deadline payload (protocol v1). Database identity gates data operations;
+    // requiring it here rejected every graceful supervisor shutdown.
+    when request.kind == "shutdown" { term persistence_worker_stopped(worker,request); };
+    when protocol_text(protocol_member(request.payload,"database_identity")) != worker.database_identity {
         term persistence_worker_error_step(worker,request,"worker-identity","The persistence request does not match this worker's database identity.",false,false);
     };
     when request.kind == "persist" { term persistence_worker_handle_save(worker,request); };
     when request.kind == "discard" { term persistence_worker_handle_discard(worker,request); };
     when request.kind == "receipt" { term persistence_worker_handle_receipts(worker,request); };
-    when request.kind == "shutdown" { term persistence_worker_stopped(worker,request); };
     term persistence_worker_error_step(worker,request,"worker-kind","This persistence worker accepts persist, discard, receipt and shutdown requests.",false,false);
 };
 

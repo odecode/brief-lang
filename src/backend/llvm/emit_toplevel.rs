@@ -188,6 +188,15 @@ impl LlvmBackend {
         let mut lets: HashMap<String, Option<Type>> = HashMap::new();
         let mut assigned: HashSet<String> = HashSet::new();
         for s in stmts { walk(s, &mut lets, &mut assigned); }
+        // 2026-10-25: expression blocks also assign enclosing locals (for
+        // example the conditional RHS of &&). Their slots must dominate the
+        // skipped edge. Retire this traversal when the statement walker owns
+        // expression-block descent as part of its public contract.
+        crate::ast::visit::walk_stmts(stmts, &mut |expression| {
+            if let Expr::Block(body) = expression {
+                for statement in body { walk(statement, &mut lets, &mut assigned); }
+            }
+        });
         lets.into_iter().filter(|(n, _)| assigned.contains(n)).collect()
     }
 
@@ -1056,7 +1065,10 @@ impl LlvmBackend {
         // `inttoptr i64`). Map a Tuple to the boxed handle type, exactly like
         // obj values below.
         if matches!(ty, Type::Tuple(_)) {
-            return format!("i{}", self.ctx.int_bits);
+            // 2026-10-25: Tuple heap images use an i64 handle even when Briev
+            // Int is i32 on wasm32. Keep the boxed-value ABI independent of
+            // Int width; otherwise tuple defns return ptrtoint i64 as i32.
+            return "i64".to_string();
         }
         // 2026-07-30: Slice<T> always uses { ptr, i64 } (fat pointer). Must be
         // checked BEFORE the general struct_types check because Slice is also
@@ -1081,7 +1093,10 @@ impl LlvmBackend {
             }
             // 2026-08-26 (Track B): an enum value is the boxed-image handle.
             if self.ctx.enum_handle_types.contains(name) {
-                return format!("i{}", self.ctx.int_bits);
+                // Enum values are boxed heap-image handles; the constructors
+                // and match path materialize them with ptrtoint i64, so their
+                // value ABI is independent of the target's native Int width.
+                return "i64".to_string();
             }
             if self.ctx.struct_types.contains_key(name) {
                 return "ptr".to_string();
@@ -1096,7 +1111,7 @@ impl LlvmBackend {
             }
             // 2026-08-26 (Track B): an enum value is the boxed-image handle.
             if self.ctx.enum_handle_types.contains(name) {
-                return format!("i{}", self.ctx.int_bits);
+                return "i64".to_string();
             }
         }
         // 2026-08-15 (coll plan §3.5): SVO List multi-slot struct type REMOVED
@@ -1631,7 +1646,10 @@ impl LlvmBackend {
             if let Some(empty_member) = empty_member {
                 let size = self.struct_type_size(&type_key);
                 let inst = self.fun.gen_reg();
-                writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+                // 2026-10-25: the State retains this collection after
+                // init_state returns. Its header must outlive the init frame;
+                // use owned storage until state destruction owns an arena.
+                writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
                 let addr = self.fun.gen_reg();
                 let hw = format!("i{}", self.ctx.int_bits);
                 writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, addr, inst, hw).ok();
@@ -1690,7 +1708,8 @@ impl LlvmBackend {
         // Allocate the instance storage and pass its address as `self`.
         let size = self.struct_type_size(&type_key);
         let inst = self.fun.gen_reg();
-        writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+        // Same persistent lifetime as the empty initializer above.
+        writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
         let addr = self.fun.gen_reg();
         // 2026-08-11 (wasm32 obj-member fix): obj instance handles are
         // i{int_bits} (i32 on wasm32), not hardcoded i64.
@@ -2342,12 +2361,21 @@ impl LlvmBackend {
             let off = self.lookup_field_offset(base, &fname);
             let gep = self.fun.gen_reg();
             writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, gep, box_p, off).ok();
-            let store_val = if load_ty == "i64" {
+            // 2026-10-25: boxed values use native field widths on every
+            // target. Widening Bool/Float/pointers corrupts adjacent fields;
+            // reverse the column conversion when materializing the box.
+            let native_ty = self.llvm_type(&fty);
+            let store_val = if load_ty == native_ty {
                 val.clone()
+            } else if native_ty == "ptr" {
+                let pointer = self.fun.gen_reg();
+                writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, pointer, load_ty, val).ok();
+                pointer
             } else {
-                self.adapt_to_i64(out, indent, &TypedRegister { name: val.clone(), ty: fty.clone() })
+                self.ensure_typed_value(out, indent, &native_ty, &val,
+                    Some(Type::bits(64)), self.ctx.type_universe.clone().as_ref())
             };
-            writeln!(out, "{}store i64 {}, ptr {}", indent, store_val, gep).ok();
+            writeln!(out, "{}store {} {}, ptr {}", indent, native_ty, store_val, gep).ok();
         }
         TypedRegister { name: addr, ty: Type::Custom(base.to_string()) }
     }
@@ -2415,7 +2443,7 @@ impl LlvmBackend {
                     data_ty = Some(fty.clone());
                     break;
                 }
-                offset += crate::backend::llvm::types::type_size(fty, self.ctx.type_universe.as_ref());
+                offset += self.field_storage_size(fty);
             }
         }
         let data_ty = data_ty?;
@@ -2699,7 +2727,7 @@ impl LlvmBackend {
         }
         let mut total: u64 = 0;
         for (_mname, mty) in &members {
-            total += crate::backend::llvm::types::type_size(mty, self.ctx.type_universe.as_ref());
+            total += self.field_storage_size(mty);
         }
         let total = total.max(8);
         let raw = self.fun.gen_reg();
@@ -3342,11 +3370,10 @@ impl LlvmBackend {
 
     /// 2026-10-20 (obj-globals): split an instance VALUE (an i64 box handle
     /// from a constructor/member call) into the bound instance's pool row.
-    /// The box stores every member as an i64 word (box_pooled_instance_value);
-    /// each word is converted back to the member's native type and stored in
-    /// that member's column at the instance's row. Nested-array columns are
-    /// skipped (a single word cannot materialize them; they stay zero).
-    fn emit_instance_seed_from_value(
+    /// 2026-10-25: initialization and replacement share this native-field
+    /// scatter, including aggregate members. Retire it only when pooled and
+    /// boxed objects share a representation.
+    pub(super) fn emit_instance_seed_from_value(
         &mut self,
         out: &mut String,
         indent: &str,
@@ -3389,12 +3416,6 @@ impl LlvmBackend {
             let Some(&idx) = self.ctx.field_index_map.get(&slot) else {
                 continue;
             };
-            // A pool column's type is the ARRAY (`[N x ...]`) — that is
-            // expected. Skip only a member whose OWN type is an array: one
-            // boxed word cannot materialize it (such members stay zero).
-            if matches!(fty, Type::Vector(_, _)) {
-                continue;
-            }
             let off = self.lookup_field_offset(mono, &fname);
             let gep = self.fun.gen_reg();
             writeln!(
@@ -3649,6 +3670,10 @@ impl LlvmBackend {
     pub(super) fn emit_definition(&mut self, out: &mut String, d: &crate::ast::Definition, needs_state: bool) {
         self.fun.pending_cleanup.clear();
         self.fun.clear_locals();
+        // 2026-10-25: helper returns are not transaction commits. A stale
+        // driver name flushed partially constructed state during rendering.
+        // Keep the boundary explicit until function contexts are isolated.
+        self.fun.txn_name.clear();
         self.fun.enum_inline_slots.clear();
         self.fun.sret_call_slots.clear();
         self.fun.enum_out_slot = None;
@@ -3817,8 +3842,13 @@ impl LlvmBackend {
         }
         self.fun.ssa_old_int_regs.clear();
         self.fun.ssa_old_float_regs.clear();
+        self.fun.txn_counter = 0;
         for (i, (n, t)) in d.parameters.iter().enumerate() {
             let raw = format!("%arg{}", i);
+            if Self::parameter_is_reassigned(&d.body, n) {
+                self.bind_mutable_parameter(out, n, t, &raw);
+                continue;
+            }
             let reg: String;
             // 2026-07-01: Use universe-declared box_op for parameter boxing.
             // If llvm_type is already i64, no boxing is needed (Int, UInt).
@@ -3904,7 +3934,6 @@ impl LlvmBackend {
                 self.fun.let_binding_types.insert(n.clone(), t.clone());
             }
         }
-        self.fun.txn_counter = 0;
         self.fun.terminated = false;
         // 2026-06-26: in_callable_txn must be true so Statement::Term in the
         // defn body emits a ret instruction (emit_stmt.rs line 78). Without
@@ -4129,6 +4158,10 @@ impl LlvmBackend {
         base: &str,
         subst: &std::collections::HashMap<String, crate::ast::Type>,
     ) {
+        if let Some(transaction) = self.ctx.generic_txns.get(base).cloned() {
+            self.emit_specialized_transaction(out, mangled, transaction, subst);
+            return;
+        }
         let Some(base_defn) = self.ctx.generic_defns.get(base).cloned() else {
             return;
         };
@@ -4153,6 +4186,30 @@ impl LlvmBackend {
         }
         let needs_state = self.ctx.defn_needs_state.get(mangled).copied().unwrap_or(true);
         self.emit_definition(out, &specialized, needs_state);
+    }
+
+    /// 2026-10-25: callable generic transactions need concrete element layouts
+    /// just like definitions. Erased adapters read/write eight-byte elements
+    /// in four-byte browser collections. Share the specialization worklist;
+    /// retire this seam when frontend monomorphization handles both item kinds.
+    fn emit_specialized_transaction(
+        &mut self, out: &mut String, name: &str, mut transaction: crate::ast::Transaction,
+        subst: &std::collections::HashMap<String, Type>,
+    ) {
+        transaction.name = name.to_string();
+        transaction.type_params.clear();
+        for (_, ty) in &mut transaction.parameters {
+            *ty = crate::typechecker::substitute_type(ty, subst);
+        }
+        transaction.outputs = transaction.outputs.iter()
+            .map(|ty| crate::typechecker::substitute_type(ty, subst)).collect();
+        transaction.output_type = transaction.output_type.map(|ty| substitute_output_type(&ty, subst));
+        for statement in &mut transaction.body {
+            crate::typechecker::substitute_stmt_types(statement, subst);
+        }
+        crate::typechecker::substitute_expr_types(&mut transaction.contract.pre_condition, subst);
+        crate::typechecker::substitute_expr_types(&mut transaction.contract.post_condition, subst);
+        self.emit_callable_txn(out, &transaction, name);
     }
 
     // 2026-06-13: Added ptr %state param — definitions can access global state.
@@ -5913,6 +5970,8 @@ fn probe_ok_checks(
             writeln!(out, "  br label %post").ok();
         }
         writeln!(out, "post:").ok();
+        self.fun.terminated = false;
+        self.fun.cur_block = Some("post".to_string());
         // 2026-10-05 (callable-txn convergence): the postcondition is the
         // convergence GOAL — satisfied → done (return), else → loop (body
         // re-runs). Unconditional for callable txns.
@@ -7446,7 +7505,7 @@ mod tests {
     #[test]
     fn result_gate_or_emits_canonical_i8() {
         // 2026-10-15 (bool-width canonicalization): the callable-txn
-        // convergence gate `[yes(term) || no(term)]` must emit `or i8` under
+        // convergence gate `[yes(term) || no(term)]` must produce i8 under
         // the bool label — the desync class produced `or i64` feeding the
         // gate's `trunc i8`, which clang rejects ("defined with type 'i64'
         // but expected 'i8'").
@@ -7467,7 +7526,7 @@ mod tests {
         let mut backend = LlvmBackend::new();
         let ir = backend.generate(&program, None);
         assert!(
-            ir.contains("or i8"),
+            ir.contains("phi i8"),
             "the gate disjunction emits at the canonical width: {ir}"
         );
         assert!(

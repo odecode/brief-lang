@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 import "./server_api.bv";
+import "./movie_catalogue.bv";
 import "./server_io.bv";
 import "./model_worker.bv";
 import "./sessions.bv";
@@ -21,7 +22,7 @@ obj ServerWorkers {
     auth_slot: Int; auth_kind: String; next_job: Int;
 };
 obj ServerState {
-    reactor: Reactor; conn: PgConn; model: ServerModel; sessions: SessionStore;
+    reactor: Reactor; conn: PgConn; model: ServerModel; catalogue: MovieCatalogue; sessions: SessionStore;
     server_epoch: String;
     views: List<OwnerView>; live_sessions: List<LiveSession>; admission: AdmissionState;
     workers: ServerWorkers; lambda: Float;
@@ -65,7 +66,7 @@ defn server_empty_workers(epoch: String) -> ServerWorkers {
 };
 
 defn server_with_workers(state: ServerState, workers: ServerWorkers) -> ServerState {
-    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: state.sessions,
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: state.sessions,
         server_epoch: state.server_epoch, views: state.views, live_sessions: state.live_sessions,
         admission: state.admission, workers: workers, lambda: state.lambda, refresh: state.refresh,
         next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
@@ -172,7 +173,8 @@ defn server_workers_start(state: ServerState) -> Result<ServerState,String> {
     term Ok(server_with_workers(state,workers));
 };
 
-defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, lambda: Float, interval: Int) -> ServerState {
+defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, catalogue: MovieCatalogue,
+    lambda: Float, interval: Int) -> ServerState {
     let views: List<OwnerView> = [];
     let live_sessions: List<LiveSession> = [];
     // 2026-10-23: one random process identity scopes protocol profile revisions
@@ -182,21 +184,21 @@ defn server_new(reactor: Reactor, conn: PgConn, model: ServerModel, lambda: Floa
     let limits: AdmissionLimits = AdmissionLimits { profiles: 4096, pending_global: 1024,
         pending_owner: 64, receipt_slots: 65536, retained_bytes: 67108864 };
     let admission: AdmissionState = profile_empty(epoch,limits);
-    term ServerState { reactor: reactor, conn: conn, model: model, sessions: sessions_new(),
+    term ServerState { reactor: reactor, conn: conn, model: model, catalogue: catalogue, sessions: sessions_new(),
         server_epoch: epoch,
         views: views, live_sessions: live_sessions, admission: admission, workers: server_empty_workers(epoch), lambda: lambda, refresh: false,
         next_refresh: server_clock()+interval, interval: interval, worker: worker_idle() };
 };
 
 defn server_with(state: ServerState, sessions: SessionStore, views: List<OwnerView>, refresh: Bool) -> ServerState {
-    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: sessions,
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: sessions,
         server_epoch: state.server_epoch,
         views: views, live_sessions: state.live_sessions, admission: state.admission, workers: state.workers, lambda: state.lambda, refresh: refresh,
         next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
 };
 
 defn server_with_live_sessions(state: ServerState, sessions: List<LiveSession>) -> ServerState {
-    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, sessions: state.sessions,
+    term ServerState { reactor: state.reactor, conn: state.conn, model: state.model, catalogue: state.catalogue, sessions: state.sessions,
         server_epoch: state.server_epoch, views: state.views, live_sessions: sessions, admission: state.admission,
         workers: state.workers, lambda: state.lambda,
         refresh: state.refresh, next_refresh: state.next_refresh, interval: state.interval, worker: state.worker };
@@ -227,6 +229,13 @@ defn server_forget_live_session_at(sessions: List<LiveSession>, slot: Int, idx: 
 };
 
 defn server_forget_live_session(state: ServerState, slot: Int) -> ServerState {
+    // 2026-10-25: idle reactor slots have no session to remove. Preserve the
+    // existing state instead of allocating a replacement list every sweep.
+    let found: Bool = false;
+    foreach idx in 0..state.live_sessions .^Length {
+        when state.live_sessions[idx].slot == slot { found = true; };
+    };
+    when !found { term state; };
     let remaining: List<LiveSession> = [];
     term server_with_live_sessions(state,server_forget_live_session_at(state.live_sessions,slot,0,remaining));
 };
@@ -364,10 +373,24 @@ defn server_auth_dispatch(state: ServerState, slot: Int, kind: String, request: 
         term state;
     };
     let input: ApiInput = api_input(request.body);
-    when !input.ok || input.username .^Length == 0 || input.username .^Length > 128 ||
-        input.password .^Length < 8 || input.password .^Length > 1024 {
-        let error: ApiReply = api_error("validation",state.sessions);
-        io_http_reply(state.reactor,slot,error.status,error.body);
+    when !input.ok {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Send username and password as a JSON object.\"}");
+        term state;
+    };
+    when input.username .^Length == 0 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Enter a username to create your account.\"}");
+        term state;
+    };
+    when input.username .^Length > 128 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Usernames must be 128 characters or fewer.\"}");
+        term state;
+    };
+    when input.password .^Length < 8 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Choose a password with at least 8 characters.\"}");
+        term state;
+    };
+    when input.password .^Length > 1024 {
+        io_http_reply(state.reactor,slot,400,"{\"error\":\"validation\",\"message\":\"Passwords must be 1024 characters or fewer.\"}");
         term state;
     };
     let tag: WorkerTag = server_auth_tag(state);
@@ -1104,7 +1127,7 @@ defn server_refresh(state: ServerState) -> ServerState {
 };
 
 defn server_snapshot_state(state: ServerState, model: ServerModel, worker: RefreshWorker, queued: Bool, deadline: Int) -> ServerState {
-    term ServerState { reactor: state.reactor, conn: state.conn, model: model, sessions: state.sessions,
+    term ServerState { reactor: state.reactor, conn: state.conn, model: model, catalogue: state.catalogue, sessions: state.sessions,
         server_epoch: state.server_epoch,
         views: state.views, live_sessions: state.live_sessions, admission: state.admission, workers: state.workers, lambda: state.lambda,
         refresh: queued, next_refresh: deadline, interval: state.interval, worker: worker };

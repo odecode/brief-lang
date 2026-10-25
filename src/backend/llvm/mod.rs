@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod builder;
 pub(crate) mod coll_scaffold;
+mod collection_assignment;
 pub mod context;
 pub mod directive;
 pub mod dispatch;
@@ -20,7 +21,13 @@ pub mod vector_phi;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod metadata_tests;
+#[cfg(test)]
 mod match_termination_tests;
+#[cfg(test)]
+mod logical_tests;
+#[cfg(test)]
+mod crash_regressions;
 
 
 pub use builder::LLVMBuilder;
@@ -1077,7 +1084,8 @@ pub(super) fn web_max_flush_entries(ctx: &crate::backend::llvm::context::Compile
     let max = ctx.transition_graph.as_ref()
         .map(|g| g.nodes.iter().map(|n| n.write_set.len()).max().unwrap_or(0))
         .unwrap_or(0);
-    max.max(1) as u32
+    let commits = ctx.web_commit_writes.values().map(|fields| fields.len()).max().unwrap_or(0);
+    max.max(commits).max(1) as u32
 }
 pub(super) fn trg_llvm_storage_ty(ty: &Type, universe: Option<&crate::type_universe::TypeUniverse>) -> String {
     protocol_llvm_type(ty, universe)
@@ -2644,6 +2652,11 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
     pub fn generate(&mut self, items: &[TopLevel], exit_condition: Option<Box<Expr>>) -> String {
         self.liveness_fixpoint_extra.clear();
         self.liveness_fixpoint_rounds = 0;
+        // LLVM metadata IDs are module-wide: reserve the root and all TBAA
+        // type nodes before loop, range, and alias metadata are emitted.
+        let tbaa_nodes = self.ctx.type_universe.as_ref().map_or(5, |u| u.types.len());
+        self.ctx.metadata_counter = tbaa_nodes + 1;
+        self.ctx.pending_metadata.clear();
         let entry_warnings = self.warnings.clone();
         // 2026-08-23 (Plan 0.1): consume the pipeline-computed analysis when
         // the caller provided it (.with_analysis); otherwise self-compute —
@@ -2989,6 +3002,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // 2026-07-28: Persist transition graph for !prof computation in emit_toplevel.
         // iter_bounds populated later (at txn processing loop) — txns not in scope yet.
         self.ctx.transition_graph = Some(analysis.transition_graph.clone());
+        self.ctx.web_commit_writes = analysis.web_commit_writes.clone();
         // 2026-08-10: webstack flush buffer sized to the largest write_set —
         // frontend analysis, computed once so the term-site batch emitters and
         // the @__web_flush_buf declaration agree.
@@ -3263,6 +3277,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // defaults out of `defn_params` — cross-module trait-default calls
         // then panicked at emission ("no member 'put_u16_be' on 'GrowBuf'").
         self.ctx.generic_defns.clear();
+        self.ctx.generic_txns.clear();
         self.ctx.generic_defn_type_params.clear();
         // 2026-10-20 (same re-entry class): the specialization bookkeeping is
         // also per-generation. A stale `emitted_defn_specializations` made the
@@ -3323,6 +3338,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     // the call path needs %state marshaling and the void/i64
                     // prototype for zero-param/void callables too.
                     if !t.is_reactive {
+                        if !t.type_params.is_empty() {
+                            self.ctx.generic_txns.insert(t.name.clone(), t.clone());
+                            self.ctx.generic_defn_type_params.insert(t.name.clone(),
+                                t.type_params.iter().map(|parameter| parameter.name.clone()).collect());
+                        }
                         let tys: Vec<Type> = t.parameters.iter().map(|(_, ty)| ty.clone()).collect();
                         self.ctx.defn_params.insert(t.name.clone(), tys);
                         let ret_tys = if !t.outputs.is_empty() {
@@ -3855,6 +3875,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             }
         }
  
+        // 2026-10-25: registration above can add enum/object types beyond
+        // the incoming universe. Reserve their TBAA IDs before emitting any
+        // function metadata, including fixpoint re-emission. Retire when all
+        // metadata families allocate through the same module registry.
+        let tbaa_end = self.ctx.type_universe.as_ref().map_or(5, |u| u.types.len()) + 1;
+        self.ctx.metadata_counter = self.ctx.metadata_counter.max(tbaa_end);
+
         // 2026-07-13: struct_layout removed from ResolvedType in new AST.
         // TypeUniverse-based struct population is a no-op until slot syntax is reintroduced.
 
@@ -5668,13 +5695,15 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
         // 2026-07-04: StateAliasScope — a distinct !{} node used by !noalias
         // metadata on Ptr<T> volatile load/store instructions.  This scope
-        // represents "accesses to %State memory."  By annotating volatile
+        // represents "accesses to %State memory." By annotating volatile
         // accesses through Ptr<T> with !noalias !{!StateScope}, we tell LLVM
         // that the Ptr<T> access does NOT alias with any %State field access.
-        // The scope ID is fixed at 99 to avoid conflicts with TBAA (!0..!N),
-        // range metadata (!{i}), and function-scoped metadata (starting at 100).
-        self.ctx.state_alias_scope_md = 99;
-        writeln!(out, "!99 = distinct !{{}} ; StateAliasScope").ok();
+        // 2026-10-25: choose after all emitted metadata definitions; the old
+        // fixed !99 collided with TBAA when a program had 99+ registered types.
+        // Undo when module metadata has one allocator shared by every family.
+        self.ctx.state_alias_scope_md = self.ctx.metadata_counter;
+        self.ctx.metadata_counter += 1;
+        writeln!(out, "!{} = distinct !{{}} ; StateAliasScope", self.ctx.state_alias_scope_md).ok();
 
         // Build optimization report if requested
         if self.ctx.optimize_report {
@@ -6330,7 +6359,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         if self.ctx.collection_iterables.is_empty() {
             return;
         }
-        writeln!(out, "@__web_view_buf = private global [1024 x i64] zeroinitializer").ok();
+        // 2026-10-25: snapshots have collection-dependent size. Reuse a heap
+        // buffer sized for all rows instead of overwriting a fixed 1024-word
+        // global. Each materializer also owns a fresh function context so
+        // collection operations cannot inherit a transaction's commit effects.
+        writeln!(out, "@__web_view_buf = private global ptr null").ok();
+        writeln!(out, "@__web_view_capacity = private global i64 0").ok();
+        let saved_fun = self.fun.clone();
         let mut names: Vec<String> = self.ctx.collection_iterables.iter().cloned().collect();
         names.sort_unstable();
         for field in &names {
@@ -6347,8 +6382,15 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if !(has("Count") && has("At")) {
                 continue;
             }
+            self.emit_one_view_materializer(out, field, &briev_ty);
+        }
+        self.fun = saved_fun;
+    }
+
+    fn emit_one_view_materializer(&mut self, out: &mut String, field: &String, briev_ty: &Type) {
             let item_fields = self.view_item_fields(&briev_ty);
             let row_size = item_fields.len();
+            self.fun = crate::backend::llvm::context::FunctionContext::new();
             let fn_name = format!("__view_items_{}", field);
             writeln!(out, "define i32 @{}(ptr noundef noalias nocapture align 8 %state) local_unnamed_addr #0 {{", fn_name).ok();
             let count_tmp = self.fun.gen_reg();
@@ -6364,6 +6406,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             } else {
                 count.name.clone()
             };
+            Self::emit_view_buffer_capacity(out, &n_i32, row_size.max(1));
             writeln!(out, "  %hdr = alloca i32").ok();
             writeln!(out, "  store i32 0, ptr %hdr").ok();
             writeln!(out, "  br label %hlbl").ok();
@@ -6383,9 +6426,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if row_size == 0 {
                 // Scalar/string element collection: one snapshot word per item.
                 let word64 = self.view_projection_word(out, "  ", &word);
-                writeln!(out, "  %w32 = add i32 %c, 1").ok();
-                writeln!(out, "  %w = sext i32 %w32 to i64").ok();
-                writeln!(out, "  %p = getelementptr [1024 x i64], ptr @__web_view_buf, i64 0, i64 %w").ok();
+                writeln!(out, "  %c64 = zext i32 %c to i64").ok();
+                writeln!(out, "  %w = add i64 %c64, 1").ok();
+                writeln!(out, "  %p = getelementptr i64, ptr %buffer, i64 %w").ok();
                 writeln!(out, "  store i64 {}, ptr %p", word64).ok();
             } else {
                 // Struct/obj element: bind the boxed element handle and project
@@ -6405,10 +6448,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     let idx = self.fun.gen_reg();
                     let wid = self.fun.gen_reg();
                     let slot = self.fun.gen_reg();
-                    writeln!(out, "  {} = mul i32 %c, {}", row, row_size).ok();
-                    writeln!(out, "  {} = add i32 {}, {}", idx, row, col + 1).ok();
-                    writeln!(out, "  {} = sext i32 {} to i64", wid, idx).ok();
-                    writeln!(out, "  {} = getelementptr [1024 x i64], ptr @__web_view_buf, i64 0, i64 {}", slot, wid).ok();
+                    writeln!(out, "  {} = zext i32 %c to i64", wid).ok();
+                    writeln!(out, "  {} = mul i64 {}, {}", row, wid, row_size).ok();
+                    writeln!(out, "  {} = add i64 {}, {}", idx, row, col + 1).ok();
+                    writeln!(out, "  {} = getelementptr i64, ptr %buffer, i64 {}", slot, idx).ok();
                     writeln!(out, "  store i64 {}, ptr {}", word64, slot).ok();
                 }
             }
@@ -6419,10 +6462,21 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             // buf[0] = n (the real len, at i64)
             let n64 = self.fun.gen_reg();
             writeln!(out, "  {} = sext i32 {} to i64", n64, n_i32).ok();
-            writeln!(out, "  store i64 {}, ptr @__web_view_buf", n64).ok();
-            writeln!(out, "  ret i32 ptrtoint ([1024 x i64]* @__web_view_buf to i32)").ok();
+            writeln!(out, "  store i64 {}, ptr %buffer", n64).ok();
+            writeln!(out, "  %result = ptrtoint ptr %buffer to i32").ok();
+            writeln!(out, "  ret i32 %result").ok();
             writeln!(out, "}}").ok();
-        }
+    }
+
+    fn emit_view_buffer_capacity(out: &mut String, count: &str, width: usize) {
+        writeln!(out, "  %count64 = zext i32 {count} to i64").ok();
+        writeln!(out, "  %words = mul i64 %count64, {width}").ok();
+        out.push_str("  %total_words = add i64 %words, 1\n  %needed = mul i64 %total_words, 8\n");
+        out.push_str("  %capacity = load i64, ptr @__web_view_capacity\n  %grow = icmp ugt i64 %needed, %capacity\n");
+        out.push_str("  br i1 %grow, label %grow_buf, label %ready_buf\ngrow_buf:\n");
+        out.push_str("  %old_buf = load ptr, ptr @__web_view_buf\n  %new_buf = call ptr @realloc(ptr %old_buf, i64 %needed)\n");
+        out.push_str("  store ptr %new_buf, ptr @__web_view_buf\n  store i64 %needed, ptr @__web_view_capacity\n");
+        out.push_str("  br label %ready_buf\nready_buf:\n  %buffer = load ptr, ptr @__web_view_buf\n");
     }
 
     /// 2026-08-06 (fix): emit the top-level closure functions collected during
@@ -7595,9 +7649,7 @@ machine instance columns — plain storage is for scalar plumbing. Remove the \
                             let mut off = 0u64;
                             for (mname, mty) in &slots {
                                 offsets.insert(mname.clone(), (off, mty.clone()));
-                                off += crate::backend::llvm::types::type_size(
-                                    mty, self.ctx.type_universe.as_ref(),
-                                );
+                                off += self.field_storage_size(mty);
                             }
                             self.ctx.boxed_offsets.insert(base.clone(), offsets);
                         }
@@ -7909,9 +7961,7 @@ machine instance columns — plain storage is for scalar plumbing. Remove the \
                     let mut off = 0u64;
                     for (mname, mty) in &slots {
                         offsets.insert(mname.clone(), (off, mty.clone()));
-                        off += crate::backend::llvm::types::type_size(
-                            mty, self.ctx.type_universe.as_ref(),
-                        );
+                        off += self.field_storage_size(mty);
                     }
                     self.ctx.boxed_offsets.insert(base.clone(), offsets);
                 }

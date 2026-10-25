@@ -10451,6 +10451,59 @@ node go [done == 0][done == 1] {
     );
 }
 
+/// 2026-10-25: tuple values use boxed i64 handles independently of the
+/// target's Briev Int width. A wasm32 tuple-returning helper must therefore
+/// declare and call the same i64 ABI that emit_tuple materializes.
+#[test]
+fn wasm32_tuple_return_uses_boxed_i64_abi() {
+    let src = r#"
+defn pair(value: Int) -> (Int, Int) { term (value, value + 1); };
+defn sum_pair(value: Int) -> Int {
+    let (left, right) = pair(value);
+    term left + right;
+};
+let result: Int = 0;
+node use_pair [result == 0][result > 0] { result = sum_pair(3); term; };
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut plugins = crate::plugin::PluginManager::new();
+    plugins.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    let mut backend = LlvmBackend::new()
+        .with_int_bits(32)
+        .with_target_triple("wasm32-unknown-wasi")
+        .with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    assert!(ir.contains("define i64 @pair("), "tuple helper must return its boxed i64 handle:\n{ir}");
+    assert!(ir.contains("call i64 @pair("), "tuple call must use the same i64 return ABI:\n{ir}");
+}
+
+/// 2026-10-25: an empty cast-graph path between integer types still requires
+/// width conversion when their target representations differ. On wasm32,
+/// `Int` is i32 while `Int64` remains i64.
+#[test]
+fn wasm32_identity_protocol_integer_cast_widens_register() {
+    let src = r#"
+defn widen(value: Int) -> Int64 { term value as Int64; };
+defn multiply(value: Int) -> Int64 {
+    term (1000000000 as Int64) * (value as Int64);
+};
+let result: Int = 0;
+node run [result == 0][result != 0] {
+    result = multiply(2) as Int;
+    term;
+};
+"#;
+    let items = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_int_bits(32)
+        .with_target_triple("wasm32-unknown-wasi");
+    let ir = backend.generate(&items, None);
+    assert!(ir.contains("sext i32"), "Int → Int64 must extend i32 to i64:\n{ir}");
+    assert!(ir.contains("mul nsw i64"), "Int64 arithmetic must operate on i64:\n{ir}");
+}
+
 /// 2026-08-17 (tuple correctness): numeric field access `t.0`/`t.1` reads a
 /// tuple element through the boxed handle.
 #[test]

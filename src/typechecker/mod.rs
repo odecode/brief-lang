@@ -2961,10 +2961,20 @@ fn elaborate_stmt(stmt: &mut Statement, ctx: &mut TypecheckContext, errors: &mut
         | Statement::Defer(body) | Statement::Mutex(body) => elaborate_stmts(body, ctx, errors),
         Statement::Foreach { item, list, body } => {
             elaborate_expr(list, ctx, errors);
+            // 2026-10-25: elaboration needs the same iterator-item type as
+            // checking. Otherwise casts of loop variables fail inference and
+            // declared operators survive as raw arithmetic on collection handles.
+            let previous = ctx.bindings.get(item).cloned();
+            if let Ok(list_ty) = infer_type_only(list, ctx) {
+                let element_ty = foreach_item_type(ctx, &list_ty);
+                ctx.bindings.insert(item.clone(), element_ty);
+            }
             let fact_base = ctx.known_facts.len();
             ctx.known_facts.extend(foreach_range_facts(list, item));
             elaborate_stmts(body, ctx, errors);
             ctx.known_facts.truncate(fact_base);
+            if let Some(ty) = previous { ctx.bindings.insert(item.clone(), ty); }
+            else { ctx.bindings.remove(item); }
         }
         _ => {}
     }

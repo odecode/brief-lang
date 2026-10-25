@@ -33,6 +33,7 @@ const staticServer = createServer(async (request, response) => {
 await new Promise(resolve => staticServer.listen(0, '127.0.0.1', resolve));
 const staticPort = staticServer.address().port;
 let browser;
+let page;
 const username = `i11_${randomBytes(8).toString('hex')}`;
 const password = `I11-${randomBytes(12).toString('hex')}`;
 const pgEnv = { ...process.env, PGHOST: process.env.PGHOST || '127.0.0.1', PGPORT: process.env.PGPORT || '5432' };
@@ -63,7 +64,8 @@ const pageErrors = [];
 const requestLog = [];
 try {
   browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || 'msedge', headless: true });
-  const page = await browser.newPage();
+  page = await browser.newPage();
+  page.setDefaultTimeout(15000);
   page.on('pageerror', error => pageErrors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') pageErrors.push(message.text()); });
   page.on('request', request => requestLog.push({ url: request.url(), method: request.method(), resource: request.resourceType() }));
@@ -133,7 +135,9 @@ try {
   await page.locator('#login').click();
   await page.getByText('Live', { exact: true }).waitFor({ timeout: 20000 });
   await page.waitForFunction(() => document.querySelectorAll('#ratings').length === 1 &&
-    document.querySelector('#rating-count')?.textContent.trim() === '5', null, { timeout: 15000 });
+    document.querySelector('.rated-films .count')?.textContent.trim() === '5', null, { timeout: 15000 });
+  const catalogue = await fetch(`${api}/movies`).then(response => response.json());
+  const movieTitle = catalogue.movies.find(movie => movie.item_id === 0).title;
   const initialRevision = await page.evaluate(() => document.querySelector('#ratings').textContent);
 
   lockProcess = spawn(psql, [...psqlPrefix, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', process.env.PGDATABASE],
@@ -149,10 +153,10 @@ try {
   });
   const beforeClickRecommendationCount = await page.evaluate(() => window.__i11.incoming
     .filter(event => event.type === 'recommendations').length);
-  await page.locator('#movie').fill('1');
-  await page.locator('#stars').fill('1');
+  await page.locator('.movie-list li').filter({ has: page.getByText(movieTitle, { exact: true }) }).getByRole('button').click();
+  await page.getByRole('button', { name: '1 star', exact: true }).click();
   await page.locator('#save-rating').click();
-  await page.waitForFunction(() => document.querySelector('#ratings')?.textContent.includes('Movie 1: 1 / 5 (pending save)'), null,
+  await page.waitForFunction(title => document.querySelector('#ratings')?.textContent.includes(`${title} — 1 / 5 · saving`), movieTitle,
     { timeout: 5000 });
   await page.waitForFunction(() => window.__i11.sent.length === 1, null, { timeout: 10000 });
   const command = await page.evaluate(() => window.__i11.sent[0]);
@@ -182,8 +186,8 @@ try {
   assert.equal(await page.evaluate(() => window.__i11.incoming.some(event => event.type === 'saved')), false,
     'save must remain unconfirmed while the database row is locked');
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  const paintedItems = await page.locator('#recommendations li').allTextContents();
-  assert.deepEqual(paintedItems, result.recommendations.map(item => `Movie ${item.item_id + 1}`),
+  const paintedItems = await page.locator('#recommendations li strong').allTextContents();
+  assert.deepEqual(paintedItems, result.recommendations.map(item => catalogue.movies.find(movie => movie.item_id === item.item_id).title),
     'recommendation event must be reflected in the rendered list after paint opportunities');
   const mutationCountAfterResult = await page.evaluate(() => window.__i11.recommendationMutations);
   const frameCountWhileBlocked = await page.evaluate(() => window.__i11.frames);
@@ -207,7 +211,7 @@ try {
   await page.getByText('Rating saved.', { exact: true }).waitFor({ timeout: 20000 });
   await page.evaluate(() => new Promise(resolve => setTimeout(() =>
     requestAnimationFrame(() => requestAnimationFrame(resolve)), 250)));
-  const savedItems = await page.locator('#recommendations li').allTextContents();
+  const savedItems = await page.locator('#recommendations li strong').allTextContents();
   assert.deepEqual(savedItems, paintedItems, 'saved confirmation must not replace recommendations');
   const mutationsAfterSave = await page.evaluate(() => window.__i11.recommendationChanges.slice(-30));
   assert.equal(await page.evaluate(() => window.__i11.recommendationMutations), mutationCountAfterResult,
@@ -217,9 +221,9 @@ try {
     'save confirmation must not trigger a follow-up GET');
   assert.equal(await page.evaluate(() => window.__i11.incoming.filter(event => event.type === 'recommendations').length),
     beforeClickRecommendationCount + 1, 'save completion must not emit another recommendation event');
-  assert.equal((await page.locator('#ratings').innerText()).includes('(pending save)'), false,
+  assert.equal((await page.locator('#ratings').innerText()).includes('· saving'), false,
     'saved confirmation must clear the pending label while preserving the rating');
-  assert.ok((await page.locator('#ratings').innerText()).includes('Movie 1: 1 / 5'),
+  assert.ok((await page.locator('#ratings').innerText()).includes(`${movieTitle} — 1 / 5`),
     'saved confirmation must retain the newly accepted rating value');
   assert.deepEqual(pageErrors, [], `browser must have no console or runtime errors: ${pageErrors.join('; ')}`);
   console.log(JSON.stringify({
@@ -232,6 +236,10 @@ try {
     animationFramesWhileBlocked: frameCountWhileBlocked,
     maxLongTaskMs: await page.evaluate(() => window.__i11.maxLongTask),
   }));
+} catch (error) {
+  console.error(await page?.locator('body').innerText());
+  console.error({ pageErrors, requests: requestLog });
+  throw error;
 } finally {
   if (lockProcess && lockProcess.exitCode === null) {
     lockProcess.stdin.write('ROLLBACK;\n\\q\n');

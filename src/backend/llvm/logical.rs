@@ -12,20 +12,31 @@ struct LogicalInputs<'a> { left: &'a Expr, right: &'a Expr, exit: bool }
 
 struct LogicalScope {
     values: HashMap<String, String>,
+    pointers: HashMap<String, String>,
+    state_pointers: HashMap<usize, (String, String)>,
+    expressions: HashMap<(String, String, String), String>,
 }
 
 impl LlvmBackend {
     fn logical_scope(&self) -> LogicalScope {
-        LogicalScope { values: self.fun.last_val_temps.clone() }
+        LogicalScope {
+            values: self.fun.last_val_temps.clone(),
+            pointers: self.fun.canonical_ptrs.clone(),
+            state_pointers: self.fun.state_ptr_cache.clone(),
+            expressions: self.fun.expr_dedup_cache.clone(),
+        }
     }
 
     fn merge_logical_scope(&mut self, before: LogicalScope) {
         // 2026-10-22: RHS-only registers do not dominate the skipped edge.
         // Keep only unchanged incoming caches; invalidations stay invalidated.
-        // The recommender integration predates main's pointer caches. Keep its
-        // existing context surface; main's isolated fix also scopes those caches.
+        // 2026-10-25: pointer and expression caches obey the same dominance
+        // rule; remove these filters only when caches are CFG-aware.
         self.fun.last_val_temps.retain(|key, value| before.values.get(key) == Some(value));
         self.fun.last_val_types.retain(|key, _| self.fun.last_val_temps.contains_key(key));
+        self.fun.canonical_ptrs.retain(|key, value| before.pointers.get(key) == Some(value));
+        self.fun.state_ptr_cache.retain(|key, value| before.state_pointers.get(key) == Some(value));
+        self.fun.expr_dedup_cache.retain(|key, value| before.expressions.get(key) == Some(value));
     }
 
     pub(super) fn parameter_is_reassigned(body: &[Statement], name: &str) -> bool {

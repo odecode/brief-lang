@@ -7,6 +7,12 @@ numbers displayed in the UI are one-based; the HTTP/WebSocket protocol uses
 zero-based item IDs. Updating an existing rating does not count as another
 distinct movie.
 
+The native `GET /movies` endpoint returns the ordered MovieLens catalogue with
+each zero-based `item_id` and UTF-8 `title`. The UI improvement plan in
+`.kiro/specs/recommender-app/tasks-uiux-improvement.md` migrates the current
+numeric display to browsable, searchable title selection and resolves live
+recommendation IDs through that catalogue.
+
 Account requests use `POST /v1/register` and `POST /v1/login`. The native
 server accepts those routes and their unversioned aliases. Login returns the
 protocol version, authenticated account identity, session token and process
@@ -117,7 +123,17 @@ node tests/fixtures/recommender/browser_pending_peer.mjs target/recommender-I09
 
 It is a mocked browser gate; it does not establish real server integration.
 
-The manual Chrome gate against the native backend covers registration/login,
-duplicate-rating counting, five distinct ratings, cold-start visibility, latest
-live recommendations, reconnect/state restoration, logout and a 375 px layout.
-Optional task 14.4's application integration-test deliverable is skipped.
+The generated app also has a real native-server gate:
+`tests/fixtures/recommender/browser_live_server.mjs <web-output> <api-url>`.
+It registers an account, signs in, seeds a profile, holds the account's database
+row lock, submits a rating, and verifies that recommendations paint before the
+save can finish. Releasing the lock must produce save confirmation without
+duplicate recommendation rendering, follow-up GETs, or synchronous XHR.
+The gate requires PostgreSQL and Playwright; it creates a distinct test account.
+
+The 2026-10-25 crash recovery establishes these runtime invariants: snapshot
+buffers grow to the collection size; global collection headers survive boot;
+generic callable transactions use concrete element layouts; String decoding
+uses UTF-8; unchanged text is not rewritten on repeated flushes. Window events
+on the same element retain their individual handlers. WASM lowering promotes
+allocas and eliminates eligible tail recursion before stack-machine emission.

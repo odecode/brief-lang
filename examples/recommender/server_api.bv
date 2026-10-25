@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 import "./server_model.bv";
+import "./movie_catalogue.bv";
 import { JsonValue, ParseFrame, Object, Null, StrVal, IntVal, parse_value, skip_ws } from "std/json.bv";
 import "std/net/http.bv";
 
@@ -14,6 +15,7 @@ import { api_member: protocol_member, api_string: protocol_text,
 
 obj ApiInput { ok: Bool; username: String; password: String; token: String; item: Int; rating: Int; };
 obj ApiReply { status: Int; body: String; sessions: SessionStore; changed_owner: Int; refresh: Bool; };
+obj ApiRuntime { catalogue: MovieCatalogue; lambda: Float; timestamp: Int; server_epoch: String; };
 
 defn api_rating_valid(input: ApiInput, nitems: Int) -> Bool {
     term input.ok && input.item >= 0 && input.item < nitems && input.rating >= 1 && input.rating <= 5;
@@ -150,13 +152,34 @@ defn api_path(path: String) -> String {
     term route;
 };
 
-defn api_movies(nitems: Int) -> String {
-    let text: String = "";
-    foreach item in 0..nitems {
-        when item > 0 { text = text + ","; };
-        text = text + "{\"item_id\":" + item as String + "}";
+defn api_movies(catalogue: MovieCatalogue) -> String {
+    // 2026-10-25: repeated immutable concatenation retained hundreds of MB
+    // per catalogue request. Own one growing buffer and release it after the
+    // final String copy; keep this until String builders own temporary storage.
+    let text: GrowBuf = put_str(grow_new(256),"{\"movies\":[");
+    foreach idx in 0..catalogue.movies .^Length {
+        let movie: CatalogueMovie = catalogue.movies[idx];
+        when movie.item_id != idx || movie.title .^Length == 0 { grow_free(text); term ""; };
+        when idx > 0 { text = put_str(text,","); };
+        text = put_str(text,"{\"item_id\":" + movie.item_id as String +
+            ",\"title\":" + api_quote(movie.title) + "}");
     };
-    term "{\"movies\":[" + text + "]}";
+    text = put_str(text,"]}");
+    let result: String = buf_slice_string(ByteBuf { ptr: text.ptr, len: text.len, cap: text.cap },0,text.len);
+    grow_free(text);
+    term result;
+};
+
+defn api_movies_reply(catalogue: MovieCatalogue, item_count: Int,
+    sessions: SessionStore) -> ApiReply {
+    when !catalogue.ok || catalogue.movies .^Length != item_count {
+        term api_reply(503,"{\"error\":\"catalogue-unavailable\",\"message\":\"The movie title catalogue is unavailable; check UITEM_PATH and its item IDs.\"}",sessions);
+    };
+    let body: String = api_movies(catalogue);
+    when body .^Length == 0 {
+        term api_reply(503,"{\"error\":\"catalogue-unavailable\",\"message\":\"The movie title catalogue contains invalid IDs or empty titles.\"}",sessions);
+    };
+    term api_reply(200,body,sessions);
 };
 
 defn api_credentials(conn: PgConn, sessions: SessionStore, input: ApiInput, path: String,
@@ -213,13 +236,15 @@ defn api_state(conn: PgConn, sessions: SessionStore, model: ServerModel, request
     term api_reply(200,body,sessions);
 };
 
-defn api_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel, request: HttpRequest,
-    lambda: Float, timestamp: Int, server_epoch: String) -> ApiReply {
+defn api_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel,
+    request: HttpRequest, runtime: ApiRuntime) -> ApiReply {
     let path: String = api_path(request.path);
     when request.method == "OPTIONS" { term api_reply(200,"{}",sessions); };
-    when request.method == "GET" && path == "/movies" { term api_reply(200,api_movies(model.population.nitems),sessions); };
+    when request.method == "GET" && path == "/movies" {
+        term api_movies_reply(runtime.catalogue,model.population.nitems,sessions);
+    };
     when request.method == "GET" && (path == "/state" || path == "/recommendations") {
-        term api_state(conn,sessions,model,request,lambda,server_epoch);
+        term api_state(conn,sessions,model,request,runtime.lambda,runtime.server_epoch);
     };
     when request.method == "POST" && path == "/admin/refresh" {
         term ApiReply { status: 200, body: "{\"ok\":true}", sessions: sessions, changed_owner: 0, refresh: true };
@@ -238,9 +263,9 @@ defn api_dispatch(conn: PgConn, sessions: SessionStore, model: ServerModel, requ
         let input: ApiInput = api_input(request.body);
         when !input.ok { term api_error("validation",sessions); };
         when path == "/register" || path == "/login" {
-            term api_credentials(conn,sessions,input,path,server_epoch);
+            term api_credentials(conn,sessions,input,path,runtime.server_epoch);
         };
-        when path == "/rating" { term api_rate(conn,sessions,input,model.population.nitems,timestamp); };
+        when path == "/rating" { term api_rate(conn,sessions,input,model.population.nitems,runtime.timestamp); };
     };
     term api_reply(404,"{\"error\":\"not-found\"}",sessions);
 };
