@@ -18,17 +18,17 @@ defn test_ws_second_payload(text: String) -> String {
 let tick: Int = 0;
 node run [tick < 1][tick == 1] {
     let server: ServerState = test_server();
-    let alice_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"alice\",\"password\":\"secret\"}");
+    let alice_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
     server = alice_register.server;
-    let bob_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"bob\",\"password\":\"other\"}");
+    let bob_register: TestExchange = test_http(server,"POST","/register","{\"username\":\"bob\",\"password\":\"bob-secret\"}");
     server = bob_register.server;
-    let alice_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"secret\"}");
+    let alice_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
     server = alice_login.server;
     let alice: String = api_input(test_body(alice_login.response)).token;
-    let alice_login_second: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"secret\"}");
+    let alice_login_second: TestExchange = test_http(server,"POST","/login","{\"username\":\"alice\",\"password\":\"alice-secret\"}");
     server = alice_login_second.server;
     let alice_second: String = api_input(test_body(alice_login_second.response)).token;
-    let bob_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"bob\",\"password\":\"other\"}");
+    let bob_login: TestExchange = test_http(server,"POST","/login","{\"username\":\"bob\",\"password\":\"bob-secret\"}");
     server = bob_login.server;
     let bob: String = api_input(test_body(bob_login.response)).token;
     when alice .^Length != 32 || alice_second .^Length != 32 || alice == alice_second || bob .^Length != 32 {
@@ -55,18 +55,24 @@ node run [tick < 1][tick == 1] {
     upgraded = upgraded && str_find(handshake_alice,"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") >= 0;
     let delivered: Bool = true;
     foreach item in 0..5 {
-        let payload: String = "{\"item_id\":"+item as String+",\"rating\":4,\"token\":"+api_quote(bob)+"}";
+        let nonce: String = session_random_token();
+        let operation: String = unwrap(protocol_operation_id(server.server_epoch,nonce));
+        let command: RatingCommand = RatingCommand { server_epoch: server.server_epoch,
+            operation_id: operation, item_id: item, rating: 4 };
+        let payload: String = unwrap(protocol_encode_command(command));
         let first_part: Bool = test_ws(live_alice,1,false,payload[0:10]);
         server = test_pump(server);
         let early: String = test_read(live_alice);
         let last_part: Bool = test_ws(live_alice,0,true,payload[10:payload .^Length]);
         server = test_pump(server);
-        let own: String = test_ws_payload(test_read(live_alice));
-        let other_own: String = test_ws_payload(test_read(live_second));
+        let own: String = test_read(live_alice);
+        let other_own: String = test_read(live_second);
         let foreign: String = test_read(live_bob);
-        when !first_part || !last_part || early .^Length != 0 || foreign .^Length != 0 || own != other_own || own .^Length == 0 { delivered = false; };
-        when item < 4 && own != "{\"cold_start\":true}" { delivered = false; };
-        when item == 4 && str_find(own,"recommendations") < 0 { delivered = false; };
+        when !first_part || !last_part || early .^Length != 0 || foreign .^Length != 0 || own != other_own ||
+            str_find(own,"\"type\":\"accepted\"") < 0 || str_find(own,"\"type\":\"recommendations\"") < 0 { delivered = false; };
+        when item < 4 && str_find(own,"\"cold_start\":true") < 0 { delivered = false; };
+        when item == 4 && str_find(own,"\"recommendations\"") < 0 { delivered = false; };
+        when !delivered { println!("live item={} payload={} early={} own={} other={} foreign={}",item,payload,early,own,other_own,foreign); };
     };
     let alice_state: TestExchange = test_http(server,"GET","/state?token="+alice,"");
     server = alice_state.server;
@@ -77,12 +83,20 @@ node run [tick < 1][tick == 1] {
     let ping_sent: Bool = test_ws(live_alice,9,true,"ping");
     server = test_pump(server);
     let pong: Bool = test_ws_payload(test_read(live_alice)) == "ping";
-    let http_rating: TestExchange = test_http(server,"POST","/rating","{\"token\":"+api_quote(alice)+",\"item_id\":0,\"rating\":2}");
+    when !ping_sent || !pong { println!("ping sent={} pong={}",ping_sent,pong); };
+    let http_nonce: String = session_random_token();
+    let http_operation: String = unwrap(protocol_operation_id(server.server_epoch,http_nonce));
+    let http_command: RatingCommand = RatingCommand { server_epoch: server.server_epoch,
+        operation_id: http_operation, item_id: 0, rating: 2 };
+    let http_body: String = "{\"v\":1,\"server_epoch\":"+api_quote(http_command.server_epoch)+
+        ",\"operation_id\":"+api_quote(http_command.operation_id)+",\"item_id\":0,\"rating\":2}";
+    let http_rating: TestExchange = test_http(server,"POST","/v1/ratings?token="+alice,http_body);
     server = http_rating.server;
     let http_push: String = test_ws_payload(test_read(live_alice));
     let second_push: String = test_ws_payload(test_read(live_second));
     let bob_push: String = test_read(live_bob);
-    let http_live: Bool = str_find(http_rating.response," 200 ") >= 0 && http_push .^Length > 0 && http_push == second_push && bob_push .^Length == 0;
+    let http_live: Bool = str_find(http_rating.response," 202 ") >= 0 && http_push .^Length > 0 && http_push == second_push && bob_push .^Length == 0;
+    when !http_live { println!("http response={} push={} second={} foreign={}",http_rating.response,http_push,second_push,bob_push); };
     let refresh: TestExchange = test_http(server,"POST","/admin/refresh","");
     server = test_refresh_complete(refresh.server);
     let refreshed: Bool = server.model.accounts .^Length == 2 && server.model.population.nnz == 29 && model_account_row(server.model,1,0) == 3 && model_account_row(server.model,2,0) == 4;
@@ -124,6 +138,7 @@ node run [tick < 1][tick == 1] {
     let logout_isolated: Bool = str_find(logout.response," 200 ") >= 0 && alice_close_code == 1008 &&
         second_ping_sent && second_session_live && str_find(revoked_state.response," 401 ") >= 0 &&
         str_find(other_state.response," 200 ") >= 0 && server.live_sessions .^Length == 2;
+    when !logout_isolated { println!("logout response={} close_code={} second_live={} revoked={} other={} live_sessions={}",logout.response,alice_close_code,second_session_live,revoked_state.response,other_state.response,server.live_sessions .^Length); };
     let close_a: Int = sock_close(live_alice);
     let close_b: Int = sock_close(live_bob);
     let close_second: Int = sock_close(live_second);

@@ -33,6 +33,14 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## Keyed browser list renderer moved unchanged nodes on every state flush — FIXED 2026-10-25
+
+**Symptom:** the real recommender browser gate observed every recommendation list item removed and reinserted when the unrelated save-status state changed. The result list text stayed the same, but this caused unnecessary DOM work after every saved confirmation and violated the I11 no-duplicate-render gate.
+
+**Root cause:** both generated `b-each` renderers unconditionally appended each keyed node to its parent during every view effect. `appendChild` moves an existing child to the end, even when its order is already correct.
+
+**Fix:** reconcile against the next expected element and call `insertBefore` only when a keyed node is out of position. Unchanged nodes remain attached and produce no DOM mutation. Regression coverage is in `src/glue/web_generator.rs`; the real collection-backed recommender list is verified by the I11 Playwright row-lock gate.
+
 ## Reassigned parameter slots reused LLVM SSA names in the function body — FIXED 2026-10-23
 
 **Symptom:** clang rejected the recommender HTTP logout gate with “multiple definition of local value” when compiling a recursive helper that mutates a `List` parameter. Its entry alloca and a later body load both used `%t6`.

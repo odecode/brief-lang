@@ -16,6 +16,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const webRoot = resolve(process.argv[2]);
 const api = process.argv[3] || 'http://127.0.0.1:18110';
 const psql = process.env.PSQL || 'psql';
+const psqlPrefix = process.env.PSQL_ARGS ? JSON.parse(process.env.PSQL_ARGS) : [];
 const mime = { '.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm' };
 const staticServer = createServer(async (request, response) => {
   const name = decodeURIComponent(new URL(request.url, 'http://localhost').pathname).replace(/^\/+/, '') || 'app.html';
@@ -38,7 +39,7 @@ const pgEnv = { ...process.env, PGHOST: process.env.PGHOST || '127.0.0.1', PGPOR
 let lockProcess;
 
 function psqlQuery(sql) {
-  return execFileSync(psql, ['-X', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql],
+  return execFileSync(psql, [...psqlPrefix, '-X', '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql],
     { env: pgEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
@@ -68,7 +69,7 @@ try {
   page.on('request', request => requestLog.push({ url: request.url(), method: request.method(), resource: request.resourceType() }));
   await page.addInitScript(() => {
     window.__i11 = { incoming: [], sent: [], xhrSends: 0, frames: 0, maxLongTask: 0,
-      longTaskWindow: 0, recommendationMutations: 0 };
+      longTaskWindow: 0, recommendationMutations: 0, recommendationChanges: [] };
     const NativeSocket = window.WebSocket;
     window.WebSocket = class extends NativeSocket {
       constructor(...args) {
@@ -104,7 +105,13 @@ try {
       const target = document.querySelector('#recommendations');
       if (!target || target.__i11Observed) return;
       target.__i11Observed = true;
-      new MutationObserver(records => { window.__i11.recommendationMutations += records.length; })
+      new MutationObserver(records => {
+        window.__i11.recommendationMutations += records.length;
+        for (const record of records) window.__i11.recommendationChanges.push({
+          type: record.type, target: record.target.nodeName, added: record.addedNodes.length,
+          removed: record.removedNodes.length, text: record.target.textContent?.slice(0, 120),
+        });
+      })
         .observe(target, { childList: true, subtree: true, characterData: true });
     };
     new MutationObserver(observeRecommendations).observe(document, { childList: true, subtree: true });
@@ -129,7 +136,7 @@ try {
     document.querySelector('#rating-count')?.textContent.trim() === '5', null, { timeout: 15000 });
   const initialRevision = await page.evaluate(() => document.querySelector('#ratings').textContent);
 
-  lockProcess = spawn(psql, ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', process.env.PGDATABASE],
+  lockProcess = spawn(psql, [...psqlPrefix, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', process.env.PGDATABASE],
     { env: pgEnv, stdio: ['pipe', 'pipe', 'pipe'] });
   lockProcess.stdin.write(`BEGIN;\nSELECT id FROM accounts WHERE id=${accountId} FOR UPDATE;\n\\echo I11_LOCK_READY\n`);
   await waitForMarker(lockProcess, 'I11_LOCK_READY');
@@ -202,8 +209,9 @@ try {
     requestAnimationFrame(() => requestAnimationFrame(resolve)), 250)));
   const savedItems = await page.locator('#recommendations li').allTextContents();
   assert.deepEqual(savedItems, paintedItems, 'saved confirmation must not replace recommendations');
+  const mutationsAfterSave = await page.evaluate(() => window.__i11.recommendationChanges.slice(-30));
   assert.equal(await page.evaluate(() => window.__i11.recommendationMutations), mutationCountAfterResult,
-    'saved confirmation must not cause a duplicate recommendation render');
+    `saved confirmation must not cause a duplicate recommendation render: ${JSON.stringify(mutationsAfterSave)}`);
   const afterClickRequests = requestLog.slice(beforeClickRequests);
   assert.equal(afterClickRequests.filter(item => item.method === 'GET').length, 0,
     'save confirmation must not trigger a follow-up GET');
