@@ -107,9 +107,9 @@ pub struct ImportResolver {
     /// splices are resolved by the inner walk — exactly the stage order a
     /// root file gets (`pipeline::compile_to_typed` runs Parsed, then
     /// resolves). Built from the ROOT's BuildOptions via
-    /// `pipeline::module_plugin_factory`, so a module gets the per-extension
-    /// treatment `config/targets.dbvl` gives a root file of its dialect
-    /// (including `--no-std`'s prelude family and CLI enable/disable).
+    /// `pipeline::module_plugin_factory`, so target-neutral `.bv` helpers
+    /// imported by a browser root use the root's web prelude; explicit foreign
+    /// dialect files retain their own prelude. CLI enable/disable still apply.
     /// `None` = modules parse plain (pre-C3 behavior; `library::parse_and_check`
     /// keeps it — that path runs no plugin stages even at the root).
     /// How to undo: drop this field, the `run_ast` block in `resolve_import`,
@@ -1843,7 +1843,10 @@ mod tests {
     /// 2026-09-25 (Wave 1 C3): the production factory the compile/check
     /// call sites install (`pipeline::module_plugin_factory`), default opts.
     fn default_factory() -> Box<dyn Fn(&str) -> Result<crate::plugin::PluginManager, String>> {
-        crate::pipeline::module_plugin_factory(&crate::pipeline::BuildOptions::default())
+        crate::pipeline::module_plugin_factory(
+            &crate::pipeline::BuildOptions::default(),
+            "main.bv",
+        )
     }
 
     #[test]

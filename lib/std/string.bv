@@ -15,10 +15,11 @@
 import "std/collections.bv";
 import { StringBuilder, new_builder, append_char, append_str } from "std/string_builder.bv";
 import { int_to_char } from "std/char.bv";
-// 2026-09-09 (Family A): byte_at moved to cast_lanes.bv (pure-Briev Load#
-// over the [len][bytes] layout) so the lane parsers and this file share one
-// definition. The prelude already injects cast_lanes.bv everywhere.
-import "std/cast_lanes.bv";
+// 2026-10-25: the target prelude supplies the matching byte_at implementation
+// (cast_lanes on native targets, cast_portable on browser targets). Importing
+// cast_lanes here duplicates byte_at in browser roots and makes resolution
+// order-dependent. Undo when imports can declare an explicit target-neutral
+// capability edge rather than inheriting the root prelude.
 
 // ===== NATIVE DEFINITIONS =====
 
