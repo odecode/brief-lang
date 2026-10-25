@@ -1,0 +1,21 @@
+{
+  "commit": "6fb27e0111af6460e7c8f2ff5042a8198e91911e",
+  "compiler": "/home/otto/briev-target/release/brievc",
+  "compiler_sha256": "44696211356611b8ba9caadfafc8996aed0bcd5859bf1cf4e15457901215ac51",
+  "machine": {
+    "system": "Linux",
+    "node": "LAPTOP-SD3GG46N",
+    "release": "6.18.54.1-microsoft-standard-WSL2",
+    "version": "#1 SMP PREEMPT_DYNAMIC Tue Oct  6 19:13:07 UTC 2026",
+    "machine": "x86_64",
+    "processor": "x86_64"
+  },
+  "clang": "Ubuntu clang version 17.0.6 (++20231208085846+6009708b4367-1~exp1~20231208085949.74)\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+  "command": "bash benchmarks/build_and_bench.sh --runtime",
+  "shell_normalization": "CRLF to LF in private archive only",
+  "runtime_archives": {
+    "libbriev_accel_rt.a": "f4f3d5dd536a23210f02571da7a2a86d1a331f7bce59d83456c935d9623d2541",
+    "libbriev_gpu_rt.a": "a2c0dfd80e8780c4e342a4de47c666d9751d50cfd0af8195f4c988b18134272a"
+  },
+  "exit_code": 1
+}

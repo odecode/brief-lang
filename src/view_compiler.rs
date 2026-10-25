@@ -696,8 +696,9 @@ impl ViewCompiler {
                     continue;
                 }
             }
-            result.push(html.chars().nth(pos).unwrap_or(' '));
-            pos += 1;
+            let character = html[pos..].chars().next().unwrap_or(' ');
+            result.push(character);
+            pos += character.len_utf8();
         }
 
         result
@@ -1536,7 +1537,7 @@ if attr.starts_with("b-text") {
         let after = &tag_lower[attr_idx + attr_name.len()..];
 
         if after.starts_with(':') {
-            let end = after[1..].find(|c: char| !c.is_alphanumeric() && c != '_')?;
+            let end = after[1..].find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')?;
             Some(after[1..end + 1].to_string())
         } else {
             None
@@ -2049,6 +2050,34 @@ mod tests {
         assert!(!html.is_empty());
         // No directives so no IDs injected
         assert!(!html.contains("id="));
+    }
+
+    #[test]
+    fn unicode_text_before_directive_preserves_byte_offsets() {
+        let mut vc = ViewCompiler::new();
+        vc.register_transaction("save", 0);
+        vc.register_signal("status", 0);
+        let source = concat!(
+            "<main><p>héllo 世界…</p><button b-trigger:click=\"save\">Save</button>",
+            "<p b-text=\"status\">Ready</p></main>"
+        );
+        let (_, html, diagnostics) = vc.compile(source);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected view diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            html.starts_with("<main><p>héllo 世界…</p><button id=\"rbv-button-0\""),
+            "HTML shifted after Unicode text: {html}"
+        );
+        assert!(
+            html.contains("<p id=\"rbv-p-1\" b-text=\"status\">Ready</p>"),
+            "later directive tag was corrupted: {html}"
+        );
+        assert!(
+            html.ends_with("</main>"),
+            "closing markup was corrupted: {html}"
+        );
     }
 
     #[test]

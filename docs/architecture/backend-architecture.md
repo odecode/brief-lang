@@ -4,6 +4,42 @@
 
 **Status:** Living document — updated as the backend evolves.
 
+2026-10-22: LLVM numeric metadata has module lifetime. TBAA owns the
+deterministic prefix; after structural types are registered, a shared
+CompilerContext counter allocates state alias, range, invariant-load and loop
+nodes. Pending definitions also live in CompilerContext so function resets and
+inline snapshots cannot erase them or rewind allocation. Each emission round
+resets this state. Fixed numeric reservations cannot bound the type universe.
+
+2026-10-21: ordinary object allocations cover the finalized field layout used
+by member accesses, while preserving any larger declared trailing allocation.
+An early aggregate byte count can precede nested type registration; it cannot
+bound later field stores. Packed and union layout paths retain their dedicated
+rules. The regression gate uses an intentionally undersized aggregate record
+and verifies both the last field's extent and preservation of explicit padding.
+
+2026-10-22: `logical.rs` owns LLVM `&&`/`||` evaluation control flow. Specific
+AST dispatch arms select the lazy path before either binary operand is emitted;
+other binary lowering remains unchanged. Dedicated constant/RHS predecessor
+blocks feed a canonical i8 phi, so nested RHS control flow needs no speculative
+loads or stack result slot. Terminating RHS edges contribute no fabricated value.
+The merge updates FunctionContext's current block for enclosing loop phis.
+Exit predicates share this lowering and widen the completed Bool at their i64
+boundary. Register-level bitwise operations keep their eager semantics.
+RHS-only last-value cache entries cannot survive the merge: retain
+only unchanged incoming entries, preserving invalidations. Expression-block
+mutations participate in entry-slot discovery. Mutable definition parameters use
+native ABI entry slots (including Float, Bool and pointers), with matching typed
+loads/stores, so skipping an assignment preserves the incoming parameter.
+The standalone main-based fix also scopes main's pointer/state caches; this
+integration checkout predates those caches and carries no such fields.
+
+2026-10-22: flexible integer constants use `LlvmBackend::llvm_type` for both
+their globals and reads. The protocol universe may describe the maximum width
+of `Int`, while the selected target chooses its concrete width (i32 on wasm32,
+i64 on the native target). Declarations, aliases and loads must share that
+target-derived type.
+
 ---
 
 ## 1. Core Architecture
@@ -14,14 +50,14 @@ The backend state is strictly stratified into three lifetimes to prevent state l
 
 | Layer | Type | Scope | Mutability | Contents |
 |-------|------|-------|------------|----------|
-| **CompilerContext** | `context.rs` | Global (entire compilation) | Read-only during codegen | AST definitions, FFI signatures, target specs, field layouts, casting graph |
+| **CompilerContext** | `context.rs` | Global (entire compilation) | Stable program facts; mutable module emission state | AST definitions, FFI signatures, target specs, field layouts, casting graph, metadata allocator/definitions |
 | **FunctionContext** | `context.rs` | Per-function/transaction | Mutable per-function | SSA registers (`gen_reg`), phi nodes, type caches, loop state |
 | **LlvmBackend** | `mod.rs` | Orchestrator | Delegates to modules | `generate()`, dispatch, helper functions |
 
 **Rules:**
 - Never add transient, function-scoped compilation variables to `CompilerContext`.
 - All registers must be requested via `self.fun.gen_reg()`. Manual register arithmetic is forbidden.
-- `CompilerContext` is read-only during codegen. If you need mutable per-function state, add it to `FunctionContext`.
+- Keep program facts stable during codegen. Module emission state such as metadata allocation belongs in `CompilerContext`; mutable per-function state belongs in `FunctionContext`.
 
 ### 1.2 Module Map
 
@@ -705,3 +741,36 @@ continuing Void expression. Match probing snapshots and restores that flag in
 addition to its binding, alloca, and block state; each arm starts independently.
 A terminating Void arm cannot suppress another arm's value phi. Continuing Void
 and all-arms-terminate behavior retain their existing lowering paths.
+
+### Ordinary collection rebinding (2026-10-21)
+
+An ordinary local assignment whose RHS has the binding's declared collection
+type replaces its handle. It must not invoke InsertAt with that handle as an
+element. collection_assignment.rs handles this seam before the historical
+insertion fallback; explicit arrow insertion retains its separate lowering.
+Dispatch derives from declared operator metadata and type equality, never a
+collection name. Existing state/member stores retain their earlier precedence.
+
+Float Abs uses LLVM width suffixes (f16/bf16/f32/f64) rather than operand type
+spellings. Its overload-aware template seam precedes the unchanged legacy
+fallback. Narrow fabs declarations accompany the existing f32/f64 declarations.
+## Portable value and persistent browser-state boundaries (2026-10-22)
+
+Target-native integer and pointer registers must be adapted explicitly when
+entering or leaving 64-bit boxed collection, tuple, enum and closure payloads.
+Call parameter/return widths come from resolved signatures; generic arguments
+come from argument expression types. Reflection derives physical widths from
+the selected representation. The interpreter uses the same numeric byte-width
+contract. Portable casting and formatting are selected through the browser
+prelude rather than native syscall/environment imports.
+
+Objects stored in persistent state are heap allocated during initialization,
+including empty objects. Generated view materializers own reusable dynamically
+sized buffers per instance and compile with fresh function-local context.
+Frontend possible-write analysis propagates helper-call writes to a fixed point;
+these conservative sets drive DOM invalidation, not concurrency proofs.
+
+Operator elaboration preserves foreach element bindings and enum-pattern
+payload bindings using existing type authorities and generic substitutions.
+Lexical bindings and facts are restored after the nested scope. This prevents
+declared collection operations from falling through to raw handle arithmetic.

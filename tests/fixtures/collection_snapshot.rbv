@@ -1,0 +1,18 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+let items: List<String> = ["héllo", "世界"];
+let empty_items: List<String> = [];
+txn grow_items [items .^Length < 1100][items .^Length == 1100] {
+    items = [];
+    foreach idx in 0..1100 { items += [idx as String]; };
+    term;
+};
+txn reset_items [items .^Length > 0][items .^Length == 0] { items = []; term; };
+<view>
+  <button b-trigger:click="grow_items">Grow</button>
+  <button b-trigger:click="reset_items">Reset</button>
+  <ul><li b-each:item="items" b-key="item"><span b-text="item"></span></li></ul>
+  <ul><li b-each:item="empty_items" b-key="item"><span b-text="item"></span></li></ul>
+</view>
+when true { reside; };

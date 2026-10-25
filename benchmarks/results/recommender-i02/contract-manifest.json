@@ -1,0 +1,32 @@
+{
+  "compiler": "/home/otto/briev-target/debug/brievc",
+  "compiler_sha256": "6eb0c732193e0196e5a100878331babfc90fa7f9f136361e2010e295e8811009",
+  "inputs": {
+    "examples/recommender/protocol.bv": "aeca4b4137b77ebb56b7fca68115733128ff928116d67dc8e61401fcc2d9ab54",
+    "examples/recommender/protocol_codec.bv": "b90e038ea67f5fe96f248336f2591ebc87d5f380461c365592b2d70bcff822db",
+    "examples/recommender/protocol_encode.bv": "c0a4fae2ec477392a4e49acfd0b6966d61cbfe893c55b238fb8d5407666993d9",
+    "examples/recommender/protocol_events.bv": "b0d71a9512e2e457903c9cd3dfc856b27726e2e701daaa42bc2338f3f244aca5",
+    "examples/recommender/protocol_policy.bv": "46536436afab79a0ce3b67df9d4505500978883d2ef2b803d1d435a3a727976f",
+    "examples/recommender/protocol_types.bv": "b94e01e6f75e9f0b43fc313ccaf32b450092dfcb1e93f70cffbb54bb06f36fb7",
+    "examples/recommender/protocol_values.bv": "b39df86d2200426ccad4b00abdafb5a91be7105ae9167a247eedd63753fc4945",
+    "examples/recommender/worker_framing.bv": "5649199bbb42b1deeb6e094a02bbcc9bee7683ffec84b60a0b16ee018bc4ee09",
+    "examples/recommender/worker_messages.bv": "1a0730ec0e8cd4a8e8421b5fa837d77469b9e371c9e7cbdaba8364e7ddd50a75",
+    "tests/fixtures/recommender/protocol_contract_checks.bv": "2e31d2ecdade2b3a7fcbc6f79e3cc99b3354498cafa7a0781b88e18179f2730c",
+    "tests/fixtures/recommender/worker_contract_checks.bv": "56f05cf3bdcbda3c0e70513381e5dc3729998d5d989c4210a1e76ca2fc1d5066",
+    "tests/fixtures/recommender/responsiveness_contract_web.rbv": "da1257202c0b96550c5b62d8dc66811636468938f5d55f974c787f2d506e5a45",
+    "tests/fixtures/recommender/responsiveness_trace_gate.bv": "e1f3297442ed38ed3503a6c5dd5469521ee808781402b5ae72ea73c372bc698a",
+    "tests/fixtures/recommender/responsiveness_contract_gate.bv": "17d7fb29433c5e1c624cc84c584950788e21cd33627b93ca7380a4cd2f6b6f79",
+    "tests/fixtures/recommender/responsiveness_frame_gate.bv": "7f5fbaee4d7617fff9064287e8d1a5ca3092212e3fec1910f30e5a4efbb004ad",
+    "tests/fixtures/recommender/responsiveness_print_gate.bv": "9bd91c13678bba519df28d13759d0ce9eb6792ff28b870a038a20660c46e90a9"
+  },
+  "artifacts": {
+    "responsiveness_contract_web.d.ts": "6484045664685281f8959cb8b5e40b713c2998f960df1e605614b2254bddad0b",
+    "responsiveness_contract_web.html": "6cbf3d199d8d4912ac58dfa0a92c2b56854bc7bd217d688b16ab97bf0475cef6",
+    "responsiveness_contract_web.ll": "2b3113cf09c94e3d1ad046026ff0e0fda44d1aaa578e83ac09c8b5d922c83dea",
+    "responsiveness_contract_web.mjs": "461346c09018babf6ca0bebd3fd3366aeeffa65ae33908dd5f9c9a1e1d419d19",
+    "responsiveness_contract_web.wasm": "03a0a0477058d465ea367b5fd25a7977411d1a1ef2816311766f91952a469266"
+  },
+  "gate_log_sha256": "eb5030b3e2166e2f712d2270c78902bc6b2d1d27e0151914a9ed1d77c49f89e2",
+  "browser_result": "PASS",
+  "browser_result_sha256": "2d60a811856ffabee3109c24810c21f74ea08cd84c34e494986996c3b9221696"
+}\n

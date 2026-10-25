@@ -42,6 +42,7 @@ pub mod region;
 pub mod schema_validator;
 pub mod transition_graph;
 pub mod watchdog;
+pub mod web_commits;
 pub mod allocation;
 pub mod frgn_dispatch;
 pub mod frgn_guard;

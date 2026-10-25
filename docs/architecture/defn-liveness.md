@@ -31,6 +31,14 @@ pillar, applied to functions instead of values).
 | compiler-generated `__reset_*` lifecycle txns | the DOM shim fires them by name (`_txn('__reset_' + inst)`), never from a Briev call edge |
 | **view-surface external roots** (webstack only) — `b-trigger` handler txns (top-level and `b-each` item triggers) + the sole-writer txn of each `b-bind:value` field | the DOM shim resolves them against the wasm export table; with no Briev call edge they are invisible to the call-graph closure. Supplied via `DefnLiveness::build_with_roots` — the webstack path in `compile.rs` computes them (`pipeline::view_external_roots`) from the parsed bindings + `resolve_bind_routes`. Only `b-bind` fields qualify — a display-only field (`b-text`/`b-when`/`b-class`) never fires its writer, so rooting every sole writer would mute the unfired-txn warning. |
 
+Compile-time `Size`, `Bytes`, `Alignment`, and `Type` inspections do not name
+callables. They retain evaluated receiver dependencies without setting
+`keep_all`. This is a semantic distinction between value inspection and member
+lookup, independent of the receiver's type or algorithm. Pinning every import
+for a byte-width query emitted dead native-only assembly in WASM programs.
+Other reflection targets keep the conservative fallback above. The LLVM
+emitted-call soundness net remains unchanged and catches any missing helper.
+
 Everything else is live iff reachable through the call graph (explicit
 `Expr::Call` edges) plus the intrinsic→helper table.
 
@@ -38,6 +46,12 @@ Everything else is live iff reachable through the call graph (explicit
 compiled button resolves a missing wasm export and the click throws at
 runtime (BUGS.md 2026-10-06 view-handler drop). `build` = `build_with_roots`
 with an empty set — native programs get the same verdict as before.
+
+`ArrowAssign` does not seed task/event helpers. Collection and event writes
+share that AST form, and emitted event calls are discovered by the LLVM
+emitted-call fixpoint. This keeps ordinary collection updates from importing
+unused task scheduling and target-specific trap/output code; live event calls
+still enter the closure through their emitted edges.
 
 ## The intrinsic→helper table
 

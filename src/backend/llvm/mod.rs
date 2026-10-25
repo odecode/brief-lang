@@ -11,6 +11,7 @@ pub(crate) mod kernel;
 pub mod helpers;
 pub mod intrinsics;
 pub mod loop_engine;
+mod logical;
 pub mod normalizer;
 pub mod types;
 pub mod strategy;
@@ -5536,9 +5537,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
 
         // Attributes
-        if !self.fun.pending_metadata.is_empty() {
+        if !self.ctx.pending_metadata.is_empty() {
             writeln!(out, "; Loop metadata").ok();
-            out.push_str(&self.fun.pending_metadata);
+            out.push_str(&self.ctx.pending_metadata);
         }
         writeln!(out).ok();
         // 2026-07-21: Fast-math attributes (tried for nbody vrcpps conversion, but

@@ -936,6 +936,7 @@ export async function createApp(wasmBytes) {{
              \x20           const dv = new DataView(this._memory.buffer);\n\
               \x20           const n = Number(dv.getBigInt64(snapPtr, true));\n\
               \x20           const seen = new Set();\n\
+              \x20           let cursor = container.firstElementChild;\n\
               \x20           for (let i = 0; i < n; i++) {{\n\
               \x20             {item_reader}\n\
               \x20             const key = itemKey({key_expr:?}, item);\n\
@@ -945,9 +946,10 @@ export async function createApp(wasmBytes) {{
               \x20               el2 = document.createElement(tagName);\n\
               \x20               el2.innerHTML = templateInner;\n\
               \x20               applyItem(el2, item);\n\
-              \x20               container.appendChild(el2);\n\
-             \x20               rendered.set(key, el2);\n\
+              \x20               rendered.set(key, el2);\n\
              \x20             }}\n\
+             \x20             if (el2 !== cursor) container.insertBefore(el2, cursor);\n\
+             \x20             cursor = el2.nextElementSibling;\n\
              \x20           }}\n\
              \x20           for (const [key, el2] of rendered) {{\n\
              \x20             if (!seen.has(key)) {{\n\
@@ -1337,6 +1339,7 @@ export async function createApp(wasmBytes) {{
                      \x20           const dv = new DataView(this._memory.buffer);\n\
                      \x20           const n = Math.min({count}, Math.floor(valLen / {elem_size}));\n\
                      \x20           const seen = new Set();\n\
+                     \x20           let cursor = container.firstElementChild;\n\
                      \x20           for (let i = 0; i < n; i++) {{\n\
                      \x20             const item = {slot_reader};\n\
                      \x20             const key = String(item);\n\
@@ -1346,9 +1349,10 @@ export async function createApp(wasmBytes) {{
                      \x20               el = document.createElement(tagName);\n\
                      \x20               el.innerHTML = templateInner;\n\
                      \x20               applyItem(el, item);\n\
-                     \x20               container.appendChild(el);\n\
                      \x20               rendered.set(key, el);\n\
                      \x20             }}\n\
+                     \x20             if (el !== cursor) container.insertBefore(el, cursor);\n\
+                     \x20             cursor = el.nextElementSibling;\n\
                      \x20           }}\n\
                      \x20           for (const [key, el] of rendered) {{\n\
                      \x20             if (!seen.has(key)) {{\n\
@@ -2312,6 +2316,10 @@ mod tests {
             "item trigger must call the txn with the item:\n{shim}");
         assert!(shim.contains("data-itm=\\\""),
             "marker-1 inner elements resolved in the clone:\n{shim}");
+        assert!(shim.contains("let cursor = container.firstElementChild")
+            && shim.contains("container.insertBefore(el, cursor)")
+            && !shim.contains("container.appendChild(el)"),
+            "keyed reconciliation must leave unchanged vector nodes in place:\n{shim}");
     }
 
     #[test]

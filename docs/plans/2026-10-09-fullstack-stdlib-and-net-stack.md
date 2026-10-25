@@ -261,3 +261,58 @@ verification pending. Feature work is preserved in the documented scratch patch.
 
 Verification: four focused regressions and native value/trap gates pass; cargo
 build passes. Full suite: 3157 passed, 38 known failure names, none added.
+
+## PostgreSQL receive buffer metadata (FIXED 2026-10-21)
+
+pg_read_msg filled memory without publishing ByteBuf.len, so bounded error-field
+scans returned empty SQLSTATE/message. buf_received now publishes initialized
+header/body prefixes without copying or creating a second allocation owner.
+Standalone tests/fixtures/stdlib/pg_receive_gate.bv passes prefix invariants and
+live 22012/division by zero preservation through rollback and connection reuse.
+Integration build passes; library suite: 3164 passed, 38 known failures, none new.
+Praetor directory checks pass. No compiler source changes or performance claim.
+Branch fix/pg-receive-length targets feat/net-db-postgres, absent from main.
+
+## Result wrong-side unwrap fabricated payloads (FIXED 2026-10-21)
+
+unwrap and unwrap_err fabricated cast fallback values instead of their documented
+trap. Wrong sides now trap; actual payloads are preserved. Standalone regression
+tests/fixtures/stdlib/result_object_gate.bv passes both object payloads and both
+wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
+stdlib branch carries no compiler changes. Integration build passes; library
+suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
+
+Task 10 complete (2026-10-21): native parser/bootstrap/population/upsert gates
+pass, including batch rollback and concurrent startup. Integration suite: 3164
+passed, 38 known failures, none added. Stdlib fixes have separate PR branches
+fix/pg-receive-length and fix/result-wrong-side-unwrap; task-10 commit excludes
+those edits. See docs/plans/2026-10-21-recommender-bootstrap.md for evidence.
+
+Task 11 native account service (2026-10-21): atomic parameterized registration,
+FNV demo storage, explicit random-token sessions and token-authenticated state
+pass their native gates (144 credential and 120 isolation cases). The human
+confirmed recommendation composition belongs to task 12, using this same owner.
+No compiler/stdlib fix needed; docs/plans/2026-10-21-recommender-accounts.md records
+the increments and tests. Full library suite is running; commit approval pending.
+
+Task 11 final gates (2026-10-21): native corpus and fresh-connection login/state
+persistence pass. Full library suite: 3164 passed, 38 baseline failures with
+exactly the same names as task 10. Praetor passes; no compiler/stdlib changes.
+
+Task 12 (2026-10-21): implemented native poll HTTP routing, token-owned live
+channels, buffered partial writes, active-account predictions and consistent
+periodic/explicit snapshot refresh. Native gates exposed and fixed collection
+rebinding (compiler) and JSON consume-or-error progress/framing (stdlib); see
+BUGS.md and docs/plans/2026-10-21-recommender-server.md. Compiler fix is prepared
+on its own main-based branch. Interpreter changes are excluded by explicit user
+instruction. Final native/property/library verification is recorded in the task
+plan; no throughput/latency claim is made before task 16.
+
+I09 view compiler UTF-8 cursor (2026-10-23): generated recommender HTML exposed
+a view compiler cursor bug. Copying a multibyte scalar advanced the byte offset
+by one, corrupting later injected directive tags. `ViewCompiler::inject_ids_inner`
+now advances by `char::len_utf8()`, with a regression that puts accented, CJK
+and punctuation text before directives. The human runs Cargo tests/rebuild per
+WORKFLOW.md; the existing WSL `brievc` binary predates this Rust edit. I09 keeps
+static template punctuation ASCII until the rebuilt compiler verifies Unicode
+output.

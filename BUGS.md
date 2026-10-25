@@ -108,6 +108,33 @@ and `analysis::desugar::rewrite_enum_variant_access` lowers an importer's
 `Enum.Variant` / `Enum.Variant(args)` (parsed before the enum is known) to the
 internal `Enum::Variant` constructor after imports resolve. Pins:
 `tests/tier1/enum_import_smoke.bv`, `fsm_smoke` (now uses named enum imports).
+## Keyed browser list renderer moved unchanged nodes on every state flush — FIXED 2026-10-25
+
+**Symptom:** the real recommender browser gate observed every recommendation list item removed and reinserted when the unrelated save-status state changed. The result list text stayed the same, but this caused unnecessary DOM work after every saved confirmation and violated the I11 no-duplicate-render gate.
+
+**Root cause:** both generated `b-each` renderers unconditionally appended each keyed node to its parent during every view effect. `appendChild` moves an existing child to the end, even when its order is already correct.
+
+**Fix:** reconcile against the next expected element and call `insertBefore` only when a keyed node is out of position. Unchanged nodes remain attached and produce no DOM mutation. Regression coverage is in `src/glue/web_generator.rs`; the real collection-backed recommender list is verified by the I11 Playwright row-lock gate.
+
+## Reassigned parameter slots reused LLVM SSA names in the function body — FIXED 2026-10-23
+
+**Symptom:** clang rejected the recommender HTTP logout gate with “multiple definition of local value” when compiling a recursive helper that mutates a `List` parameter. Its entry alloca and a later body load both used `%t6`.
+
+**Root cause:** `emit_definition` allocated reassigned parameter slots using `FunctionContext::txn_counter`, then reset that counter to zero after parameter binding. Body emission therefore reused names already defined in the entry prologue.
+
+**Fix:** reset the counter at definition entry, before parameter prologue emission, and keep it monotonic through the body. The LLVM backend regression compiles the real `sessions.bv` module and asserts local value names are unique in `session_revoke_entries` (`src/backend/llvm/tests.rs`).
+
+## Raw Ptr<T> scalar index load/store CSE-aliased via inttoptr provenance loss -> stale read -- FIXED 2026-10-20
+
+**Symptom:** a top-N serving routine (recommender-app Task 8 oracle, examples/recommender/reference.bv `recommend_user`) returned already-rated items and ran to `topn` instead of stopping. A `picked[]` exclusion array (a raw `Malloc#`-backed `Ptr<Int>`) was correctly marked `[1,1,1,1]` (confirmed by a print inside the writing defn), yet a sibling defn's `rec_argbest` read `picked[3]` as 0 and re-selected item 3 every pass. Same memory, same function, different result across recursion frames.
+
+**Controlled A/B:** hand-editing the emitted `.ll` to mark the single `picked[i]` load `volatile` fixed the output exactly (`best=3` at done=0 -> `best=-1` at done=1). Smaller probes (`scratch/ptr_store_crossdefn.bv` lanes A/B/C: cross-defn inline store, helper-wrapped store, recursive-select with Int then Float scoring) all PASSED -- the trigger needs the load and store in SEPARATE defns large enough to NOT inline (`rec_argbest` calls the heavy `cf_predict_ref`), so the `memory(argmem: readwrite)` attribute survives and the cross-function loads/stores remain for LTO to mis-analyze.
+
+**Root cause:** the raw `Ptr<T>` scalar index LOAD (`base[i]`, emit_expr.rs raw_ptr_scalar branch) and STORE (`base[i]=v`, emit_stmt.rs scalar_pointee branch) each recover the pointer with a FRESH `inttoptr i64 %base to ptr`. `inttoptr` yields a pointer with no provenance; LLVM BasicAA (under -O3 -flto, after inlining the load defn and store defn together) cannot prove the two independent inttoptr-derived pointers alias, so it treats the load as not-aliasing the store and hoists/CSEs the load across it -> stale read. The `#8`/`#13` memory-attribute doctrine (BUGS.md "string concat") governs the CALLER's effect summary and does NOT fix this intra-/inter-body load-vs-store provenance gap.
+
+**Fix:** emit the raw `Ptr<T>` SCALAR element load and store as `volatile` (unconditionally for scalar pointees i8/i16/i32/i64/float/double; emit_expr.rs load + emit_stmt.rs store). Volatile accesses cannot be eliminated or reordered relative to other volatile accesses, so the `base[j]=v` store can no longer be reordered around the `base[i]` read -- the sound, general fix for every raw-buffer read/write regardless of inlining. Scoped to scalar pointees; the boxed-handle (List/dyn/String) carrier path is untouched. Regression test `raw_ptr_scalar_index_load_and_store_are_volatile` (src/backend/llvm/emit_toplevel.rs).
+
+**Optimization impact (deliberate tradeoff -- see PR-ptr-index-provenance.md):** volatile defeats SLP/load-store vectorization, redundant-load elimination, and store-to-load forwarding ON RAW Ptr<T> SCALAR BUFFERS (matrix.bv/vector/CSR hot loops). Correctness-first per the operating contract. The provenance-preserving successor (thread ONE canonical `ptr` from the `as Ptr<T>` cast through every index/deref access instead of re-inttoptr-ing per access, so AA relates them and volatile can be dropped) is the documented future-work path to restore the optimization.
 
 ## Float-tuple destructure loaded elements as i64 -> clang float/i64 clash -- FIXED 2026-10-19
 
@@ -10922,3 +10949,274 @@ is `std/float_fmt.bv`'s tuple-returning `sscale` (`(Int, Int)` return emitted as
 an i64 pointer handle against an i32 return). Compiled app gates and Task Board
 remain green; JSON-to-`List<Task>` on wasm is deferred until the tuple-return
 ABI is fixed.
+## PostgreSQL receive buffer metadata (FIXED 2026-10-21)
+
+pg_read_msg filled memory without publishing ByteBuf.len, so bounded error-field
+scans returned empty SQLSTATE/message. buf_received now publishes initialized
+header/body prefixes without copying or creating a second allocation owner.
+Standalone tests/fixtures/stdlib/pg_receive_gate.bv passes prefix invariants and
+live 22012/division by zero preservation through rollback and connection reuse.
+Integration build passes; library suite: 3164 passed, 38 known failures, none new.
+Praetor directory checks pass. No compiler source changes or performance claim.
+Branch fix/pg-receive-length targets feat/net-db-postgres, absent from main.
+
+## Result wrong-side unwrap fabricated payloads (FIXED 2026-10-21)
+
+unwrap and unwrap_err fabricated cast fallback values instead of their documented
+trap. Wrong sides now trap; actual payloads are preserved. Standalone regression
+tests/fixtures/stdlib/result_object_gate.bv passes both object payloads and both
+wrong-side SIGILL paths on integration. Depends on compiler fix 23cbbdac; this
+stdlib branch carries no compiler changes. Integration build passes; library
+suite: 3164 passed, 38 baseline failures, no added failure names. Praetor passes.
+
+## Ordinary local collection assignment inserts a handle (FIXED 2026-10-21)
+
+Task 12's dense account-ID map and owner-view cache were corrupted by ordinary
+`values = values + entry`. Minimal scratch/task12_list_rebind.bv printed two
+heap addresses instead of 1,2; the interpreter's ordinary assignment semantics
+replace the binding. LLVM's identifier assignment consulted InsertAt before
+storing a local, treating a same-type collection RHS as an element.
+
+collection_assignment.rs now handles same-type declared collection rebinding
+before that historical fallback, using operator metadata and type equality.
+Explicit arrow insertion and different-type fallback remain unchanged. Three
+unit tests plus tests/fixtures/stdlib/collection_rebind_gate.bv cover replacement,
+concat accumulation, object elements, explicit push and unchanged fallbacks.
+Native gate passes; task-12 owner isolation and refresh mapping pass with it.
+Isolated branch fix/collection-assignment-rebind has the compiler fix prepared
+from main; commits remain pending workflow approval.
+
+## JSON malformed-input progress and framing (FIXED 2026-10-21)
+
+Task 12 native probes hung on unterminated strings and exposed accepted missing
+commas/trailing commas, unvalidated null tokens, leading-zero numbers and broken
+escape advancement. json.bv now uses bounded recursive descent with an explicit
+consume-or-error progress invariant, strict separators and complete-input checks,
+Unicode scalar/surrogate validation, UTF-8 checks, integer overflow bounds and
+IEEE finite classification. A named builder-conversion import prevents collision
+with database/string imports. Native server_json_gate passes all grammar, Unicode,
+integer endpoint, nested-value and escape gates. Interpreter work is explicitly
+excluded at the user's request.
+
+## Float Abs intrinsic uses a type spelling as its overload (FIXED 2026-10-21)
+
+The task-12 cached/full-engine comparison failed native linking with undefined
+@llvm.fabs.float. template_for_op used the LLVM operand type as the intrinsic
+suffix. A new overload-aware seam emits f16/bf16/f32/f64 names; the narrow
+declarations are added beside existing f32/f64 declarations. Integer Abs and
+the legacy fallback remain unchanged. Two unit tests and native
+tests/fixtures/stdlib/float_abs_gate.bv pin the behavior. Prepared separately
+on fix/float-abs-intrinsic from main; no interpreter changes.
+
+## Nested object allocation smaller than finalized fields (FIXED 2026-10-21)
+
+Full-model snapshot construction allocated ServerModel with an early 212-byte
+aggregate size but emitted its last field at byte 332, corrupting the heap.
+Valgrind pinned invalid stores to model_load_path. Ordinary object allocation
+now covers the finalized field extent and preserves larger declared padding;
+packed/union paths are unchanged. The unit gate intentionally supplies stale
+aggregate metadata; native snapshot round-trip and refresh gates verify the
+real trigger. Remove the extent guard only after nested registration finalizes
+aggregate metadata consistently with every member offset.
+
+## read_file leaked descriptors after EOF and failure (FIXED 2026-10-21)
+
+The wrapper opened a descriptor and returned read_whole without closing it.
+Snapshot reuse would eventually exhaust descriptors. The owning wrapper now
+closes after either read outcome and preserves the original result. Native
+fs_read_lifecycle_gate reads 512 times with RLIMIT_NOFILE=64.
+
+## Full similarity cache repeatedly recomputed prerequisites (FIXED 2026-10-21)
+
+Each pair's imputed-union PCC recursively recalculated base PCC and missing
+ratings. The full 943/1682/100000 startup exceeded 37 minutes before cancellation.
+Application-level prepared stages reuse base pairs and imputed cells while
+retaining the exact original union/accumulation order. Full startup now reaches
+readiness in 11.8–15.3 seconds in development checks; fresh persisted startup
+takes 0.40–0.47 seconds. See the cache-reuse plan for same-geometry reference
+gates and timing limitations. Transactional revisions and off-loop workers fix
+unconditional startup rebuilding and synchronous refresh stalls at the same time.
+
+## Print macro inside foreach can reach codegen unresolved (OPEN 2026-10-21)
+
+A diagnostic println! inside cache_full_reference_gate's foreach survived the
+print plugin and reached the existing backend rejection. print_plugin::walk_stmt
+does not visit Foreach bodies. The numeric gate uses a final aggregate result
+instead; recommender transport/cache behavior does not depend on loop printing.
+Repair belongs in the print plugin's traversal, not a permissive backend fallback.
+## Browser target widths and persistent state boundaries (FIXED 2026-10-22)
+
+The recommender's generated WASM exposed native-register/boxed-payload width
+mismatches in calls, collections, closures, tuples, enums and pointer indexing.
+Shared lowering boundaries now adapt the target representation explicitly;
+native 64-bit boxed storage remains intact. Portable JSON/formatting uses an
+explicit Int64 accumulator and browser-safe imports. The UTF-8 character-to-
+String allocation includes its full header and maximum payload. Actual WASM JSON,
+heap and collection snapshot gates cover the application path.
+
+Initialized collection objects could retain init_state stack addresses, and view
+materializers had a fixed 1024-word buffer. Both empty/seeded state allocations
+now outlive initialization, and snapshots resize to cardinality. The collection
+fixture verifies Unicode, 1100 elements, reuse and reset. Rendering now decodes
+UTF-8 values and reconciles current order; helper-call writes invalidate views.
+Window-event parsing accepts hyphenated event names. Host behavioral gates cover
+HTTP errors, channel isolation, bounded queues and timer/socket cleanup.
+
+## Nested lexical types lost during operator elaboration (FIXED 2026-10-22)
+
+`foreach index in 0..n { result += [index as String]; }` lost the loop element
+binding during elaboration and emitted raw addition of collection handles.
+Binding the element also exposed missing enum payload bindings in enclosing
+match arms. Elaboration now consumes the checker's existing iterable and enum
+payload type authorities, including generic substitution, and restores lexical
+scope afterward. Two unit regressions and the generated-WASM collection fixture
+pin declared concatenation through both forms.
+
+## Logical RHS evaluated before its guard (2026-10-22)
+
+Recommender I02 exposed `idx > 0 && items[idx-1]...` reading index -1. LLVM's
+ordinary BinaryOp path emitted both operands before register `and`/`or`; the
+loop-exit evaluator did likewise. The reference interpreter already skips the
+unneeded RHS. Minimal discriminators use runtime flags around a trapping/read
+RHS and count exactly-once writes for the required edge.
+
+The new logical CFG emitter branches before RHS emission, joins canonical i8
+values through explicit predecessor blocks, handles nested/terminating RHS
+paths, and supplies the exit evaluator's existing i64 boundary through shared
+adaptation. Specific AST arms precede the unchanged eager fallback; bitwise
+operations remain eager. Native -O0/-O2 and LLVM verifier regressions are in
+`logical_tests.rs`. Verification is recorded in the dated short-circuit plan.
+Conditional expression-block writes also require entry-slot discovery for locals
+and mutable native ABI parameters. Logical merges discard RHS-only pointer,
+state-pointer and last-value cache entries to preserve SSA dominance.
+
+## Recommender clock failure reads unwritten timespec (2026-10-22)
+
+I01 instrumentation review found `server_time(clock_id)` loading the allocated
+timespec before checking the clock_gettime syscall result. An invalid clock ID
+therefore read memory the syscall had not initialized. The failure guard now
+frees the allocation and returns -1 before either load. The new trace helper
+uses the same ordering. Regression: `responsiveness_trace_gate.bv` calls
+`server_time(-1)` and checks the error sentinel. Native gate passes with tracing
+disabled and enabled (2026-10-22).
+`server_timestamp` also preserves a failed clock's -1 instead of dividing it to
+zero, so rating persistence rejects the invalid timestamp rather than storing it.
+
+## Print macros skipped nested statement and operand positions (2026-10-22)
+
+The recommender worker contract's foreach/guard failure diagnostic reached LLVM
+as PluginIntercept and panicked. Print expansion had partial private walkers:
+foreach/match bodies, container/operand positions and behavioral members could
+escape resolution. The new exhaustive mutable postorder AST visitor processes
+children before print replacement, preserving nested receiver/argument expansion.
+The print plugin uses it and returns nested format errors. Print# retains typed
+dispatch; its unused annotation table and partial walkers are retired.
+Regression coverage includes nested diagnostics, unknown-plugin children,
+malformed nested formats, exactly-once postorder mutation and read/mutable
+coverage agreement. See docs/architecture/ast-traversal.md and the dated plan.
+
+## 2026-10-22 — WASM codec imports dead native assembly through closed reflection (OPEN)
+
+**Symptom:** building the I02 browser codec fixture for wasm32 reaches the
+stdlib `Prefetch` assembly wrapper, which has no wasm32 lowering. The fixture
+does not call that wrapper. Bypassing that check also showed native
+`stdout_flush` and its Linux `briev_syscall` call in emitted IR.
+
+**Root cause:** compile-time reflection set `DefnLiveness.keep_all` for every
+target. JSON integer and finite-number checks use closed value inspections such
+as `.^^Bytes`; these inspect receiver metadata and cannot look up a callable.
+Keeping all imported definitions defeats target-specific dead-code elimination.
+
+**Fix:** closed `Size`, `Bytes`, `Alignment`, and `Type` inspections traverse
+receiver dependencies without setting `keep_all`. Unknown reflection targets
+retain the existing conservative behavior. Regression tests cover all four
+closed targets, receiver-call reachability, and the fallback. The emitted-call
+soundness net remains enabled.
+
+## 2026-10-22 — collection arrows retain unused task runtime (OPEN)
+
+**Symptom:** a WASM program using JSON collection updates emits task scheduling,
+`event_strict_trap` and its Linux `briev_syscall` helper despite containing no
+event operation.
+
+**Root cause:** liveness seeded the complete task/event helper family for every
+`ArrowAssign`. Collection writes share this syntax with event-wire writes, so
+ordinary list mutation pulled in unrelated target-specific code.
+
+**Fix:** remove the statement-level task/event seed and let the emitted-call
+fixpoint derive backend-generated event calls. The regression checks ordinary
+arrow writes do not retain unused task/event helpers. See
+`docs/plans/2026-10-22-event-trap-liveness.md`.
+
+## 2026-10-22 — wasm32 typed Int constant emits an i64 load (OPEN)
+
+**Symptom:** comparing a Briev `Int` field against a typed Int constant emits
+`icmp i32 ..., i64 ...` on wasm32, and `llc` rejects the module.
+
+**Root cause:** constant globals used the target-independent protocol width,
+and identifier reads hardcoded `load i64`. Flexible Int is i32 on wasm32.
+
+**Fix:** use the backend's target-derived `llvm_type` for constant globals,
+aliases and loads, and retain the declared Briev type in the loaded register.
+The wasm32 regression covers declaration and read. See
+`docs/plans/2026-10-22-wasm-constant-width.md`.
+
+## 2026-10-22 — LLVM metadata reservations overlap on large programs (FIXED 2026-10-22)
+
+The recommender server emitted both a TBAA type node and StateAliasScope as
+`!99`; clang rejected it with “Metadata id is already used.” Range nodes began
+at !50 and loop/invariant-load nodes at !100, so these families could also
+overlap. Function resets additionally cleared pending module metadata.
+
+All generated nodes now use one module counter after the registered TBAA
+prefix. Pending definitions survive function reset/snapshot operations and
+reset only per emission round. Regression tests cover large universes, late
+structural registration, and cross-function metadata lifetime. See
+`docs/plans/2026-10-22-module-metadata-allocation.md` for verification evidence.
+
+## 2026-10-23 — multibyte view text shifts later directives (FIXED 2026-10-23)
+
+**Symptom:** generated browser HTML becomes malformed when UTF-8 text appears
+before a later `b-*` directive. ASCII-only templates remain intact.
+
+**Root cause:** `ViewCompiler::inject_ids_inner` advanced a byte offset by one
+after copying a Unicode scalar, then used that offset to slice the UTF-8 source.
+The cursor stopped at a non-character boundary and later tag processing drifted.
+
+**Fix:** copy the next scalar from the current byte boundary and advance by its
+UTF-8 byte length. The focused regression places accented, CJK and multibyte
+punctuation before two injected directive tags. See
+`docs/plans/2026-10-09-fullstack-stdlib-and-net-stack.md` for the I09 discovery.
+
+## 2026-10-23 — recommender browser account API used a different contract (FIXED 2026-10-23)
+
+**Symptom:** `/movies` returned successfully, but browser registration and sign-in
+failed, and authenticated profile hydration expected fields that the server did
+not return.
+
+**Root cause:** the browser called `/v1/register`, `/v1/login` and `/v1/state`,
+while native dispatch only recognized unversioned paths. The server's login
+response also lacked the protocol version, message type, account identity and
+process epoch required by the browser client.
+
+**Fix:** normalize the optional `/v1/` prefix at route dispatch, preserve one
+random server epoch through state copies, and return versioned authentication
+and profile envelopes while retaining legacy identity fields and routes. The
+server API gate now exercises versioned registration, sign-in and state reads.
+See `docs/plans/2026-10-23-recommender-account-api-integration.md`.
+
+## 2026-10-23 — reactive rebinding of an unpacked top-level object dropped returned members (FIXED 2026-10-23)
+
+**Symptom:** `txn_serve` called `server_step(state)` but subsequent loop turns
+continued using stale object members. LLVM had no `%State` handle slot for the
+top-level unpacked object, so ordinary identifier assignment silently fell
+through without committing the returned value.
+
+**Fix:** the LLVM statement emitter now recognizes registered unpacked
+instances, resolves member slots from the instance metadata, and commits each
+returned member into the corresponding row. Local bindings, unrelated fallback
+behavior, and boxed member offsets remain handled by their existing paths.
+Regression compiles the recommender server and checks that `server_step` is
+followed by stores to the unpacked server's registered member slots
+(`reactive_rebinding_of_an_unpacked_object_commits_member_slots` in
+`src/backend/llvm/tests.rs`).

@@ -386,3 +386,5 @@ benchmarks/queue_drain_c
 benchmarks/series_converge_c
 benchmarks/utf8_ops_c
 benchmarks/parity/_out/
+# Local recommendation snapshots, including atomic-write and worker artifacts.
+/recommender.snapshot.bin*

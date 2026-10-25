@@ -1,0 +1,17 @@
+{
+  "before_release": {
+    "save_completed": false,
+    "catalogue_completed": false
+  },
+  "save": {
+    "operation": "native_16_0",
+    "initial_ratings": 5,
+    "actual_ratings": 5,
+    "post_ms": 2327.278149,
+    "get_ms": 196.995922,
+    "flow_ms": 2524.2740710000003
+  },
+  "catalogue_ms": 2232.930307,
+  "held_after_submit_ms": 1250,
+  "interpretation": "Current synchronous baseline; not prediction-independence acceptance."
+}

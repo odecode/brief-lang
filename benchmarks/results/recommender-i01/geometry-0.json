@@ -1,0 +1,1809 @@
+{
+  "url": "http://localhost:18083/app.html?api=http://127.0.0.1:18082",
+  "username": "i01_0_1792656748716356852",
+  "initial": "0",
+  "samples": 10,
+  "warmups": 3,
+  "new_rating_samples": 1,
+  "errors": [],
+  "network": [
+    {
+      "method": "GET",
+      "path": "/app.html"
+    },
+    {
+      "method": "GET",
+      "path": "/app.css"
+    },
+    {
+      "method": "GET",
+      "path": "/app.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/app.wasm"
+    },
+    {
+      "method": "POST",
+      "path": "/login"
+    },
+    {
+      "method": "GET",
+      "path": "/movies"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    },
+    {
+      "method": "POST",
+      "path": "/rating"
+    },
+    {
+      "method": "GET",
+      "path": "/state"
+    }
+  ],
+  "protocol": [
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.html",
+      "timestamp": 672048.069479,
+      "id": "9B105D09070EBF0A5DC1E5D8C6E6CEA3",
+      "type": "Document"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.095423,
+      "id": "9B105D09070EBF0A5DC1E5D8C6E6CEA3",
+      "type": "Document"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.css",
+      "timestamp": 672048.108447,
+      "id": "16656.2",
+      "type": "Stylesheet"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.mjs",
+      "timestamp": 672048.124159,
+      "id": "16656.4",
+      "type": "Script"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.145675,
+      "id": "16656.2",
+      "type": "Stylesheet"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.156487,
+      "id": "16656.4",
+      "type": "Script"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/app.wasm",
+      "timestamp": 672048.158184,
+      "id": "16656.5",
+      "type": "Fetch"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.262298,
+      "id": "16656.5",
+      "type": "Fetch"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/favicon.ico",
+      "timestamp": 672048.266144,
+      "id": "16656.6",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 404,
+      "timestamp": 672048.284863,
+      "id": "16656.6",
+      "type": "Other"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/login",
+      "timestamp": 672048.57382,
+      "id": "16656.7",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/login",
+      "timestamp": 672048.578241,
+      "id": "CC1A4E61CCC7AD034E3F9B3E66E0DD45",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.585894,
+      "id": "CC1A4E61CCC7AD034E3F9B3E66E0DD45",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.678931,
+      "id": "16656.7",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/movies",
+      "timestamp": 672048.681299,
+      "id": "16656.8",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672048.955291,
+      "id": "16656.8",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672051.461625,
+      "id": "16656.9",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672051.513742,
+      "id": "16656.9",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672051.657947,
+      "id": "16656.11",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "OPTIONS",
+      "path": "/rating",
+      "timestamp": 672051.660233,
+      "id": "D5CA1106640D0D55826150593A2E59CB",
+      "type": "Other"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672051.665131,
+      "id": "D5CA1106640D0D55826150593A2E59CB",
+      "type": "Preflight"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672051.798601,
+      "id": "16656.11",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672051.799097,
+      "id": "16656.12",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672051.850216,
+      "id": "16656.12",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672051.974357,
+      "id": "16656.13",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.11381,
+      "id": "16656.13",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672052.114295,
+      "id": "16656.14",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.169802,
+      "id": "16656.14",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672052.255089,
+      "id": "16656.15",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.389817,
+      "id": "16656.15",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672052.390207,
+      "id": "16656.16",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.437767,
+      "id": "16656.16",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672052.523075,
+      "id": "16656.17",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.661658,
+      "id": "16656.17",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672052.662078,
+      "id": "16656.18",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.713897,
+      "id": "16656.18",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672052.806997,
+      "id": "16656.19",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672052.95012,
+      "id": "16656.19",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672052.950608,
+      "id": "16656.20",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.001903,
+      "id": "16656.20",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672053.090205,
+      "id": "16656.21",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.225581,
+      "id": "16656.21",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672053.225924,
+      "id": "16656.22",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.274605,
+      "id": "16656.22",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672053.357042,
+      "id": "16656.23",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.493483,
+      "id": "16656.23",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672053.493872,
+      "id": "16656.24",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.541959,
+      "id": "16656.24",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672053.623753,
+      "id": "16656.25",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.761468,
+      "id": "16656.25",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672053.761833,
+      "id": "16656.26",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672053.809988,
+      "id": "16656.26",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672053.88945,
+      "id": "16656.27",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.02546,
+      "id": "16656.27",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672054.025855,
+      "id": "16656.28",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.07379,
+      "id": "16656.28",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672054.157596,
+      "id": "16656.29",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.293782,
+      "id": "16656.29",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672054.29426,
+      "id": "16656.30",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.341894,
+      "id": "16656.30",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672054.42395,
+      "id": "16656.31",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.562143,
+      "id": "16656.31",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672054.562606,
+      "id": "16656.32",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.61381,
+      "id": "16656.32",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672054.690261,
+      "id": "16656.33",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.830219,
+      "id": "16656.33",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672054.830639,
+      "id": "16656.34",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672054.886223,
+      "id": "16656.34",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672054.974826,
+      "id": "16656.35",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672055.114043,
+      "id": "16656.35",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672055.114527,
+      "id": "16656.36",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672055.166036,
+      "id": "16656.36",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "POST",
+      "path": "/rating",
+      "timestamp": 672055.258106,
+      "id": "16656.37",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672055.393909,
+      "id": "16656.37",
+      "type": "XHR"
+    },
+    {
+      "stage": "request",
+      "method": "GET",
+      "path": "/state",
+      "timestamp": 672055.394347,
+      "id": "16656.38",
+      "type": "XHR"
+    },
+    {
+      "stage": "response",
+      "status": 200,
+      "timestamp": 672055.442388,
+      "id": "16656.38",
+      "type": "XHR"
+    }
+  ],
+  "evidence": [
+    {
+      "operation": "",
+      "stage": "long_task",
+      "ms": 196.5,
+      "start": 90.29999995231628,
+      "duration": 97
+    },
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 217.60000002384186
+    },
+    {
+      "operation": "",
+      "stage": "dom_recommendations",
+      "ms": 217.70000004768372
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 506.60000002384186,
+      "path": "/login",
+      "method": "POST"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 612.2000000476837,
+      "path": "/login",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 614.1000000238419,
+      "path": "/movies",
+      "method": "GET"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 888.5,
+      "path": "/movies",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "http_start",
+      "ms": 3394.5,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "",
+      "stage": "http_end",
+      "ms": 3450.7999999523163,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 3457.100000023842
+    },
+    {
+      "operation": "",
+      "stage": "long_task",
+      "ms": 3466.7000000476837,
+      "start": 499,
+      "duration": 2962
+    },
+    {
+      "operation": "",
+      "stage": "dom_notice",
+      "ms": 3511.7000000476837
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "click",
+      "ms": 3590.2000000476837,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "http_start",
+      "ms": 3590.7999999523163,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "http_end",
+      "ms": 3731.7999999523163,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "http_start",
+      "ms": 3732,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "http_end",
+      "ms": 3783.399999976158,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "dom_notice",
+      "ms": 3784
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "dom_ratings",
+      "ms": 3784
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "live_receive",
+      "ms": 3787,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "dom_notice",
+      "ms": 3788.100000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "long_task",
+      "ms": 3788.399999976158,
+      "start": 3588.600000023842,
+      "duration": 196
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_1",
+      "stage": "paint_opportunity",
+      "ms": 3789.7000000476837,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 1 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "click",
+      "ms": 3906.600000023842,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "http_start",
+      "ms": 3907.2000000476837,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "http_end",
+      "ms": 4047,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "http_start",
+      "ms": 4047.2000000476837,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "http_end",
+      "ms": 4102.899999976158,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "dom_notice",
+      "ms": 4103.5
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "dom_ratings",
+      "ms": 4103.5
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "live_receive",
+      "ms": 4105.100000023842,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "dom_notice",
+      "ms": 4105.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "long_task",
+      "ms": 4105.700000047684,
+      "start": 3904.899999976158,
+      "duration": 199
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_2",
+      "stage": "paint_opportunity",
+      "ms": 4106.5,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 2 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "click",
+      "ms": 4187.700000047684,
+      "purpose": "warmup"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "http_start",
+      "ms": 4187.899999976158,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "http_end",
+      "ms": 4323,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "http_start",
+      "ms": 4323.100000023842,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "http_end",
+      "ms": 4370.899999976158,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "dom_notice",
+      "ms": 4371.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "dom_ratings",
+      "ms": 4371.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "live_receive",
+      "ms": 4373.700000047684,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "dom_notice",
+      "ms": 4374.200000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "long_task",
+      "ms": 4374.700000047684,
+      "start": 4186.600000023842,
+      "duration": 185
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_3",
+      "stage": "paint_opportunity",
+      "ms": 4376,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 3 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "click",
+      "ms": 4455.5,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "http_start",
+      "ms": 4456,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "http_end",
+      "ms": 4594.899999976158,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "http_start",
+      "ms": 4595,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "http_end",
+      "ms": 4647.100000023842,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "dom_notice",
+      "ms": 4647.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "dom_ratings",
+      "ms": 4647.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "live_receive",
+      "ms": 4650.100000023842,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "dom_notice",
+      "ms": 4650.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "long_task",
+      "ms": 4651.200000047684,
+      "start": 4454.5,
+      "duration": 193
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_4",
+      "stage": "paint_opportunity",
+      "ms": 4652.200000047684,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 4 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "click",
+      "ms": 4739.299999952316,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "http_start",
+      "ms": 4739.799999952316,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "http_end",
+      "ms": 4883.299999952316,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "http_start",
+      "ms": 4883.5,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "http_end",
+      "ms": 4935,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "dom_notice",
+      "ms": 4936.299999952316
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "dom_ratings",
+      "ms": 4936.299999952316
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "live_receive",
+      "ms": 4938.200000047684,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "dom_notice",
+      "ms": 4938.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "long_task",
+      "ms": 4939,
+      "start": 4738,
+      "duration": 198
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_5",
+      "stage": "paint_opportunity",
+      "ms": 4939.899999976158,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 5 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "click",
+      "ms": 5022.700000047684,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "http_start",
+      "ms": 5023.100000023842,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "http_end",
+      "ms": 5158.700000047684,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "http_start",
+      "ms": 5158.899999976158,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "http_end",
+      "ms": 5207.700000047684,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "dom_notice",
+      "ms": 5208.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "dom_ratings",
+      "ms": 5208.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "live_receive",
+      "ms": 5210.799999952316,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "dom_notice",
+      "ms": 5211.200000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "long_task",
+      "ms": 5211.5,
+      "start": 5021,
+      "duration": 188
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_6",
+      "stage": "paint_opportunity",
+      "ms": 5212.5,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 1 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "click",
+      "ms": 5289.5,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "http_start",
+      "ms": 5290,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "http_end",
+      "ms": 5426.600000023842,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "http_start",
+      "ms": 5426.799999952316,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "http_end",
+      "ms": 5475.100000023842,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "dom_notice",
+      "ms": 5475.700000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "dom_ratings",
+      "ms": 5475.700000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "live_receive",
+      "ms": 5477.700000047684,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "dom_notice",
+      "ms": 5478.200000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "long_task",
+      "ms": 5478.5,
+      "start": 5288.399999976158,
+      "duration": 187
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_7",
+      "stage": "paint_opportunity",
+      "ms": 5479.399999976158,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 2 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "click",
+      "ms": 5556.100000023842,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "http_start",
+      "ms": 5556.600000023842,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "http_end",
+      "ms": 5694.5,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "http_start",
+      "ms": 5694.700000047684,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "http_end",
+      "ms": 5743.100000023842,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "dom_notice",
+      "ms": 5743.899999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "dom_ratings",
+      "ms": 5743.899999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "live_receive",
+      "ms": 5746,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "dom_notice",
+      "ms": 5746.5
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "long_task",
+      "ms": 5746.899999976158,
+      "start": 5554.899999976158,
+      "duration": 189
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_8",
+      "stage": "paint_opportunity",
+      "ms": 5747.700000047684,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 3 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "click",
+      "ms": 5822,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "http_start",
+      "ms": 5822.299999952316,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "http_end",
+      "ms": 5958.600000023842,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "http_start",
+      "ms": 5958.799999952316,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "http_end",
+      "ms": 6006.899999976158,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "dom_notice",
+      "ms": 6007.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "dom_ratings",
+      "ms": 6007.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "live_receive",
+      "ms": 6010,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "dom_notice",
+      "ms": 6010.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "long_task",
+      "ms": 6011,
+      "start": 5820.799999952316,
+      "duration": 187
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_9",
+      "stage": "paint_opportunity",
+      "ms": 6012.100000023842,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 4 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "click",
+      "ms": 6090,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "http_start",
+      "ms": 6090.399999976158,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "http_end",
+      "ms": 6226.899999976158,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "http_start",
+      "ms": 6227.100000023842,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "http_end",
+      "ms": 6275,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "dom_notice",
+      "ms": 6275.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "dom_ratings",
+      "ms": 6275.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "live_receive",
+      "ms": 6277.600000023842,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "dom_notice",
+      "ms": 6278.899999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "long_task",
+      "ms": 6279.100000023842,
+      "start": 6088.700000047684,
+      "duration": 187
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_10",
+      "stage": "paint_opportunity",
+      "ms": 6280.399999976158,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 5 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "click",
+      "ms": 6356.399999976158,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "http_start",
+      "ms": 6356.799999952316,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "http_end",
+      "ms": 6495.299999952316,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "http_start",
+      "ms": 6495.5,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "http_end",
+      "ms": 6547,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "dom_notice",
+      "ms": 6547.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "dom_ratings",
+      "ms": 6547.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "live_receive",
+      "ms": 6550.200000047684,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "dom_notice",
+      "ms": 6550.700000047684
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "long_task",
+      "ms": 6550.899999976158,
+      "start": 6354.899999976158,
+      "duration": 193
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_11",
+      "stage": "paint_opportunity",
+      "ms": 6552.200000047684,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 1 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "click",
+      "ms": 6622.600000023842,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "http_start",
+      "ms": 6623.100000023842,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "http_end",
+      "ms": 6763.299999952316,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "http_start",
+      "ms": 6763.5,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "http_end",
+      "ms": 6819.399999976158,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "dom_notice",
+      "ms": 6820.100000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "dom_ratings",
+      "ms": 6820.100000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "live_receive",
+      "ms": 6822.799999952316,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "dom_notice",
+      "ms": 6823.100000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "long_task",
+      "ms": 6823.5,
+      "start": 6621.600000023842,
+      "duration": 199
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_12",
+      "stage": "paint_opportunity",
+      "ms": 6825,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 2 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "click",
+      "ms": 6905.799999952316,
+      "purpose": "measured"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "http_start",
+      "ms": 6907.700000047684,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "http_end",
+      "ms": 7047.200000047684,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "http_start",
+      "ms": 7047.399999976158,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "http_end",
+      "ms": 7099.100000023842,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "dom_notice",
+      "ms": 7100
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "dom_ratings",
+      "ms": 7100.100000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "live_receive",
+      "ms": 7102.200000047684,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "dom_notice",
+      "ms": 7102.600000023842
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "long_task",
+      "ms": 7103.100000023842,
+      "start": 6904.600000023842,
+      "duration": 196
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_13",
+      "stage": "paint_opportunity",
+      "ms": 7104.5,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 3 / 5. ",
+      "rating_count": 1,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "click",
+      "ms": 7190.600000023842,
+      "purpose": "new_rating"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "http_start",
+      "ms": 7191,
+      "path": "/rating",
+      "method": "POST"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "http_end",
+      "ms": 7327,
+      "path": "/rating",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "http_start",
+      "ms": 7327.200000047684,
+      "path": "/state",
+      "method": "GET"
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "http_end",
+      "ms": 7375.5,
+      "path": "/state",
+      "status": 200
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "dom_notice",
+      "ms": 7376.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "dom_ratings",
+      "ms": 7376.399999976158
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "live_receive",
+      "ms": 7378,
+      "cold_start": true
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "dom_notice",
+      "ms": 7378.299999952316
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "long_task",
+      "ms": 7378.5,
+      "start": 7189.100000023842,
+      "duration": 187
+    },
+    {
+      "operation": "browser_093a9f770f0b425f9bd60e96e61b5b75_14",
+      "stage": "paint_opportunity",
+      "ms": 7379.200000047684,
+      "notice": "Rating saved. Your shortlist is up to date.",
+      "ratings": "Movie 101: 3 / 5. Movie 102: 4 / 5. ",
+      "rating_count": 2,
+      "recommendations": "Your next good film\n        \n      ",
+      "recommendations_visible": false
+    }
+  ]
+}

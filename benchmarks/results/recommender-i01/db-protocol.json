@@ -1,0 +1,29 @@
+{
+  "backend_pid": 31955,
+  "operation": {
+    "operation": "native_138_0",
+    "initial_ratings": 5,
+    "actual_ratings": 5,
+    "post_ms": 1467.838481,
+    "get_ms": 45.790089,
+    "flow_ms": 1513.62857
+  },
+  "extended_queries": 4,
+  "client_protocol_messages": 20,
+  "postgres_duration_records_ms": [
+    0.174,
+    0.245,
+    0.065,
+    0.123,
+    0.095,
+    0.394,
+    0.142,
+    0.348,
+    0.098,
+    0.161,
+    0.279,
+    0.077
+  ],
+  "postgres_duration_sum_ms": 2.201,
+  "scope": "Parse/Bind/Execute durations; no SQL text, credentials or cross-clock subtraction."
+}
