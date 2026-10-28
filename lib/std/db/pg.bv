@@ -1,4 +1,6 @@
 // pg - a minimal PostgreSQL v3 wire-protocol client (net stack L3a).
+// Authored by Otto Westerlund (@odecode); adopted with attribution, see
+// docs/contributors/otto-westerlund.md.
 //
 // 2026-10-19 (recommender-app net stack, Task 2): the app persists accounts
 // and ratings in PostgreSQL. This module is the client side of the v3 wire
@@ -21,10 +23,7 @@
 
 import "std/net/socket.bv";
 import "std/net/bytes.bv";
-// 2026-10-21: only integer decoding is needed here. Importing all string
-// helpers leaks to_string(Int) into JSON users' StringBuilder namespace.
-// Keep this selective unless another string operation is actually required.
-import { to_int } from "std/string.bv";
+import "std/string.bv";
 
 // ── PgConn ─────────────────────────────────────────────────────────────────
 //
@@ -54,11 +53,16 @@ defn pg_send_msg(c: PgConn, mtype: Int, payload: GrowBuf)
 {
     let body_len: Int = payload.len;
     let total: Int = 1 + 4 + body_len;
+    let capacity: Int = max_int(total, 1);
     // frame = type | len(=4+body_len) | payload
-    let frame: ByteBuf = buf_new(total)
+    let frame: ByteBuf = buf_new(capacity)
         .put_u8(mtype)
         .put_u32_be(4 + body_len)
         .put_bytes(payload.ptr, body_len);
+    when c.sock.fd < -4096 || total < 0 || total > frame.len {
+        buf_free(frame);
+        term -4096;
+    };
     let rc: Int = sock_send(c.sock, frame, total);
     buf_free(frame);
     term rc;
@@ -73,6 +77,7 @@ defn pg_send_msg(c: PgConn, mtype: Int, payload: GrowBuf)
 //
 // Returns a PgMsg whose `ok` is false on a transport error or truncated read.
 defn pg_read_msg(c: PgConn) -> PgMsg {
+    when c.sock.fd < -4096 { term pg_msg_err(); };
     // 5-byte header: type + i32be length.
     let hdr: ByteBuf = buf_new(5);
     let hn: Int = sock_recv(c.sock, hdr, 5);
@@ -83,7 +88,9 @@ defn pg_read_msg(c: PgConn) -> PgMsg {
     // 2026-10-21: recv updates bytes, not ByteBuf's value metadata. Readers
     // must see the initialized prefix; otherwise bounded cstr scans later
     // treat every received payload as empty (lost SQLSTATE/message fields).
+    when hn > hdr.cap { buf_free(hdr); term pg_msg_err(); };
     let header: ByteBuf = buf_received(hdr, hn);
+    when header.len < 5 { buf_free(hdr); term pg_msg_err(); };
     let mtype: Int = get_u8(header, 0);
     let len: Int = get_u32_be(header, 1);
     buf_free(hdr);
@@ -95,12 +102,18 @@ defn pg_read_msg(c: PgConn) -> PgMsg {
     // Assemble a reader holding the payload only (type/len already consumed).
     // plen may be 0 (e.g. a bare message); buf_new needs cap >= 1, so size at
     // least 1 and record the real plen in the PgMsg.
-    let body: ByteBuf = buf_new(max_int(plen, 1));
+    let body_cap: Int = max_int(plen, 1);
+    let body: ByteBuf = buf_new(body_cap);
+    when plen < 0 || plen > body.cap {
+        buf_free(body);
+        term pg_msg_err();
+    };
     let bn: Int = when_read_payload(c, body, plen);
     when bn < plen {
         buf_free(body);
         term pg_msg_err();
     };
+    when bn < 0 || bn > body.cap { buf_free(body); term pg_msg_err(); };
     let received: ByteBuf = buf_received(body, bn);
     term PgMsg { ok: true, mtype: mtype, body: received, plen: plen };
 };
@@ -111,6 +124,9 @@ defn when_read_payload(c: PgConn, body: ByteBuf, plen: Int)
     [plen >= 0 && plen <= body.cap][term >= -4096]
     -> Int
 {
+    when plen < 0 || plen > body.cap || c.sock.fd < -4096 {
+        term -4096;
+    };
     when plen == 0 {
         term 0;
     };
@@ -181,10 +197,16 @@ defn pg_send_startup(c: PgConn, user: String, database: String)
         .put_u8(0);                              // terminating NUL of the block
     // total = len(4) + protocol(4) + params
     let total: Int = 4 + 4 + params.len;
-    let frame: ByteBuf = buf_new(total)
+    let capacity: Int = max_int(total, 1);
+    let frame: ByteBuf = buf_new(capacity)
         .put_u32_be(total)
         .put_u32_be(PG_PROTOCOL_V3)
         .put_bytes(params.ptr, params.len);
+    when c.sock.fd < -4096 || total < 0 || total > frame.len {
+        buf_free(frame);
+        grow_free(params);
+        term -4096;
+    };
     let rc: Int = sock_send(c.sock, frame, total);
     buf_free(frame);
     grow_free(params);
@@ -226,6 +248,7 @@ defn pg_handshake(c: PgConn) -> PgConn {
     // AuthenticationOk (trust). Any non-zero code is an unsupported auth method
     // for first-green (md5/SCRAM deferred) - we stop and signal pid = -1.
     when m.mtype == PG_AUTH {
+        when m.body.len < 4 { pg_msg_free(m); term PgConn { sock: c.sock, pid: -1, key: 0 }; };
         let code: Int = get_u32_be(m.body, 0);
         pg_msg_free(m);
         when code != 0 {
@@ -235,6 +258,7 @@ defn pg_handshake(c: PgConn) -> PgConn {
     };
     // BackendKeyData: payload is pid(i32be) + secret key(i32be). Record them.
     when m.mtype == PG_BACKENDKEY {
+        when m.body.len < 8 { pg_msg_free(m); term PgConn { sock: c.sock, pid: -1, key: 0 }; };
         let pid: Int = get_u32_be(m.body, 0);
         let key: Int = get_u32_be(m.body, 4);
         pg_msg_free(m);
@@ -274,7 +298,9 @@ defn pg_close(c: PgConn) -> Void {
     let empty: GrowBuf = grow_new(1);
     pg_send_msg(c, 88, empty);              // 'X' = 88
     grow_free(empty);
-    sock_close(c.sock);
+    when c.sock.fd >= -4096 {
+        sock_close(c.sock);
+    };
     term;
 };
 
@@ -341,6 +367,7 @@ defn pg_read_result_loop(c: PgConn, acc: PgResult) -> PgResult {
     };
     when m.mtype == PG_ROWDESC {
         // RowDescription: first 2 bytes = field count (i16be).
+        when m.body.len < 2 { pg_msg_free(m); term pg_read_result_loop(c, acc); };
         let ncols: Int = get_u16_be(m.body, 0);
         pg_msg_free(m);
         term pg_read_result_loop(c, PgResult { ok: acc.ok, ncols: ncols, nrows: acc.nrows, fields: acc.fields, err_code: acc.err_code, err_msg: acc.err_msg });
@@ -365,6 +392,9 @@ defn pg_read_result_loop(c: PgConn, acc: PgResult) -> PgResult {
 // -1 is SQL NULL, decoded as the empty String). Fields are appended in column
 // order; nrows increments by one.
 defn pg_decode_datarow(m: PgMsg, acc: PgResult) -> PgResult {
+    when m.body.len < 2 {
+        term PgResult { ok: false, ncols: acc.ncols, nrows: acc.nrows, fields: acc.fields, err_code: "", err_msg: "truncated DataRow" };
+    };
     let ncol: Int = get_u16_be(m.body, 0);
     let appended: List<String> = pg_decode_fields(m, acc.fields, ncol, 0, 2);
     term PgResult { ok: acc.ok, ncols: acc.ncols, nrows: acc.nrows + 1, fields: appended, err_code: acc.err_code, err_msg: acc.err_msg };
@@ -380,11 +410,17 @@ defn pg_decode_fields(m: PgMsg, fields: List<String>, ncol: Int, col: Int, off: 
     when col >= ncol {
         term fields;
     };
+    when off < 0 || off + 4 > m.body.len {
+        term fields;
+    };
     let flen: Int = pg_read_i32_at(m.body, off);
     when flen < 0 {
         // SQL NULL: empty string, advance past the 4 length bytes only.
         let withnull: List<String> = fields + [""];
         term pg_decode_fields(m, withnull, ncol, col + 1, off + 4);
+    };
+    when flen < 0 || off + 4 + flen > m.body.len {
+        term fields;
     };
     let text: String = buf_slice_string(m.body, off + 4, flen);
     let grown: List<String> = fields + [text];
@@ -398,6 +434,9 @@ defn pg_read_i32_at(buf: ByteBuf, off: Int)
     [off >= 0 && off + 4 <= buf.len][true]
     -> Int
 {
+    when off < 0 || off + 4 > buf.len {
+        term 0;
+    };
     let u: Int = get_u32_be(buf, off);
     when u >= 2147483648 {
         term u - 4294967296;
@@ -430,6 +469,7 @@ defn pg_error_field(m: PgMsg, want: Int, off: Int)
     };
     let vlen: Int = pg_cstr_len(m.body, off + 1);
     when ftype == want {
+        when off + 1 + vlen > m.body.len { term ""; };
         term buf_slice_string(m.body, off + 1, vlen);
     };
     // skip this field: 1 type byte + vlen value bytes + 1 NUL.
@@ -461,7 +501,8 @@ defn pg_cstr_len_acc(buf: ByteBuf, off: Int, n: Int)
 // then read the result to ReadyForQuery. Text-format columns. For one-off
 // statements with no parameters (e.g. SELECT 1, DDL).
 defn pg_simple_query(c: PgConn, sql: String) -> PgResult {
-    let payload: GrowBuf = grow_new(CharCount#(sql) + 1).put_cstr(sql);
+    let payload_cap: Int = max_int(CharCount#(sql) + 1, 1);
+    let payload: GrowBuf = grow_new(payload_cap).put_cstr(sql);
     let rc: Int = pg_send_msg(c, 81, payload);        // 'Q' = 81
     grow_free(payload);
     when rc < 0 {
@@ -492,9 +533,14 @@ defn pg_simple_query(c: PgConn, sql: String) -> PgResult {
 // `params`.
 defn pg_exec(c: PgConn, sql: String, params: List<String>) -> PgResult {
     let np: Int = params.Count#();
+    when np < 0 {
+        let e: List<String> = [];
+        term PgResult { ok: false, ncols: 0, nrows: 0, fields: e, err_code: "", err_msg: "invalid parameter count" };
+    };
+    let parse_cap: Int = max_int(CharCount#(sql) + 8, 1);
     // Parse 'P': name(cstr, empty) + query(cstr) + param-type-count(i16be, 0 =
     // let the server infer all types).
-    let parse: GrowBuf = grow_new(CharCount#(sql) + 8)
+    let parse: GrowBuf = grow_new(parse_cap)
         .put_u8(0)                     // unnamed statement: empty cstr (just NUL)
         .put_cstr(sql)
         .put_u16_be(0);                // 0 parameter type OIDs (infer)

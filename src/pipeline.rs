@@ -1036,11 +1036,9 @@ pub fn module_plugin_factory(
     let root_is_browser = get_extension(&root_file_path) == ".rbv";
     Box::new(move |module_path| {
         // 2026-10-25: a browser root imports target-neutral `.bv` app modules
-        // into the same WebAssembly program. Give those modules the root's
-        // web prelude; applying native `.bv` prelude as well injects a second
-        // `byte_at` beside the portable definition and makes import order
-        // ambiguous. Explicit foreign dialect files retain their own prelude.
-        // Undo when module target capability is explicit in import metadata.
+        // into the same WebAssembly program. Give those modules the root's web
+        // prelude; the native `.bv` prelude would inject a second `byte_at`
+        // beside the portable definition. Explicit foreign dialects keep theirs.
         let module_is_briev = get_extension(module_path) == ".bv";
         let plugin_path = if root_is_browser && module_is_briev {
             root_file_path.as_str()
@@ -1442,7 +1440,6 @@ mod tests {
         std::fs::write(&helper, "obj HelperValue { value: Int; };").unwrap();
         let source = "import \"./helper.bv\";\nlet value: HelperValue = HelperValue { value: 1 };\n<view><p b-text=\"value.value\">1</p></view>";
         std::fs::write(&root, source).unwrap();
-
         let opts = BuildOptions {
             file_path: root.to_string_lossy().to_string(),
             stdlib_path: Some(crate::resource_root().join("lib").to_string_lossy().to_string()),

@@ -12,6 +12,7 @@
 
 mod output_inference;
 mod call_literals;
+mod elaboration_scope;
 mod validate;
 pub use validate::*;
 
@@ -25,6 +26,15 @@ use crate::type_universe::{
 use std::collections::HashMap;
 
 /// Type-check context: variable bindings and type universe.
+thread_local! {
+    /// Proven-dead guards collected during inference, keyed by
+    /// (function, preorder ordinal, required condition). A post-pass lowers
+    /// them out of the AST so the backend emits no runtime branch.
+    static PROVEN_GUARDS: std::cell::RefCell<
+        std::collections::HashSet<(String, usize, String)>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
 pub struct TypecheckContext<'a> {
     pub bindings: HashMap<String, Type>,
     /// 2026-07-18: Names of state-level bindings (top-level let, state fields,
@@ -42,6 +52,14 @@ pub struct TypecheckContext<'a> {
     /// program (defns, txns, imported bodies). Used to validate a declared
     /// `op` binding's implementation target actually exists.
     pub defined_fns: std::collections::HashSet<String>,
+    /// 2026-10-26: enclosing defn/txn name for dev guard audits.
+    pub current_fn_name: Option<String>,
+    /// 2026-10-26: preorder ordinal of guarded statements in this function.
+    pub guard_ordinal: usize,
+    /// 2026-10-26: parameters of the current body and locals that shadow a
+    /// global constant. Constant unfolding must skip these.
+    pub param_names: std::collections::HashSet<String>,
+    pub local_shadows: std::collections::HashSet<String>,
     /// 2026-08-01 (Phase 3): locals consumed by a `~op` (`a ~= b`, `dest ~<-
     /// src`, `~<- src;`). Reading a consumed local afterward is a use-after-move
     /// compile error; reassigning it (via `=` or `let`) clears the mark.
@@ -240,6 +258,10 @@ impl<'a> TypecheckContext<'a> {
             fn_contracts: HashMap::new(),
             constant_defs: HashMap::new(),
             known_facts: Vec::new(),
+            current_fn_name: None,
+            guard_ordinal: 0,
+            param_names: std::collections::HashSet::new(),
+            local_shadows: std::collections::HashSet::new(),
             in_defn: false,
             current_output_type: None,
             type_protocols: HashMap::new(),
@@ -2037,36 +2059,11 @@ fn infer_call(name: &str, args: &[Expr], ctx: &mut TypecheckContext) -> Result<T
             &contract.params,
             args,
         );
-        // Fold compile-time constants in the goal (`SYS_OPEN` → 2). Constants
-        // are immutable by declaration, so this is pure substitution.
-        if !ctx.constant_defs.is_empty() {
-            // Only unfold names that are not locally bound: a std helper's
-            // `total` parameter must not pick up a program-level `const total`.
-            let live: Vec<&String> = ctx
-                .constant_defs
-                .keys()
-                .filter(|n| !ctx.bindings.contains_key(*n))
-                .collect();
-            if !live.is_empty() {
-                let names: Vec<String> = live.iter().map(|n| (*n).clone()).collect();
-                let values: Vec<crate::ast::Expr> = names
-                    .iter()
-                    .map(|n| ctx.constant_defs[n].clone())
-                    .collect();
-                // Constants may be defined in terms of other constants
-                // (`UART_CR1 = UART_BASE + 0x0C`): unfold to a fixpoint.
-                for _ in 0..8 {
-                    let before = goal.clone();
-                    goal = crate::proof_engine::callgate::substitute_params(
-                        &goal, &names, &values,
-                    );
-                    if goal == before {
-                        break;
-                    }
-                }
-            }
+        // Fold constants in the goal and facts together; see fold_constants.
+        let verdict = prove_with_constants(&goal, ctx);
+        if verdict == crate::proof_engine::callgate::Verdict::Proven {
+            crate::proof_engine::ledger::record("contract", "typecheck-only");
         }
-        let verdict = crate::proof_engine::callgate::prove_precondition(&goal, &ctx.known_facts);
         if verdict != crate::proof_engine::callgate::Verdict::Proven {
             // Rollout stage (config/contracts.dbvl `policy:` row): `allow`
             // (migration) rejects nothing, `warn` announces, `deny` is the
@@ -2827,6 +2824,8 @@ fn elaborate_ops(items: &mut [TopLevel], universe: &TypeUniverse, env: &CheckEnv
                     crate::proof_engine::callgate::facts_of(&d.contract.pre_condition),
                 );
                 ctx.in_defn = true;
+                ctx.param_names = d.parameters.iter().map(|(n, _)| n.clone()).collect();
+                ctx.local_shadows.clear();
                 elaborate_stmts(&mut d.body, &mut ctx, &mut errors);
                 ctx.in_defn = false;
                 elaborate_expr(&mut d.contract.pre_condition, &mut ctx, &mut errors);
@@ -2852,6 +2851,8 @@ fn elaborate_ops(items: &mut [TopLevel], universe: &TypeUniverse, env: &CheckEnv
                 ctx.known_facts.extend(
                     crate::proof_engine::callgate::facts_of(&t.contract.pre_condition),
                 );
+                ctx.param_names = t.parameters.iter().map(|(n, _)| n.clone()).collect();
+                ctx.local_shadows.clear();
                 elaborate_stmts(&mut t.body, &mut ctx, &mut errors);
                 ctx.known_facts.truncate(fact_base);
                 elaborate_expr(&mut t.contract.pre_condition, &mut ctx, &mut errors);
@@ -2925,6 +2926,9 @@ fn elaborate_stmt(stmt: &mut Statement, ctx: &mut TypecheckContext, errors: &mut
                 }
             }
             record_component_post_facts(expr.as_ref(), names, ctx);
+            if names.is_empty() {
+                record_call_post_facts(expr.as_ref(), name, ctx);
+            }
         }
         Statement::Assign(l, r) => {
             elaborate_expr(l, ctx, errors);
@@ -2960,24 +2964,40 @@ fn elaborate_stmt(stmt: &mut Statement, ctx: &mut TypecheckContext, errors: &mut
         Statement::Block(body) | Statement::SyncBlock(body)
         | Statement::Defer(body) | Statement::Mutex(body) => elaborate_stmts(body, ctx, errors),
         Statement::Foreach { item, list, body } => {
-            elaborate_expr(list, ctx, errors);
-            // 2026-10-25: elaboration needs the same iterator-item type as
-            // checking. Otherwise casts of loop variables fail inference and
-            // declared operators survive as raw arithmetic on collection handles.
-            let previous = ctx.bindings.get(item).cloned();
-            if let Ok(list_ty) = infer_type_only(list, ctx) {
-                let element_ty = foreach_item_type(ctx, &list_ty);
-                ctx.bindings.insert(item.clone(), element_ty);
-            }
-            let fact_base = ctx.known_facts.len();
-            ctx.known_facts.extend(foreach_range_facts(list, item));
-            elaborate_stmts(body, ctx, errors);
-            ctx.known_facts.truncate(fact_base);
-            if let Some(ty) = previous { ctx.bindings.insert(item.clone(), ty); }
-            else { ctx.bindings.remove(item); }
+            elaborate_foreach(item, list, body, ctx, errors)
         }
         _ => {}
     }
+}
+
+// 2026-10-21: operator elaboration needs the same declared element binding as
+// type checking. Otherwise `result += [item as String]` loses its concat op
+// and reaches codegen as integer addition of collection handles. Restore the
+// lexical environment after the loop, including shadowed names and facts.
+fn elaborate_foreach(
+    item: &str,
+    list: &mut Expr,
+    body: &mut [Statement],
+    ctx: &mut TypecheckContext,
+    errors: &mut Vec<TypeError>,
+) {
+    elaborate_expr(list, ctx, errors);
+    let list_ty = match infer_type_only(list, ctx) {
+        Ok(ty) => ty,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+    let bindings = ctx.bindings.clone();
+    let facts = ctx.known_facts.clone();
+    ctx.bindings.insert(item.to_string(), foreach_item_type(ctx, &list_ty));
+    ctx.known_facts.extend(foreach_range_facts(list, item));
+    ctx.foreach_depth += 1;
+    elaborate_stmts(body, ctx, errors);
+    ctx.foreach_depth -= 1;
+    ctx.known_facts = facts;
+    ctx.bindings = bindings;
 }
 
 fn elaborate_expr(expr: &mut Expr, ctx: &mut TypecheckContext, errors: &mut Vec<TypeError>) {
@@ -3031,15 +3051,7 @@ fn elaborate_expr_children(expr: &mut Expr, ctx: &mut TypecheckContext, errors: 
                 elaborate_expr(e, ctx, errors);
             }
         }
-        Expr::Match(scrut, arms) => {
-            elaborate_expr(scrut, ctx, errors);
-            for arm in arms.iter_mut() {
-                if let Some(g) = &mut arm.guard {
-                    elaborate_expr(g, ctx, errors);
-                }
-                elaborate_expr(&mut arm.body, ctx, errors);
-            }
-        }
+        Expr::Match(scrut, arms) => elaboration_scope::expression_match(scrut, arms, ctx, errors),
         Expr::Call(_, args, _) => {
             for a in args.iter_mut() {
                 elaborate_expr(a, ctx, errors);
@@ -3358,7 +3370,9 @@ fn infer_unary_op(
     match kind {
         UnaryOpKind::Neg => {
             let type_str = format!("{}", ty);
-            if type_str == "Int" || type_str == "Float" {
+            if ctx.operand_implements_protocol(&ty, "Int")
+                || ctx.operand_implements_protocol(&ty, "Float")
+            {
                 Ok(ty)
             } else {
                 Err(TypeError::InvalidOperation {
@@ -3431,6 +3445,10 @@ fn infer_match(
     let mut result_ty: Option<Type> = None;
 
     for arm in arms {
+        // 2026-10-26: arm-local facts must not leak into sibling arms. A
+        // terminating guard in one arm (e.g. `when discard { term ... }`)
+        // otherwise refutes the opposite guard in the next arm.
+        let fact_base = ctx.known_facts.len();
         let mut saved: Vec<(String, Option<Type>)> = Vec::new();
         let mut binds: Vec<(String, Type)> = Vec::new();
 
@@ -3546,6 +3564,7 @@ fn infer_match(
             ctx.bindings.insert(n.clone(), t.clone());
         }
         let ty = infer_type_only(&arm.body, ctx);
+        ctx.known_facts.truncate(fact_base);
         for (n, prev) in saved {
             match prev {
                 Some(p) => {
@@ -3762,6 +3781,108 @@ fn record_call_post_facts(
     ctx.known_facts.extend(facts);
 }
 
+/// 2026-10-26: collect identifier assignments in a loop body. Nested foreach
+/// assignments are recorded separately so counter induction can reject them.
+fn collect_loop_assignments(
+    stmts: &[Statement],
+    nested: bool,
+    out: &mut Vec<(String, Expr, bool)>,
+) {
+    for st in stmts {
+        match st {
+            Statement::Assign(Expr::Identifier(name), rhs) => {
+                out.push((name.clone(), rhs.clone(), nested));
+            }
+            Statement::ArrowAssign { target: Some(t), .. } => {
+                if let Expr::Identifier(name) = t.as_ref() {
+                    out.push((name.clone(), Expr::Bool(false), nested));
+                }
+            }
+            Statement::Block(body) | Statement::Guarded(_, body) => {
+                collect_loop_assignments(body, nested, out);
+            }
+            Statement::Foreach { body, .. } => {
+                collect_loop_assignments(body, true, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `count = count + 1` induction for `foreach i in start..end`: at the body
+/// head `count <= i - start`; after the loop `count <= end - start` when the
+/// range is non-empty. Only variables initialized to zero and assigned by
+/// exactly one non-nested increment qualify.
+fn foreach_counter_facts(
+    list: &Expr,
+    item: &str,
+    body: &[Statement],
+    ctx: &TypecheckContext,
+) -> (Vec<Expr>, Vec<Expr>, Vec<String>) {
+    let Expr::Range { start, end, .. } = list else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let mut assigns: Vec<(String, Expr, bool)> = Vec::new();
+    collect_loop_assignments(body, false, &mut assigns);
+    let assigned: Vec<String> = {
+        let mut v: Vec<String> = assigns.iter().map(|(n, _, _)| n.clone()).collect();
+        v.sort(); v.dedup(); v
+    };
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    for name in &assigned {
+        let mine: Vec<&(String, Expr, bool)> = assigns.iter().filter(|(n, _, _)| n == name).collect();
+        if mine.len() != 1 || mine[0].2 { continue; }
+        let increment = matches!(
+            &mine[0].1,
+            Expr::BinaryOp(BinaryOpKind::Add, l, r)
+                if matches!(l.as_ref(), Expr::Identifier(n) if n == name)
+                    && matches!(r.as_ref(), Expr::Decimal(1))
+        );
+        if !increment { continue; }
+        let zero = Expr::BinaryOp(
+            BinaryOpKind::Eq,
+            Box::new(Expr::Identifier(name.clone())),
+            Box::new(Expr::Decimal(0)),
+        );
+        if prove_with_constants(&zero, ctx) != crate::proof_engine::callgate::Verdict::Proven {
+            continue;
+        }
+        pre.push(Expr::BinaryOp(
+            BinaryOpKind::Ge,
+            Box::new(Expr::Identifier(name.clone())),
+            Box::new(Expr::Decimal(0)),
+        ));
+        pre.push(Expr::BinaryOp(
+            BinaryOpKind::Le,
+            Box::new(Expr::Identifier(name.clone())),
+            Box::new(Expr::BinaryOp(
+                BinaryOpKind::Sub,
+                Box::new(Expr::Identifier(item.to_string())),
+                start.clone(),
+            )),
+        ));
+        let ordered = Expr::BinaryOp(BinaryOpKind::Le, start.clone(), end.clone());
+        if prove_with_constants(&ordered, ctx) == crate::proof_engine::callgate::Verdict::Proven {
+            post.push(Expr::BinaryOp(
+                BinaryOpKind::Ge,
+                Box::new(Expr::Identifier(name.clone())),
+                Box::new(Expr::Decimal(0)),
+            ));
+            post.push(Expr::BinaryOp(
+                BinaryOpKind::Le,
+                Box::new(Expr::Identifier(name.clone())),
+                Box::new(Expr::BinaryOp(
+                    BinaryOpKind::Sub,
+                    end.clone(),
+                    start.clone(),
+                )),
+            ));
+        }
+    }
+    (pre, post, assigned)
+}
+
 /// Range facts established inside `foreach i in a..b` (or `a..=b`): the loop
 /// item is bounded by the range endpoints. Only simple endpoints are used —
 /// an endpoint expression with effects could change while the fact is live.
@@ -3776,6 +3897,11 @@ fn foreach_range_facts(list: &Expr, item: &str) -> Vec<Expr> {
             Expr::Identifier(_) | Expr::Decimal(_) => true,
             Expr::Field(base, _) => simple(base),
             Expr::Cast(inner, _) => simple(inner),
+            // 2026-10-26: arithmetic endpoints are stable when their leaves
+            // are simple: `(a + 1)..n`, `(idx + 1)..len`. These are ubiqui-
+            // tous in index loops and previously produced no loop facts.
+            Expr::UnaryOp(_, inner) => simple(inner),
+            Expr::BinaryOp(_, l, r) => simple(l) && simple(r),
             _ => false,
         }
     }
@@ -3794,6 +3920,65 @@ fn foreach_range_facts(list: &Expr, item: &str) -> Vec<Expr> {
         end.clone(),
     ));
     facts
+}
+
+/// 2026-10-26: unfold top-level constants in an expression, skipping names
+/// that the current body shadows. Constants are immutable; this is pure
+/// substitution. Used symmetrically on goals AND facts so symbolic facts such
+/// as `size - WORKER_FRAME_HEADER >= 0` still match a folded goal.
+fn fold_constants(expr: &Expr, ctx: &TypecheckContext) -> Expr {
+    if ctx.constant_defs.is_empty() {
+        return expr.clone();
+    }
+    let live: Vec<&String> = ctx
+        .constant_defs
+        .keys()
+        .filter(|n| !ctx.param_names.contains(*n) && !ctx.local_shadows.contains(*n))
+        .collect();
+    if live.is_empty() {
+        return expr.clone();
+    }
+    let names: Vec<String> = live.iter().map(|n| (*n).clone()).collect();
+    let values: Vec<Expr> = names.iter().map(|n| ctx.constant_defs[n].clone()).collect();
+    let mut out = expr.clone();
+    for _ in 0..8 {
+        let before = out.clone();
+        out = crate::proof_engine::callgate::substitute_params(&out, &names, &values);
+        if out == before {
+            break;
+        }
+    }
+    out
+}
+
+fn prove_with_constants(goal: &Expr, ctx: &TypecheckContext) -> crate::proof_engine::callgate::Verdict {
+    let goal = fold_constants(goal, ctx);
+    let facts: Vec<Expr> = ctx
+        .known_facts
+        .iter()
+        .map(|f| fold_constants(f, ctx))
+        .collect();
+    crate::proof_engine::callgate::prove_precondition(&goal, &facts)
+}
+
+/// 2026-10-26: dev-only guard audit. For `when !(cond) { trap; }`, ask the
+/// prover whether `cond` already follows from the facts live before the guard.
+/// `BRIEV_AUDIT_GUARDS=1` prints one line per guard; it never changes checking.
+fn audit_guard_condition(cond: &Expr, ctx: &TypecheckContext) {
+    if std::env::var_os("BRIEV_AUDIT_GUARDS").is_none() {
+        return;
+    }
+    let Expr::UnaryOp(crate::ast::UnaryOpKind::Not, inner) = cond else {
+        return;
+    };
+    let verdict = prove_with_constants(inner, ctx);
+    let label = match verdict {
+        crate::proof_engine::callgate::Verdict::Proven => "redundant",
+        crate::proof_engine::callgate::Verdict::Refuted => "dead",
+        crate::proof_engine::callgate::Verdict::Unproven => "unproven",
+    };
+    let name = ctx.current_fn_name.as_deref().unwrap_or("<top>");
+    eprintln!("AUDIT {label} [{name}]: {inner}");
 }
 
 /// Infer the type of a statement.
@@ -3823,7 +4008,10 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
             // Result/when is the idiom, not an assertion). There is no
             // runtime check to emit — the backend no-op is correct by this
             // ruling and the interpreter's runtime enforcement retires.
-            let verdict = crate::proof_engine::callgate::prove_precondition(cond, &ctx.known_facts);
+            let verdict = prove_with_constants(cond, ctx);
+            if verdict == crate::proof_engine::callgate::Verdict::Proven {
+                crate::proof_engine::ledger::record("check", "typecheck-only");
+            }
             if verdict != crate::proof_engine::callgate::Verdict::Proven {
                 // Same rollout stage as the call gate
                 // (config/contracts.dbvl `policy:`; ContractGatePolicy).
@@ -3902,7 +4090,7 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
             }
             // 2026-07-25: Tuple destructuring or single let.
             if names.len() > 1 {
-                return check_let_destructure(names, expr, ctx);
+                return check_let_destructure(names, expr, ty.as_ref(), ctx);
             }
             if names.len() == 1 && names[0] == "_" {
                 // 2026-07-25: Discard binding — evaluate expr but don't bind.
@@ -4036,6 +4224,11 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
                 }
             }
             let resolved = ty.clone().unwrap_or(inferred);
+            for n in std::iter::once(&*name).chain(names.iter()) {
+                if ctx.constant_defs.contains_key(n) {
+                    ctx.local_shadows.insert(n.clone());
+                }
+            }
             ctx.bindings.insert(name.clone(), resolved);
             record_call_post_facts(expr.as_ref(), name, ctx);
             Ok(())
@@ -4380,6 +4573,29 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
         }
         Statement::Guarded(cond, body) => {
             infer_type_only(cond, ctx)?;
+            let ordinal = ctx.guard_ordinal;
+            ctx.guard_ordinal += 1;
+            let is_assertion_guard = body.iter().any(|s| matches!(s, Statement::Trap));
+            if is_assertion_guard {
+                if let Expr::UnaryOp(crate::ast::UnaryOpKind::Not, inner) = cond {
+                    if prove_with_constants(inner, ctx)
+                        == crate::proof_engine::callgate::Verdict::Proven
+                    {
+                        if let Some(name) = ctx.current_fn_name.clone() {
+                            PROVEN_GUARDS.with(|set| {
+                                set.borrow_mut().insert((
+                                    name,
+                                    ordinal,
+                                    inner.to_string(),
+                                ));
+                            });
+                        }
+                    }
+                }
+            }
+            if ctx.in_defn && is_assertion_guard {
+                audit_guard_condition(cond, ctx);
+            }
             // 2026-10-19 (contract tiers, Option 1): a guard ESTABLISHES its
             // condition as fact inside the body — this is exactly how
             // bounds-checked reads discharge (`when off + 4 <= buf.len {
@@ -4432,9 +4648,15 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
             // return, substituted with the concrete generic args. Never a
             // hardcoded Int.
             let element_ty = foreach_item_type(ctx, &list_ty);
+            if ctx.constant_defs.contains_key(item) {
+                ctx.local_shadows.insert(item.clone());
+            }
             ctx.bindings.insert(item.clone(), element_ty);
             let fact_base = ctx.known_facts.len();
+            let (counter_pre, counter_post, assigned) =
+                foreach_counter_facts(list, item, body, ctx);
             ctx.known_facts.extend(foreach_range_facts(list, item));
+            ctx.known_facts.extend(counter_pre);
             ctx.foreach_depth += 1;
             for stmt in body {
                 if let Err(e) = infer_statement(stmt, ctx) {
@@ -4445,6 +4667,14 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
             }
             ctx.foreach_depth -= 1;
             ctx.known_facts.truncate(fact_base);
+            // The body may have mutated these locals; pre-loop facts about
+            // them are no longer valid after the loop.
+            ctx.known_facts.retain(|f| {
+                !assigned.iter().any(|n| {
+                    crate::proof_engine::callgate::mentions(f, n)
+                })
+            });
+            ctx.known_facts.extend(counter_post);
             Ok(())
         }
         // 2026-08-17 (foreach break): `break;` is valid only lexically inside
@@ -4490,15 +4720,28 @@ pub fn infer_statement(stmt: &Statement, ctx: &mut TypecheckContext) -> Result<(
 fn check_let_destructure(
     names: &[String],
     expr: &Option<Expr>,
+    declared: Option<&Type>,
     ctx: &mut TypecheckContext,
 ) -> Result<(), TypeError> {
-    // 2026-07-25: Always bind destructured names — type is Int as fallback.
+    // 2026-10-26: never swallow an inference error into Int fallbacks — that
+    // hid the real component types and produced mismatches far from the
+    // binding. A tuple annotation still types the no-initializer form.
+    let declared_elems = match declared {
+        Some(Type::Tuple(types)) => Some(types.clone()),
+        _ => None,
+    };
     let elem_types = match expr {
-        Some(e) => match infer_type_only(e, ctx) {
-            Ok(Type::Tuple(types)) => types,
-            _ => vec![Type::int(); names.len()],
+        Some(e) => match infer_type_only(e, ctx)? {
+            Type::Tuple(types) => types,
+            found => {
+                return Err(TypeError::TypeMismatch {
+                    expected: "tuple".to_string(),
+                    found: format!("{}", found),
+                    context: format!("destructuring let ({})", names.join(", ")),
+                });
+            }
         },
-        None => vec![Type::int(); names.len()],
+        None => declared_elems.unwrap_or_else(|| vec![Type::int(); names.len()]),
     };
     let count = elem_types.len().min(names.len());
     for i in 0..count {
@@ -4905,6 +5148,8 @@ pub fn check_program_with_target(
     isr_mechanism: Option<&str>,
     surface_electronics: bool,
 ) -> Result<(), Vec<TypeError>> {
+    PROVEN_GUARDS.with(|set| set.borrow_mut().clear());
+    crate::proof_engine::ledger::clear();
     // 2026-08-22 (Phase 5, SPEC §8.5): the parser's relationship list is
     // SYNTACTIC — a bare name becomes the refinement parent whether or not
     // it names a trait. Here, with the trait registry known, reclassify:
@@ -6123,6 +6368,9 @@ pub fn check_program_with_target(
         errors.extend(elaborate_ops(items, universe, &env));
     }
     if errors.is_empty() {
+        let proven = PROVEN_GUARDS.with(|set| set.borrow().clone());
+        eliminate_proven_guards(items, &proven);
+        crate::proof_engine::ledger::dump();
         Ok(())
     } else {
         Err(errors)
@@ -6637,6 +6885,91 @@ fn make_typecheck_context<'a>(env: &CheckEnv<'a>, universe: &'a TypeUniverse) ->
     ctx
 }
 
+/// 2026-10-26: compiler-owned guard elimination. A guard `when !(cond) ...`
+/// whose `cond` is proven true is dead; remove it after all proofs have run.
+/// Source guards stay in the program as intent/documentation.
+fn eliminate_proven_guards(
+    items: &mut [TopLevel],
+    proven: &std::collections::HashSet<(String, usize, String)>,
+) {
+    let mut lowered: std::collections::HashSet<(String, usize, String)> =
+        std::collections::HashSet::new();
+    for item in items.iter_mut() {
+        match item {
+            TopLevel::Definition(d) => {
+                let mut ord = 0;
+                lower_guards(&mut d.body, &d.name, &mut ord, proven, &mut lowered);
+            }
+            TopLevel::Transaction(t) => {
+                let mut ord = 0;
+                lower_guards(&mut t.body, &t.name, &mut ord, proven, &mut lowered);
+            }
+            TopLevel::Export(e) => {
+                let mut one = vec![(*e.inner).clone()];
+                eliminate_proven_guards(&mut one, proven);
+                if let Some(TopLevel::Definition(_) | TopLevel::Transaction(_)) = one.first() {
+                    *e.inner = one.remove(0);
+                }
+            }
+            _ => {}
+        }
+    }
+    if std::env::var_os("BRIEV_PROOF_LEDGER").is_some() {
+        eprintln!(
+            "PROOF_LEDGER family=guard proven={} lowered={} unconsumed={}",
+            proven.len(),
+            lowered.len(),
+            proven.difference(&lowered).count()
+        );
+        for (fn_name, ord, cond) in proven.difference(&lowered) {
+            crate::proof_engine::ledger::record("guard", "UNCONSUMED");
+            eprintln!(
+                "PROOF_LEDGER UNCONSUMED family=guard fn={fn_name} ordinal={ord} cond={cond}"
+            );
+        }
+    }
+}
+
+fn lower_guards(
+    stmts: &mut [Statement],
+    fn_name: &str,
+    ord: &mut usize,
+    proven: &std::collections::HashSet<(String, usize, String)>,
+    lowered: &mut std::collections::HashSet<(String, usize, String)>,
+) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Statement::Guarded(cond, body) => {
+                let this = *ord;
+                *ord += 1;
+                let key_cond = match cond {
+                    Expr::UnaryOp(crate::ast::UnaryOpKind::Not, inner) => inner.to_string(),
+                    _ => cond.to_string(),
+                };
+                // Always descend so nested guard ordinals stay aligned, then
+                // drop a proven-dead guard itself.
+                lower_guards(body, fn_name, ord, proven, lowered);
+                let key = (fn_name.to_string(), this, key_cond);
+                if proven.contains(&key) {
+                    lowered.insert(key);
+                    *stmt = Statement::Block(Vec::new());
+                    crate::proof_engine::ledger::record("guard", "guard-elimination");
+                }
+            }
+            Statement::Block(body)
+            | Statement::SyncBlock(body)
+            | Statement::Defer(body)
+            | Statement::Mutex(body) => {
+                lower_guards(body, fn_name, ord, proven, lowered)
+            }
+            Statement::Foreach { body, .. } => {
+                lower_guards(body, fn_name, ord, proven, lowered)
+            }
+            _ => {}
+        }
+    }
+}
+
 fn check_top_level<'a>(
     item: &TopLevel,
     universe: &'a TypeUniverse,
@@ -6680,6 +7013,10 @@ fn check_top_level<'a>(
             let fact_base = ctx.known_facts.len();
             ctx.known_facts.extend(own_pre);
             ctx.in_defn = true;
+            ctx.current_fn_name = Some(defn.name.clone());
+            ctx.guard_ordinal = 0;
+            ctx.param_names = defn.parameters.iter().map(|(n, _)| n.clone()).collect();
+            ctx.local_shadows.clear();
             for stmt in &defn.body {
                 infer_statement(stmt, &mut ctx)?;
             }
@@ -6701,6 +7038,10 @@ fn check_top_level<'a>(
             let own_pre =
                 crate::proof_engine::callgate::facts_of(&txn.contract.pre_condition);
             ctx.known_facts.extend(own_pre);
+            ctx.current_fn_name = Some(txn.name.clone());
+            ctx.guard_ordinal = 0;
+            ctx.param_names = txn.parameters.iter().map(|(n, _)| n.clone()).collect();
+            ctx.local_shadows.clear();
             for stmt in &txn.body {
                 infer_statement(stmt, &mut ctx)?;
             }
@@ -8384,6 +8725,15 @@ mod tests {
         check_program(&mut items, &universe)
     }
 
+    fn checked_items(src: &str) -> Vec<TopLevel> {
+        let tokens = crate::lexer::tokenize(src).unwrap();
+        let mut p = crate::parser::Parser::new(tokens, src);
+        let mut items = p.parse_program().unwrap();
+        let universe = crate::type_universe::TypeUniverse::new();
+        check_program(&mut items, &universe).expect("program checks");
+        items
+    }
+
     // ── 2026-10-16 (tails plan §2): tail typecheck ─────────────────────────
 
     // ── 2026-10-20 (contract tiers, ruling ii): check = static-only ───────
@@ -8417,6 +8767,32 @@ mod tests {
              defn f() -> Int { let n: Int = 7; check n > 0; term pos(n); };",
         )
         .expect("proven check discharges the downstream contract");
+    }
+
+    /// 2026-10-26: a terminating guard in one match arm must not leak its
+    /// fall-through fact into a sibling arm. Before the fix, the first arm's
+    /// `when b { term ... }` established `!b`, and the false arm's `check b`
+    /// was reported REFUTED instead of simply unproven.
+    #[test]
+    fn match_arm_facts_do_not_leak_between_siblings() {
+        let _deny = DenyGate::install();
+        let errs = check(
+            "defn f(b: Bool) -> Int {\n\
+             match b {\n\
+                 true => { when b { term 1; }; term 2; },\n\
+                 false => { check b; term 3; },\n\
+             }\n\
+             };",
+        )
+        .expect_err("the false arm cannot prove b");
+        assert!(
+            errs.iter().any(|e| format!("{e:?}").contains("cannot be proven")),
+            "expected unproven, not a leaked refutation: {errs:#?}"
+        );
+        assert!(
+            !errs.iter().any(|e| format!("{e:?}").contains("REFUTED")),
+            "arm fact leaked: {errs:#?}"
+        );
     }
 
     /// A refuted check is a compile error under `deny`.
@@ -8503,6 +8879,23 @@ mod tests {
     /// Foreach over a range establishes the item bounds for call-site proofs.
     /// This is what lets a hot payload walk call a bounds-proven accessor
     /// without a redundant per-iteration guard.
+    /// 2026-10-26: a destructuring let must not silently bind Int when the
+    /// initializer is not a tuple. That fallback hid the real component types
+    /// and produced mismatches far from the offending binding.
+    #[test]
+    fn destructuring_non_tuple_initializer_is_error() {
+        let _deny = DenyGate::install();
+        let err = check(
+            "defn pair() -> Int { term 1; }; \
+             defn f() -> Int { let (a, b): (Int, Int) = pair(); term a; };",
+        )
+        .expect_err("non-tuple initializer must be rejected");
+        assert!(
+            err.iter().any(|e| format!("{e}").contains("tuple")),
+            "unexpected errors: {err:?}"
+        );
+    }
+
     #[test]
     fn foreach_range_proves_item_bounds() {
         let _deny = DenyGate::install();
@@ -8514,6 +8907,98 @@ mod tests {
              };",
         )
         .expect("the foreach range facts prove the item bounds");
+    }
+
+    /// A zero-initialized counter incremented once per iteration is bounded
+    /// by the iteration index; the compiler should prove `count < n` inside
+    /// the loop and `count <= n` after it without a guard.
+    #[test]
+    fn foreach_counter_induction_proves_bounds() {
+        let _deny = DenyGate::install();
+        check(
+            "defn need(c: Int, n: Int) [c >= 0 && c < n][term >= 0] -> Int { term c; }; \
+             defn f(n: Int) [n >= 1][term >= 0] -> Int { \
+                 let total: Int = n; \
+                 let count: Int = 0; \
+                 foreach idx in 0..n { let x: Int = need(count, total); count = count + 1; }; \
+                 check count <= total; \
+                 term count; \
+             };",
+        )
+        .expect("counter induction proves the loop and post-loop bounds");
+    }
+
+    /// A proven-dead guard must be lowered out of the AST by the compiler,
+    /// not deleted from the source. `i >= 0` follows from the foreach range.
+    #[test]
+    fn proven_guard_is_eliminated_in_ast() {
+        let items = checked_items(
+            "defn f(n: Int) [n >= 0] -> Int { \
+                 foreach i in 0..n { when !(i >= 0) { trap; }; }; \
+                 term 0; \
+             };",
+        );
+        let body = items
+            .iter()
+            .find_map(|i| match i {
+                TopLevel::Definition(d) if d.name == "f" => Some(&d.body),
+                _ => None,
+            })
+            .expect("defn f");
+        fn walk(stmts: &[Statement], lowered: &mut bool, still_present: &mut bool) {
+            for s in stmts {
+                match s {
+                    Statement::Guarded(_, _) => *still_present = true,
+                    Statement::Block(b) if b.is_empty() => *lowered = true,
+                    Statement::Block(b)
+                    | Statement::SyncBlock(b)
+                    | Statement::Defer(b)
+                    | Statement::Mutex(b) => walk(b, lowered, still_present),
+                    Statement::Foreach { body, .. } => walk(body, lowered, still_present),
+                    _ => {}
+                }
+            }
+        }
+        let mut lowered = false;
+        let mut still_present = false;
+        walk(body, &mut lowered, &mut still_present);
+        assert!(lowered, "the proven guard should lower to an empty block");
+        assert!(!still_present, "no guard statement should remain in f");
+    }
+
+    /// A loop-mutated local must not retain its pre-loop facts after the
+    /// loop. `count` starts at 0 but is incremented; the post-loop check cannot
+    /// be proven from `count == 0`.
+    #[test]
+    fn loop_mutations_invalidate_pre_loop_facts() {
+        let _deny = DenyGate::install();
+        let errs = check(
+            "defn f(n: Int) [n >= 1] -> Int { \
+                 let count: Int = 0; \
+                 foreach idx in 0..n { count = count + 1; }; \
+                 check count == 0; \
+                 term count; \
+             };",
+        )
+        .expect_err("the post-loop count is not known to be zero");
+        assert!(
+            errs.iter().any(|e| format!("{e:?}").contains("cannot be proven")),
+            "expected unproven, not a stale proof: {errs:#?}"
+        );
+    }
+
+    /// Arithmetic range endpoints (`(a + 1)..n`) establish the item bound.
+    #[test]
+    fn foreach_arithmetic_range_proves_item_bounds() {
+        let _deny = DenyGate::install();
+        check(
+            "defn need(i: Int, n: Int) [i >= 1 && i < n][term >= 0] -> Int { term i; }; \
+             defn f(a: Int, n: Int) [a >= 0 && a + 1 < n][term >= 0] -> Int { \
+                 foreach i in (a + 1)..n { let x: Int = need(i, n); }; \
+                 term 0; \
+             };",
+        )
+        .expect("arithmetic range endpoints prove the item bounds");
     }
 
     /// A post fact that a scale is positive proves a multiplied argument
@@ -10587,6 +11072,58 @@ defn concat_demo() -> List<Int> {
             "`+` must elaborate into a call to the stdlib iter_chain, got calls: {calls:?}"
         );
         assert_eq!(add_ops, 0, "no `+` may survive over list operands");
+    }
+
+    #[test]
+    fn foreach_element_binding_survives_operator_elaboration() {
+        let source = r#"
+import "std/collections.bv";
+import "std/iterator.bv";
+defn collect_strings() -> List<String> {
+    let result: List<String> = [];
+    foreach index in 0..3 { result += [index as String]; };
+    term result;
+};
+"#;
+        let (items, _) = crate::library::parse_and_check("foreach_concat.bv", source).unwrap();
+        let mut concatenates = 0;
+        for item in &items {
+            let TopLevel::Definition(defn) = item else { continue };
+            if defn.name != "collect_strings" { continue; }
+            crate::ast::visit::walk_stmts(&defn.body, &mut |expr| {
+                if matches!(expr, Expr::Call(name, _, _) if name == "iter_chain") { concatenates += 1; }
+            });
+        }
+        assert_eq!(concatenates, 1, "loop elements must resolve declared collection operations");
+    }
+
+    #[test]
+    fn match_payload_binding_survives_nested_foreach_elaboration() {
+        let source = r#"
+import "std/collections.bv";
+import "std/iterator.bv";
+enum Batch { Values(List<Int>), Empty };
+defn render(batch: Batch) -> List<String> {
+    match batch {
+        Values(values) => {
+            let result: List<String> = [];
+            foreach value in values { result += [value as String]; };
+            term result;
+        },
+        Empty => { let result: List<String> = []; term result; }
+    };
+};
+"#;
+        let (items, _) = crate::library::parse_and_check("payload_foreach.bv", source).unwrap();
+        let mut found = false;
+        for item in &items {
+            let TopLevel::Definition(defn) = item else { continue };
+            if defn.name != "render" { continue; }
+            crate::ast::visit::walk_stmts(&defn.body, &mut |expr| {
+                if matches!(expr, Expr::Call(name, _, _) if name == "iter_chain") { found = true; }
+            });
+        }
+        assert!(found, "enum payload element types must reach declared collection operators");
     }
 
     /// 2026-10-06: the gate the rewrite must NOT open — mismatched element

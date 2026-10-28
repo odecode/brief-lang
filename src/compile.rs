@@ -2725,7 +2725,7 @@ fn collect_extra_objects(items: &[briev_compiler::ast::TopLevel], resolver: &bri
         match ext.as_deref() {
             Some("c") | Some("cpp") | Some("cc") | Some("cxx") | Some("m") => {
                 let src = resolved_path();
-                let obj = compile_source_to_object(&src, &cache_dir, None)?;
+                let obj = compile_source_to_object(&src, &cache_dir)?;
                 objects.push(obj);
             }
             Some("so") | Some("dylib") | Some("a") | Some("o") => {
@@ -2749,7 +2749,7 @@ fn get_ffi_cache_dir() -> PathBuf {
 
 /// 2026-07-16: P4 — Compile a C/C++ source to a .o object file.
 /// Content-hash cached at ~/.cache/briev-compiler/ffi/<hash>.o.
-fn compile_source_to_object(source_path: &Path, cache_dir: &Path, target_triple: Option<&str>) -> Result<PathBuf, String> {
+fn compile_source_to_object(source_path: &Path, cache_dir: &Path) -> Result<PathBuf, String> {
     let content = std::fs::read(source_path)
         .map_err(|e| format!("cannot read '{}': {}", source_path.display(), e))?;
     // 2026-07-26: Include compiler flags in the cache key so flag changes
@@ -2757,9 +2757,6 @@ fn compile_source_to_object(source_path: &Path, cache_dir: &Path, target_triple:
     let mut hasher = blake3::Hasher::new();
     hasher.update(&content);
     hasher.update(b":flto:fPIC");
-    if let Some(triple) = target_triple {
-        hasher.update(triple.as_bytes());
-    }
     let hash = hasher.finalize();
     let cache_path = cache_dir.join(format!("{}.o", hash.to_hex()));
     if cache_path.exists() {
@@ -2771,15 +2768,8 @@ fn compile_source_to_object(source_path: &Path, cache_dir: &Path, target_triple:
         "cpp" | "cc" | "cxx" => "c++",
         _ => return Err(format!("unknown source extension '{}' for '{}'", ext, source_path.display())),
     };
-    let mut command = Command::new("clang");
-    let compile_triple = target_triple.filter(|triple| triple.contains("linux") || !triple.contains("unknown"));
-    if let Some(triple) = compile_triple {
-        command.arg(format!("--target={}", triple));
-    }
-    if let Some(triple) = compile_triple {
-        hasher.update(triple.as_bytes());
-    }
-    let status = command.args([
+    let status = Command::new("clang")
+        .args([
             "-O3", "-flto", "-march=native", "-ffast-math", "-fPIC",
             "-x", lang_flag,
             "-c",
@@ -2809,8 +2799,28 @@ struct LinkInputs<'a> {
     bootstrap_entry: Option<&'a str>,
 }
 
+/// 2026-10-27: reject invalid emitted IR before clang/llc. This turns
+/// compiler lowering bugs (missing sret slots, width mismatches, undefined SSA)
+/// into Briev diagnostics instead of clang errors or runtime traps.
+fn verify_emitted_ir(ll_path: &str) -> Result<(), String> {
+    let output = Command::new("opt")
+        .args(["-passes=verify", "-disable-output", ll_path])
+        .output()
+        .map_err(|e| format!("cannot invoke opt to verify '{}': {}", ll_path, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "emitted IR failed LLVM verification for '{}':\n{}",
+        ll_path,
+        stderr.trim()
+    ))
+}
+
 fn compile_ll_to_binary(ll_path: &str, binary_path: &str, inputs: LinkInputs<'_>) -> Result<(), String> {
     let LinkInputs { extra_objects, protocol_libs, shared, bad_objects, bootstrap_entry } = inputs;
+    verify_emitted_ir(ll_path)?;
     let ll_text = std::fs::read_to_string(ll_path)
         .map_err(|e| format!("cannot read '{}': {}", ll_path, e))?;
     // Extract target triple from the IR (first line: target triple = "..."`)
@@ -2888,7 +2898,7 @@ fn compile_ll_to_binary(ll_path: &str, binary_path: &str, inputs: LinkInputs<'_>
         });
         if needs_runtime && !has_runtime {
             let cache_dir = get_ffi_cache_dir();
-            let obj = compile_source_to_object(&runtime_c, &cache_dir, Some(&triple))?;
+            let obj = compile_source_to_object(&runtime_c, &cache_dir)?;
             cmd.arg(obj.as_os_str());
         }
         for obj in extra_objects {
@@ -3096,6 +3106,7 @@ fn compile_ll_to_library(ll_path: &str, base: &str, _extra_objects: &[PathBuf]) 
 /// Uses `llc -march=wasm32 -filetype=obj` to produce a .o, then
 /// `wasm-ld` to link into .wasm. This avoids needing a wasm32 clang.
 fn compile_wasm(ll_path: &str, wasm_path: &str, exports: &[String]) -> Result<(), String> {
+    verify_emitted_ir(ll_path)?;
     // 2026-10-25: llc alone does not eliminate self-tail recursion. Ordinary
     // catalogue scans exhausted the WASM stack. Promote local slots and run
     // LLVM's proof-preserving tail-call pass before instruction selection.
@@ -3105,6 +3116,7 @@ fn compile_wasm(ll_path: &str, wasm_path: &str, exports: &[String]) -> Result<()
         .args(["-S", "-passes=mem2reg,tailcallelim", ll_path, "-o", &lowered_path])
         .status().map_err(|error| format!("Could not run LLVM opt: {error}. Install llvm-tools or use --emit-ir-only."))?;
     if !optimized.success() {
+        let _ = std::fs::remove_file(&lowered_path);
         return Err(format!("LLVM could not lower '{ll_path}' for WebAssembly. Check the emitted IR diagnostics."));
     }
     // Step 1: compile .ll to .wasm object file
@@ -3200,6 +3212,22 @@ fn resolve_wasm_linker() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emitted_ir_verifier_rejects_invalid_module() {
+        let path = std::env::temp_dir().join(format!(
+            "briev-invalid-{}.ll",
+            std::process::id()
+        ));
+        std::fs::write(&path, "define i32 @bad() {\n  ret void\n}\n").unwrap();
+        let result = super::verify_emitted_ir(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "invalid IR must be rejected");
+        assert!(
+            result.unwrap_err().contains("verification"),
+            "diagnostic must identify IR verification"
+        );
+    }
+
 
     /// 2026-08-27 (Slice A): an extern source that does not exist is a hard
     /// error naming both symbol and path.
@@ -3666,12 +3694,12 @@ node go [done == false][done == true] {
         with_temp_file(content, |path| {
             let cache_dir = get_ffi_cache_dir();
             // First compilation
-            let result1 = compile_source_to_object(path, &cache_dir, None);
+            let result1 = compile_source_to_object(path, &cache_dir);
             assert!(result1.is_ok(), "first compile failed: {:?}", result1);
             let obj1 = result1.unwrap();
             assert!(obj1.exists(), "object file not created");
             // Same source → same hash → returns cached path (identical)
-            let result2 = compile_source_to_object(path, &cache_dir, None);
+            let result2 = compile_source_to_object(path, &cache_dir);
             assert!(result2.is_ok(), "second compile failed: {:?}", result2);
             let obj2 = result2.unwrap();
             assert_eq!(obj1, obj2, "cached path should match");
@@ -3688,7 +3716,7 @@ node go [done == false][done == true] {
     fn test_compile_source_to_object_bad_ext() {
         let path = Path::new("/tmp/test_bad_ext.xyz");
         std::fs::write(path, "hello").ok();
-        let result = compile_source_to_object(path, &get_ffi_cache_dir(), None);
+        let result = compile_source_to_object(path, &get_ffi_cache_dir());
         assert!(result.is_err(), "expected compile error for unknown extension");
         let _ = std::fs::remove_file(path);
     }

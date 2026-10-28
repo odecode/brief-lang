@@ -1,6 +1,7 @@
 //===----------------------------------------------------------------------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
+// Authored by Otto Westerlund (@odecode); adopted with attribution.
 // 2026-10-21: browser programs need portable types, collections and casts.
 // Linux I/O/environment modules belong to prelude-native, not the browser host.
 // Keep this target choice in configuration; do not recognize web library names

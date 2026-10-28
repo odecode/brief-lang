@@ -1,6 +1,8 @@
 //===----------------------------------------------------------------------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
+// Authored by Otto Westerlund (@odecode); adopted with attribution, see
+// docs/contributors/otto-westerlund.md.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 const source = fs.readFileSync(new URL('../src/glue/web_heap.js', import.meta.url), 'utf8');

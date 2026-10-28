@@ -21,11 +21,11 @@ pub mod vector_phi;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod metadata_tests;
-#[cfg(test)]
 mod match_termination_tests;
 #[cfg(test)]
 mod logical_tests;
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(test)]
 mod crash_regressions;
 
@@ -57,6 +57,38 @@ fn escape_llvm_string(s: &str) -> String {
 /// callees' memory effects — `print_str` reaches `SysCall#` through
 /// `write_all`, and claiming argmemonly there let -O2 delete the buffer
 /// stores before write(2).
+/// Defns that may trap/halt directly or through a callee. Calls to these are
+/// observable even when their result is unused; the defn attribute must not
+/// claim `willreturn` or LLVM can delete the whole call.
+fn compute_transitive_may_trap(items: &[TopLevel]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    fn gather<'a>(item: &'a TopLevel, out: &mut Vec<&'a crate::ast::Definition>) {
+        match item {
+            TopLevel::Definition(d) => out.push(d),
+            TopLevel::Export(e) => gather(&e.inner, out),
+            TopLevel::TypeDef(td) => {
+                for m in &td.body.members { gather(m, out); }
+            }
+            TopLevel::Impl(im) => {
+                for d in &im.functions { out.push(d); }
+            }
+            _ => {}
+        }
+    }
+    let mut defs: Vec<&crate::ast::Definition> = Vec::new();
+    for item in items { gather(item, &mut defs); }
+    let mut called: std::collections::HashMap<&str, HashSet<String>> = std::collections::HashMap::new();
+    let mut may_trap: HashSet<String> = HashSet::new();
+    for d in &defs {
+        let mut calls = HashSet::new();
+        for stmt in &d.body { collect_called_names_stmt(stmt, &mut calls); }
+        if LlvmBackend::definition_may_trap(&d.body) { may_trap.insert(d.name.clone()); }
+        called.insert(d.name.as_str(), calls);
+    }
+    close_over_calls(&mut may_trap, &called);
+    may_trap
+}
+
 fn compute_transitive_raw_memory(items: &[TopLevel]) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     fn gather<'a>(item: &'a TopLevel, out: &mut Vec<&'a crate::ast::Definition>) {
@@ -1084,8 +1116,17 @@ pub(super) fn web_max_flush_entries(ctx: &crate::backend::llvm::context::Compile
     let max = ctx.transition_graph.as_ref()
         .map(|g| g.nodes.iter().map(|n| n.write_set.len()).max().unwrap_or(0))
         .unwrap_or(0);
-    let commits = ctx.web_commit_writes.values().map(|fields| fields.len()).max().unwrap_or(0);
-    max.max(commits).max(1) as u32
+    // 2026-10-21: helper-call writes join the commit batch, so size the buffer
+    // for the largest helper closure and for the union of direct + helper
+    // writes on a node. Without this a helper that writes several fields can
+    // overflow @__web_flush_buf.
+    let helper_max = ctx.web_commit_writes.values().map(|writes| writes.len()).max().unwrap_or(0);
+    let union_max = ctx.transition_graph.as_ref().map(|graph| graph.nodes.iter().map(|node| {
+        ctx.web_commit_writes.get(&node.name).map(|writes|
+            writes.len() + node.write_set.difference(writes).count()
+        ).unwrap_or(node.write_set.len())
+    }).max().unwrap_or(0)).unwrap_or(0);
+    max.max(helper_max).max(union_max).max(1) as u32
 }
 pub(super) fn trg_llvm_storage_ty(ty: &Type, universe: Option<&crate::type_universe::TypeUniverse>) -> String {
     protocol_llvm_type(ty, universe)
@@ -1229,6 +1270,14 @@ pub(super) fn emit_loop_metadata(
     writeln!(out, "{0}br label %{1}, !llvm.loop !{2}", indent, backedge_label, md_idx).ok();
 }
 
+/// Reserve a contiguous module-wide ID range for one metadata family.
+/// 2026-10-22: centralize single nodes and loop bundles to prevent overlaps.
+pub(super) fn reserve_metadata_ids(counter: &mut usize, count: usize) -> usize {
+    let first = *counter;
+    *counter += count;
+    first
+}
+
 /// Same as `emit_loop_metadata` but the caller supplies the backedge text.
 /// Use when the backedge is a conditional branch (br i1) or when multiple
 /// backedges share the same metadata node.
@@ -1266,8 +1315,8 @@ pub(super) fn emit_loop_metadata_nodes(
 
     let entries = md_entries.join(", ");
     writeln!(pending_metadata, "!{0} = !{{!{0}, {1}}}", start, entries).ok();
-    *metadata_counter += md_count;
-    start
+    reserve_metadata_ids(metadata_counter, md_count)
+
 }
 
 fn extract_trigger_keys(pre: &Expr, trigger_names: &std::collections::HashSet<&str>) -> Option<Vec<i64>> {
@@ -2652,11 +2701,6 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
     pub fn generate(&mut self, items: &[TopLevel], exit_condition: Option<Box<Expr>>) -> String {
         self.liveness_fixpoint_extra.clear();
         self.liveness_fixpoint_rounds = 0;
-        // LLVM metadata IDs are module-wide: reserve the root and all TBAA
-        // type nodes before loop, range, and alias metadata are emitted.
-        let tbaa_nodes = self.ctx.type_universe.as_ref().map_or(5, |u| u.types.len());
-        self.ctx.metadata_counter = tbaa_nodes + 1;
-        self.ctx.pending_metadata.clear();
         let entry_warnings = self.warnings.clone();
         // 2026-08-23 (Plan 0.1): consume the pipeline-computed analysis when
         // the caller provided it (.with_analysis); otherwise self-compute —
@@ -2953,6 +2997,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // before the write() syscall — every concat printed empty. Seed with
         // direct touchers, then close over calls (fixpoint, like needs_state).
         self.ctx.defn_touches_raw_memory = compute_transitive_raw_memory(items);
+        self.ctx.defn_may_trap = compute_transitive_may_trap(items);
         // 2026-10-15 (type-dependent member statefulness): concrete types with
         // a state-taking member. A trait default/generic monomorphized onto
         // such a type must itself take `%state` (its specialized body reaches a
@@ -3277,7 +3322,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // defaults out of `defn_params` — cross-module trait-default calls
         // then panicked at emission ("no member 'put_u16_be' on 'GrowBuf'").
         self.ctx.generic_defns.clear();
-        self.ctx.generic_txns.clear();
         self.ctx.generic_defn_type_params.clear();
         // 2026-10-20 (same re-entry class): the specialization bookkeeping is
         // also per-generation. A stale `emitted_defn_specializations` made the
@@ -3338,11 +3382,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     // the call path needs %state marshaling and the void/i64
                     // prototype for zero-param/void callables too.
                     if !t.is_reactive {
-                        if !t.type_params.is_empty() {
-                            self.ctx.generic_txns.insert(t.name.clone(), t.clone());
-                            self.ctx.generic_defn_type_params.insert(t.name.clone(),
-                                t.type_params.iter().map(|parameter| parameter.name.clone()).collect());
-                        }
                         let tys: Vec<Type> = t.parameters.iter().map(|(_, ty)| ty.clone()).collect();
                         self.ctx.defn_params.insert(t.name.clone(), tys);
                         let ret_tys = if !t.outputs.is_empty() {
@@ -3875,12 +3914,14 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             }
         }
  
-        // 2026-10-25: registration above can add enum/object types beyond
-        // the incoming universe. Reserve their TBAA IDs before emitting any
-        // function metadata, including fixpoint re-emission. Retire when all
-        // metadata families allocate through the same module registry.
-        let tbaa_end = self.ctx.type_universe.as_ref().map_or(5, |u| u.types.len()) + 1;
-        self.ctx.metadata_counter = self.ctx.metadata_counter.max(tbaa_end);
+        // 2026-10-26: structural `obj`/TypeDef sizes are first cached while
+        // their fields are registered in declaration order. A field whose own
+        // type is registered later then contributes a provisional size, so the
+        // parent's `bytes` disagrees with `lookup_field_offset` (which sums the
+        // final field sizes) and object allocation under-runs. Recompute to a
+        // fixpoint now that every type is present. Explicit `spec bytes` stay
+        // authoritative; packed/union layouts are already derived per access.
+        self.recompute_structural_sizes();
 
         // 2026-07-13: struct_layout removed from ResolvedType in new AST.
         // TypeUniverse-based struct population is a no-op until slot syntax is reintroduced.
@@ -4407,11 +4448,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         sorted_constants.sort();
         for name in &sorted_constants {
             let (ty, expr) = &self.ctx.constants[name];
-            let llvm_ty = if *ty == Type::int() {
-                format!("i{}", self.ctx.int_bits)
-            } else {
-                protocol_llvm_type(ty, self.ctx.type_universe.as_ref())
-            };
+            // 2026-10-22: constants must honor target-sized flexible Int just
+            // like ordinary values; universe metadata alone may describe the
+            // 64-bit maximum on wasm32. Keep declarations, aliases and reads
+            // on `llvm_type`.
+            let llvm_ty = self.llvm_type(ty);
             let key = match expr {
                 Expr::Float(f) => format!("{}:{}", llvm_ty, float_to_llvm_str(*f, &llvm_ty)),
                 Expr::Decimal(n) => format!("{}:{}", llvm_ty, n),
@@ -4443,11 +4484,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             let (ty, expr) = &self.ctx.constants[name];
             let canonical = alias_map.get(name).cloned().unwrap_or_else(|| name.clone());
             if canonical != *name {
-                let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+                let llvm_ty = self.llvm_type(ty);
                 writeln!(out, "@{} = alias {}, {}* @{}", name, llvm_ty, llvm_ty, canonical).ok();
                 continue;
             }
-            let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+            let llvm_ty = self.llvm_type(ty);
             let val_str = match expr {
                 Expr::Float(f) => float_to_llvm_str(*f, &llvm_ty),
                 Expr::Decimal(n) => n.to_string(),
@@ -4606,6 +4647,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             }
         }
 
+        // 2026-10-22: reserve the complete TBAA prefix AFTER structural type
+        // registration and BEFORE function emission. One module allocator
+        // replaces fixed !50/!99/!100 reservations, including fixpoint reruns.
+        self.ctx.metadata_counter = self.ctx.type_universe.as_ref()
+            .map_or(5, |universe| universe.types.len()) + 1;
+        self.ctx.state_alias_scope_md = reserve_metadata_ids(&mut self.ctx.metadata_counter, 1);
+        self.ctx.pending_metadata.clear();
         let mut range_meta: Vec<String> = Vec::new();
 
         // Definitions
@@ -5564,10 +5612,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
 
         // Attributes
-        if !self.ctx.pending_metadata.is_empty() {
-            writeln!(out, "; Loop metadata").ok();
-            out.push_str(&self.ctx.pending_metadata);
-        }
         writeln!(out).ok();
         // 2026-07-21: Fast-math attributes (tried for nbody vrcpps conversion, but
         // vrcpps only works on vector types — all nbody divisions are scalar fdiv).
@@ -5662,7 +5706,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         writeln!(out, "attributes #14 = {{").ok();
         writeln!(out, "    mustprogress nofree nosync nounwind noreturn memory(readwrite)").ok();
         writeln!(out, "}}").ok();
-        // Range metadata
+// 2026-10-25: may-trap/halt defns. No willreturn: an unused call is observable.\nattributes #15 = {\n    nofree norecurse nosync nounwind memory(readwrite)\n}\n        // Range metadata
         if !range_meta.is_empty() {
             writeln!(out).ok();
             for m in &range_meta {
@@ -5695,14 +5739,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
         // 2026-07-04: StateAliasScope — a distinct !{} node used by !noalias
         // metadata on Ptr<T> volatile load/store instructions.  This scope
-        // represents "accesses to %State memory." By annotating volatile
+        // represents "accesses to %State memory."  By annotating volatile
         // accesses through Ptr<T> with !noalias !{!StateScope}, we tell LLVM
         // that the Ptr<T> access does NOT alias with any %State field access.
-        // 2026-10-25: choose after all emitted metadata definitions; the old
-        // fixed !99 collided with TBAA when a program had 99+ registered types.
-        // Undo when module metadata has one allocator shared by every family.
-        self.ctx.state_alias_scope_md = self.ctx.metadata_counter;
-        self.ctx.metadata_counter += 1;
+        // 2026-10-22: allocate this node after the TBAA prefix at module
+        // entry; ranges and loops use the same monotonic allocator. A fixed
+        // ID cannot remain disjoint from an unbounded type universe.
         writeln!(out, "!{} = distinct !{{}} ; StateAliasScope", self.ctx.state_alias_scope_md).ok();
 
         // Build optimization report if requested
@@ -6025,6 +6067,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // 2026-08-06 (fix): escaping closures — emit the collected closure
         // functions at the end of the module.
         self.emit_pending_closures(&mut out);
+        // 2026-10-22: late closures and web materializers can allocate nodes
+        // too. Flush once after every function family has emitted its body.
+        if !self.ctx.pending_metadata.is_empty() {
+            writeln!(out, "; Loop metadata").ok();
+            out.push_str(&self.ctx.pending_metadata);
+        }
 
         // ── Owned _start + captured environ (Family F, 2026-09-10) ──────
         // When the program references NOTHING from briev_rt.c or libc, the
@@ -6349,23 +6397,25 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
     /// 2026-08-12 (Iterable protocol, slice 4): for each `b-each` iterable that
     /// is a Tier-2 collection (op Count + op At as op-as-member members), emit a
     /// `__view_items_<field>(ptr %state)` snapshot materializer. It drives the
-    /// collection's own ops to fill `@__web_view_buf` as `[len][word…]` and
-    /// returns the buffer pointer — the shim's b-each renderer reads the
-    /// snapshot instead of vector layout bytes (which cannot index a heap
-    /// collection). Structural: the compiler knows only the op surface, never a
-    /// collection layout.
+    /// collection's own ops to fill a dynamically sized `@__web_view_buf` as
+    /// `[len][word…]` and returns the buffer pointer — the shim's b-each
+    /// renderer reads the snapshot instead of vector layout bytes (which cannot
+    /// index a heap collection). Structural: the compiler knows only the op
+    /// surface, never a collection layout.
     fn emit_view_materializers(&mut self, out: &mut String) {
         use crate::ast::TopLevel;
         if self.ctx.collection_iterables.is_empty() {
             return;
         }
-        // 2026-10-25: snapshots have collection-dependent size. Reuse a heap
-        // buffer sized for all rows instead of overwriting a fixed 1024-word
-        // global. Each materializer also owns a fresh function context so
-        // collection operations cannot inherit a transaction's commit effects.
-        writeln!(out, "@__web_view_buf = private global ptr null").ok();
-        writeln!(out, "@__web_view_capacity = private global i64 0").ok();
+        // Materializers are pure view helpers, never machine transactions.
+        // A stale txn_name/stateless flag from the previously emitted function
+        // made them call __web_flush_state, which re-entered the same
+        // materializer through the binding flush (infinite recursion).
         let saved_fun = self.fun.clone();
+        // 2026-10-21: collection cardinality is runtime data. A fixed 1024-word
+        // snapshot overwrote globals for larger collections. Grow an owned
+        // instance-local buffer; JS consumes it synchronously before reuse.
+        writeln!(out, "@__web_view_buf = private global ptr null").ok();
         let mut names: Vec<String> = self.ctx.collection_iterables.iter().cloned().collect();
         names.sort_unstable();
         for field in &names {
@@ -6382,16 +6432,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if !(has("Count") && has("At")) {
                 continue;
             }
-            self.emit_one_view_materializer(out, field, &briev_ty);
-        }
-        self.fun = saved_fun;
-    }
-
-    fn emit_one_view_materializer(&mut self, out: &mut String, field: &String, briev_ty: &Type) {
             let item_fields = self.view_item_fields(&briev_ty);
             let row_size = item_fields.len();
-            self.fun = crate::backend::llvm::context::FunctionContext::new();
             let fn_name = format!("__view_items_{}", field);
+            self.fun = FunctionContext::new();
+            self.fun.txn_name = fn_name.clone();
+            self.fun.stateless_body = true;
             writeln!(out, "define i32 @{}(ptr noundef noalias nocapture align 8 %state) local_unnamed_addr #0 {{", fn_name).ok();
             let count_tmp = self.fun.gen_reg();
             let count = self.emit_method_call(out, &count_tmp, &crate::ast::Expr::Identifier(field.clone()), "Count", &[], &[], "  ");
@@ -6406,7 +6452,7 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             } else {
                 count.name.clone()
             };
-            Self::emit_view_buffer_capacity(out, &n_i32, row_size.max(1));
+            Self::emit_view_buffer(out, &n_i32);
             writeln!(out, "  %hdr = alloca i32").ok();
             writeln!(out, "  store i32 0, ptr %hdr").ok();
             writeln!(out, "  br label %hlbl").ok();
@@ -6426,9 +6472,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if row_size == 0 {
                 // Scalar/string element collection: one snapshot word per item.
                 let word64 = self.view_projection_word(out, "  ", &word);
-                writeln!(out, "  %c64 = zext i32 %c to i64").ok();
-                writeln!(out, "  %w = add i64 %c64, 1").ok();
-                writeln!(out, "  %p = getelementptr i64, ptr %buffer, i64 %w").ok();
+                writeln!(out, "  %w32 = add i32 %c, 1").ok();
+                writeln!(out, "  %w = sext i32 %w32 to i64").ok();
+                writeln!(out, "  %p = getelementptr i64, ptr %view_data, i64 %w").ok();
                 writeln!(out, "  store i64 {}, ptr %p", word64).ok();
             } else {
                 // Struct/obj element: bind the boxed element handle and project
@@ -6448,10 +6494,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     let idx = self.fun.gen_reg();
                     let wid = self.fun.gen_reg();
                     let slot = self.fun.gen_reg();
-                    writeln!(out, "  {} = zext i32 %c to i64", wid).ok();
-                    writeln!(out, "  {} = mul i64 {}, {}", row, wid, row_size).ok();
-                    writeln!(out, "  {} = add i64 {}, {}", idx, row, col + 1).ok();
-                    writeln!(out, "  {} = getelementptr i64, ptr %buffer, i64 {}", slot, idx).ok();
+                    writeln!(out, "  {} = mul i32 %c, {}", row, row_size).ok();
+                    writeln!(out, "  {} = add i32 {}, {}", idx, row, col + 1).ok();
+                    writeln!(out, "  {} = sext i32 {} to i64", wid, idx).ok();
+                    writeln!(out, "  {} = getelementptr i64, ptr %view_data, i64 {}", slot, wid).ok();
                     writeln!(out, "  store i64 {}, ptr {}", word64, slot).ok();
                 }
             }
@@ -6462,21 +6508,24 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             // buf[0] = n (the real len, at i64)
             let n64 = self.fun.gen_reg();
             writeln!(out, "  {} = sext i32 {} to i64", n64, n_i32).ok();
-            writeln!(out, "  store i64 {}, ptr %buffer", n64).ok();
-            writeln!(out, "  %result = ptrtoint ptr %buffer to i32").ok();
-            writeln!(out, "  ret i32 %result").ok();
+            writeln!(out, "  store i64 {}, ptr %view_data", n64).ok();
+            writeln!(out, "  %view_result = ptrtoint ptr %view_data to i32").ok();
+            writeln!(out, "  ret i32 %view_result").ok();
             writeln!(out, "}}").ok();
+        }
+        self.fun = saved_fun;
     }
 
-    fn emit_view_buffer_capacity(out: &mut String, count: &str, width: usize) {
-        writeln!(out, "  %count64 = zext i32 {count} to i64").ok();
-        writeln!(out, "  %words = mul i64 %count64, {width}").ok();
-        out.push_str("  %total_words = add i64 %words, 1\n  %needed = mul i64 %total_words, 8\n");
-        out.push_str("  %capacity = load i64, ptr @__web_view_capacity\n  %grow = icmp ugt i64 %needed, %capacity\n");
-        out.push_str("  br i1 %grow, label %grow_buf, label %ready_buf\ngrow_buf:\n");
-        out.push_str("  %old_buf = load ptr, ptr @__web_view_buf\n  %new_buf = call ptr @realloc(ptr %old_buf, i64 %needed)\n");
-        out.push_str("  store ptr %new_buf, ptr @__web_view_buf\n  store i64 %needed, ptr @__web_view_capacity\n");
-        out.push_str("  br label %ready_buf\nready_buf:\n  %buffer = load ptr, ptr @__web_view_buf\n");
+    fn emit_view_buffer(out: &mut String, count: &str) {
+        writeln!(out, "  %view_valid = icmp sge i32 {count}, 0").ok();
+        writeln!(out, "  br i1 %view_valid, label %view_reserve, label %view_invalid").ok();
+        writeln!(out, "view_invalid:\n  call void @llvm.trap()\n  unreachable\nview_reserve:").ok();
+        writeln!(out, "  %view_count = zext i32 {count} to i64").ok();
+        writeln!(out, "  %view_slots = add i64 %view_count, 1").ok();
+        writeln!(out, "  %view_bytes = mul i64 %view_slots, 8").ok();
+        writeln!(out, "  %view_old = load ptr, ptr @__web_view_buf").ok();
+        writeln!(out, "  %view_data = call ptr @realloc(ptr %view_old, i64 %view_bytes)").ok();
+        writeln!(out, "  store ptr %view_data, ptr @__web_view_buf").ok();
     }
 
     /// 2026-08-06 (fix): emit the top-level closure functions collected during
@@ -7649,7 +7698,9 @@ machine instance columns — plain storage is for scalar plumbing. Remove the \
                             let mut off = 0u64;
                             for (mname, mty) in &slots {
                                 offsets.insert(mname.clone(), (off, mty.clone()));
-                                off += self.field_storage_size(mty);
+                                off += crate::backend::llvm::types::type_size(
+                                    mty, self.ctx.type_universe.as_ref(),
+                                );
                             }
                             self.ctx.boxed_offsets.insert(base.clone(), offsets);
                         }
@@ -7775,6 +7826,92 @@ machine instance columns — plain storage is for scalar plumbing. Remove the \
 
     /// Compute the total size of the %State struct in bytes from field_types.
     /// Used by the memcpy round-trip SROA optimization in emit_main.
+    /// 2026-10-26: refresh structural object sizes after registration.
+    /// `record_structural_layout` runs when an obj/TypeDef is first seen, but
+    /// a later-registered field type still has a provisional `bytes`; the
+    /// cached parent size then contradicts the offset walk at codegen and the
+    /// object allocates too little. Iterate until sizes stop changing.
+    fn recompute_structural_sizes(&mut self) {
+        let names: Vec<String> = self.ctx.struct_types.keys().cloned().collect();
+        for _ in 0..names.len().max(1) {
+            let mut updates: Vec<(String, u64)> = Vec::with_capacity(names.len());
+            for name in &names {
+                if self.ctx.unions.contains(name) || self.ctx.packed_structs.contains(name) {
+                    continue;
+                }
+                let Some(fields) = self.ctx.struct_types.get(name) else {
+                    continue;
+                };
+                let explicit = self
+                    .ctx
+                    .type_universe
+                    .as_ref()
+                    .and_then(|u| u.types.get(name))
+                    .is_some_and(|rt| {
+                        ["bytes", "bits", "maxbits", "minbits"]
+                            .iter()
+                            .any(|k| rt.properties.contains_key(*k))
+                    });
+                if explicit {
+                    continue;
+                }
+                let bytes: u64 = fields
+                    .iter()
+                    .map(|(_, ty)| crate::backend::llvm::types::type_size(
+                        ty,
+                        self.ctx.type_universe.as_ref(),
+                    ))
+                    .sum();
+                updates.push((name.clone(), bytes));
+            }
+            let Some(universe) = self.ctx.type_universe.as_mut() else {
+                return;
+            };
+            let mut changed = false;
+            for (name, bytes) in updates {
+                if let Some(rt) = universe.types.get_mut(&name) {
+                    if rt.bytes != bytes {
+                        rt.bytes = bytes;
+                        rt.min_bits = bytes * 8;
+                        rt.max_bits = bytes * 8;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Phase C invariant: the computed struct byte size must cover every
+        // emitted field end. A smaller size is the stale-layout class that
+        // produced heap OOB and LTO-only corruption.
+        for name in &names {
+            if self.ctx.unions.contains(name) || self.ctx.packed_structs.contains(name) {
+                continue;
+            }
+            let Some(fields) = self.ctx.struct_types.get(name) else {
+                continue;
+            };
+            let Some(bytes) = self.ctx.type_universe.as_ref()
+                .and_then(|u| u.types.get(name))
+                .map(|rt| rt.bytes)
+            else {
+                continue;
+            };
+            let end = fields.iter().map(|(field, ty)| {
+                self.lookup_field_offset(name, field)
+                    + crate::backend::llvm::types::type_size(
+                        ty,
+                        self.ctx.type_universe.as_ref(),
+                    )
+            }).max().unwrap_or(0);
+            debug_assert!(
+                bytes >= end,
+                "structural layout {name}: size {bytes} < field end {end}"
+            );
+        }
+    }
+
     pub(crate) fn compute_state_size_bytes(&self) -> i64 {
         self.ctx.field_types.iter().map(|t| llvm_type_byte_size(t)).sum()
     }
@@ -7961,7 +8098,9 @@ machine instance columns — plain storage is for scalar plumbing. Remove the \
                     let mut off = 0u64;
                     for (mname, mty) in &slots {
                         offsets.insert(mname.clone(), (off, mty.clone()));
-                        off += self.field_storage_size(mty);
+                        off += crate::backend::llvm::types::type_size(
+                            mty, self.ctx.type_universe.as_ref(),
+                        );
                     }
                     self.ctx.boxed_offsets.insert(base.clone(), offsets);
                 }

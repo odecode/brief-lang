@@ -1,4 +1,6 @@
-// JSON - Pure-Briev JSON parser (RFC 8259 subset)
+// JSON - Pure-Briev JSON parser/writer (RFC 8259 subset)
+// Authored in part by Otto Westerlund (@odecode); adopted with attribution,
+// see docs/contributors/otto-westerlund.md.
 // Tier 2: String & Text Processing
 //
 // STATUS 2026-10-21: bounded recursive descent. The 2026-10-05 callable-txn
@@ -16,10 +18,14 @@
 //   json_get(v, key) -> Result<String, String>      (string values)
 //   json_get_by_index(v, i) -> Result<JsonValue, String>
 //   json_is_array(v) -> Bool ; json_length(v) -> Int
+//   json_stringify(value) -> Result<String, String>
 
 import "std/char";
 import "std/collections.bv";
 import "std/iterator.bv";
+// 2026-10-21: the builder conversion shares a spelling with integer string
+// conversion. Give this dependency an explicit local name so JSON composes
+// with database/string users; keep the alias if builder internals change.
 import { StringBuilder, new_builder, append_char, append_str, json_builder_string: to_string } from "std/string_builder";
 import "std/result";
 
@@ -87,6 +93,11 @@ defn resolve_str_val(val: JsonValue) -> Result<String, String> {
 };
 
 defn handle_object(pairs: List<(String, JsonValue)>, key: String) -> Result<String, String> {
+    // find_pair's convergence loop requires a non-empty range; an empty object
+    // must return Err here.
+    when pairs.Count#() == 0 {
+        term Err(e_utoken());
+    };
     let result = find_pair(pairs, key, 0);
     match result {
         Ok(val) => resolve_str_val(val),
@@ -201,9 +212,14 @@ defn json_space(value: Char) -> Bool {
     term value == ' ' || value == '\t' || value == '\r' || value == '\n';
 };
 
-defn skip_ws(text: String, pos: Int) [pos >= 0][true] -> Int {
+defn skip_ws(text: String, pos: Int) [true] -> Int {
+    when pos < 0 { term 0; };
     when pos >= (text .^Length) || !json_space(char_at(text,pos)) { term pos; };
     term skip_ws(text,pos+1);
+};
+
+defn json_digit_value(c: Char) [true] -> Int {
+    term (c as Int) - 48;
 };
 
 defn parse_value(text: String, pos: Int) -> Result<ParseFrame,String> {
@@ -242,7 +258,7 @@ defn parse_str_chars(text: String, pos: Int, builder: StringBuilder) -> Result<P
     let token: Char = char_at(text,pos);
     when token == '"' { term Ok(ParseFrame { value: StrVal(json_builder_string(builder)), pos: pos+1 }); };
     when token < ' ' { term err_frame(e_invesc()); };
-    when token == '\\' { term json_escape(text,pos+1,builder); };
+    when token == '\\' { term json_parse_escape(text,pos+1,builder); };
     let end: Int = json_string_run(text,pos);
     when end < 0 { term err_frame("invalid_utf8"); };
     term parse_str_chars(text,end,append_str(builder,text[pos:end]));
@@ -275,7 +291,7 @@ defn json_utf8_width(text: String, pos: Int) -> Int {
     term width;
 };
 
-defn json_escape(text: String, pos: Int, builder: StringBuilder) -> Result<ParseFrame,String> {
+defn json_parse_escape(text: String, pos: Int, builder: StringBuilder) -> Result<ParseFrame,String> {
     when pos >= (text .^Length) { term err_frame(e_unexpend()); };
     let token: Char = char_at(text,pos);
     when token == 'u' { term json_unicode(text,pos+1,builder); };
@@ -341,19 +357,16 @@ defn json_number_end(text: String, pos: Int) -> Int {
     term cursor;
 };
 
-defn json_signed_integer(text: String, pos: Int, end: Int, negative: Bool, value: Int) -> Result<ParseFrame,String> {
+defn json_signed_integer(text: String, pos: Int, end: Int, negative: Int, value: Int) -> Result<ParseFrame,String> {
     when pos >= end {
-        when negative { term Ok(ParseFrame { value: IntVal(value), pos: end }); };
+        when negative == 1 { term Ok(ParseFrame { value: IntVal(value), pos: end }); };
         term Ok(ParseFrame { value: IntVal(0-value), pos: end });
     };
-    let digit: Int = digit_to_int(char_at(text,pos));
-    // 2026-10-21: Int follows the target word width. Accumulate negatively
-    // against its derived minimum, preserving the asymmetric signed endpoint
-    // on both 32- and 64-bit targets instead of assuming a 64-bit browser Int.
+    let digit: Int = json_digit_value(char_at(text,pos));
     let minimum: Int = 1 << (value .^^Bytes * 8 - 1);
     let cutoff: Int = minimum / 10;
     let last: Int = 0 - (minimum % 10);
-    when !negative { last = last - 1; };
+    when negative == 0 { last = last - 1; };
     when value < cutoff || (value == cutoff && digit > last) { term err_frame(e_invnum()); };
     term json_signed_integer(text,pos+1,end,negative,value*10-digit);
 };
@@ -361,13 +374,13 @@ defn json_signed_integer(text: String, pos: Int, end: Int, negative: Bool, value
 defn parse_number(text: String, pos: Int) -> Result<ParseFrame,String> {
     let end: Int = json_number_end(text,pos);
     when end < 0 { term err_frame(e_invnum()); };
-    let negative: Bool = char_at(text,pos) == '-';
+    let negative: Int = 0;
+    when char_at(text,pos) == '-' { negative = 1; };
     let begin: Int = pos;
-    when negative { begin = pos+1; };
+    when negative == 1 { begin = pos+1; };
     let digits: Int = json_digit_end(text,begin);
     when digits == end { term json_signed_integer(text,begin,end,negative,0); };
-    let literal: String = "";
-    foreach idx in pos..end { literal = literal + char_at(text,idx) as String; };
+    let literal: String = text[pos:end];
     let value: Float = literal as Float;
     when !json_finite(value) { term err_frame(e_invnum()); };
     term Ok(ParseFrame { value: FloatVal(value), pos: end });
@@ -378,11 +391,11 @@ defn parse_number(text: String, pos: Int) -> Result<ParseFrame,String> {
 // Integer classification is independent of floating reassociation/fast flags;
 // remove these masks only in favor of a stdlib classification protocol.
 defn json_finite(value: Float) -> Bool {
-    let bits: Int64 = (value as Data) as Int64;
+    let bits: Int = (value as Data) as Int;
     let width: Int = value .^^Bytes;
-    when width == 2 { term (bits & ((31 as Int64) << (10 as Int64))) != ((31 as Int64) << (10 as Int64)); };
-    when width == 4 { term (bits & ((255 as Int64) << (23 as Int64))) != ((255 as Int64) << (23 as Int64)); };
-    when width == 8 { term (bits & ((2047 as Int64) << (52 as Int64))) != ((2047 as Int64) << (52 as Int64)); };
+    when width == 2 { term (bits & 31744) != 31744; };
+    when width == 4 { term (bits & 2139095040) != 2139095040; };
+    when width == 8 { term (bits & 9218868437227405312) != 9218868437227405312; };
     term false;
 };
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 //! 2026-10-22: retain pattern payload types while elaborating nested operators.
+//! Authored by Otto Westerlund (@odecode); adopted with attribution.
 //! The normal checker validates coverage; this pass consumes its enum slots
 //! and generic substitutions so nested loops see the same lexical bindings.
 use super::*;

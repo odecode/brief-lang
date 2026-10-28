@@ -3,10 +3,7 @@
 **2026-10-06.** 430+ files in `docs/plans/`; historical plans are
 reference-only (never retroactively edited — AGENTS.md Rule 13).
 
-**Suite state:** `cargo test --lib` 2901 green (2026-10-06, incl. the two
-normalizer-diagnostic tests, three `List + List` tests, four json interpreter
-tests, and five folio package tests); conformance sweep green; `gemm_h`
-byte-identical; 19 pre-existing warnings; Praetor no new diagnostics.
+**Suite state:** `cargo test --lib` 3343 green (2026-10-25); daily corpus 29 green; Task Board structured Chrome/API green; full runtime suite green; browser host/heap/snapshot gates green; determinism quick green.
 **Ledger state:** `docs/plans/2026-10-06-bugs-ledger-sweep.md` — 152
 unmarked BUGS entries verified, 4 open. Fixed during the sweep: the
 `List<T> + List<T>` silent miscompile (now elaborates to stdlib `iter_chain`),
@@ -15,6 +12,24 @@ reference), the json-interpreter array hang + two more Rule-5 divergences
 (`&&`/`||` short-circuit, trailing-expression result), the 12 stale
 normalizer warnings, and the unfired-`txn` empty-program silence (build now
 warns).
+
+**Active stability lane (2026-10-25):** `docs/plans/2026-10-25-stability-v0.1.md` — freeze features; make `cargo test --all` a hard gate, close interpreter/backend parity, declare Tier 1 = x86_64 Linux + wasm32, add a nightly performance baseline, and ship `v0.1.0-preview` then `v0.1.0`. GPU/embedded remain experimental; Otto’s server stays external.
+
+**Active recommender lane (2026-10-25):** `docs/plans/2026-10-25-recommender-fixes-and-app-adoption.md` — A/C/D compiler/web/WASM bundles landed; casting change rejected; generic txn specialization deferred. App remains external and pinned at `79234665`. Source compiler commit: `894fcfa5`.
+
+**Session report (2026-10-27):** `docs/2026-10-27-session-report.md` — chronological record of app compatibility, compiler hardening, proof elimination, ledger, and remaining browser/hardening work.
+
+**Active JSON/runtime lane (2026-10-25):** `docs/plans/2026-10-25-json-wasm-runtime-closure.md` — strict JSON, browser heap, dynamic snapshots, helper-write flushes, lexical elaboration, logical semantics, metadata and target-width constants are landed. Phase D stdlib breadth (PostgreSQL, portable web, CSR) is adopted; the remaining compiler item is generic callable transaction specialization.
+
+**Active proof-completeness lane (2026-10-26):** `docs/plans/2026-10-26-proof-completeness-and-guard-elimination.md` — make the prover discharge constructible obligations and let the compiler consume them. Source guards are retained; proof-aware guard elimination is implemented (Rule 25).
+
+**Active eternal-ABI lane (2026-10-27):** `docs/plans/2026-10-27-eternal-abi-and-temporal-transport.md` — centralize target ABI/layout, verify emitted IR, make transport/timers explicit. Phase C (verifier/invariants) is first.
+
+**Active proof-consumption workstream (2026-10-27):** `docs/plans/2026-10-26-proof-consumption-ledger.md` — every proof family must name its codegen consumer (or an explicit no-runtime-consumer record). Instrumentation landed: 176/176 assertion guards consumed, 0 unconsumed. Accessor bounds are `NONE (static contract; no runtime check)`; loop/constructor/alias consumers remain open.
+
+**Active app acceptance lane (2026-10-26):** `docs/plans/2026-10-26-recommender-app-acceptance-and-upstream.md` — recommender app builds against current main (PR #1, draft); compiler prerequisites `e442f06b`/`1c1dd70f` pushed to Randozart main. Remaining: `cargo test --all`, non-PostgreSQL app gates, then PG/MovieLens/Playwright acceptance and the upstream landing decision.
+
+**Active adoption lane (2026-10-25):** `docs/plans/2026-10-25-otto-contribution-adoption.md` — adopt Otto Westerlund's missing compiler/stdlib/browser work on current main, starting with attribution, Result/print/view/collection fixes, then JSON, PostgreSQL, portable web stdlib, logical/metadata semantics and browser runtime. Credit ledger: `docs/contributors/otto-westerlund.md`.
 
 **GPU standing state:** fused online softmax (`ptx_deferred_online: 1`) is
 the shipped default. Composite decode: **float4 k/v loads landed

@@ -76,8 +76,7 @@ pub(super) fn emit_web_flush_batch(backend: &mut LlvmBackend, out: &mut String, 
     // state-machine transaction. A stateless body has no %state parameter, so
     // flushing there emits undefined IR. Only real txn/reactive drivers set
     // txn_name and are eligible.
-    if txn_name.is_empty() || backend.fun.stateless_body
-        || backend.fun.self_binding.is_some() || backend.fun.self_prefix.is_some() {
+    if txn_name.is_empty() || backend.fun.stateless_body {
         return;
     }
     // 2026-08-10: the write_set is frontend analysis — sorted by field index
@@ -90,13 +89,15 @@ pub(super) fn emit_web_flush_batch(backend: &mut LlvmBackend, out: &mut String, 
                 .collect()
         })
         .unwrap_or_default();
-    // 2026-10-25: helper calls can mutate visible state without a direct txn
-    // assignment. Consume the frontend commit closure so async completions
-    // publish those writes. Keep scheduling write sets separate from UI effects.
-    written.extend(backend.ctx.web_commit_writes.get(&txn_name).into_iter().flatten()
-        .filter_map(|name| backend.ctx.field_index_map.get(name).copied()));
     written.sort_unstable();
-    written.dedup();
+    // 2026-10-21: a transaction's helper calls may write state that its own
+    // write_set does not contain. Union the frontend's cross-helper commit
+    // closure so those fields are flushed too.
+    if let Some(writes) = backend.ctx.web_commit_writes.get(&txn_name) {
+        written.extend(writes.iter().filter_map(|name| backend.ctx.field_index_map.get(name).copied()));
+        written.sort_unstable();
+        written.dedup();
+    }
     if written.is_empty() {
         writeln!(out, "{}call void @__web_flush_state(i32 0, i32 0)", indent).ok();
         return;
@@ -358,56 +359,52 @@ fn emit_bare_term_stop(backend: &mut LlvmBackend, out: &mut String, indent: &str
     backend.fun.terminated = true;
 }
 
-/// 2026-10-25 (tuple ABI): unbox one tuple element loaded from its i64 heap
-/// slot back to its declared native representation — the inverse of
-/// `adapt_to_i64` on the store side
+/// 2026-10-19 (BUGS.md "Float-tuple destructure loaded elements as i64"):
+/// unbox one tuple element loaded from its i64 heap slot back to its native
+/// Float register — the exact inverse of `adapt_to_i64` on the store side
 /// (emit_tuple_materialize), which boxes a double via `bitcast double -> i64`
 /// and a float via `bitcast float -> i32; zext -> i64`.
 ///
-/// Pattern targeted: a wasm32 tuple helper returns `(Int, Int)` as a boxed
-/// i64 handle, then tuple destructuring feeds the i64 slot value into an i32
-/// parameter. Narrow integer, pointer, and Float-family elements are restored
-/// through protocol-derived LLVM types. To undo: bind `elem` directly at the
-/// destructure call site (which reintroduces invalid cross-target IR).
-fn unbox_tuple_element(
+/// Pattern targeted: `let (a, b): (Float, Float) = f();` — the element was
+/// bound as the raw `load i64`, so a downstream float use received an
+/// i64-defined register (clang: "defined with type 'i64' but expected
+/// 'float'"). Dispatch is protocol-driven (Rule 19): Float protocol
+/// membership + the casting graph's LLVM width, so every Float-family type
+/// (Float, Float32, Float64, Double, user aliases) unboxes correctly, and a
+/// width the graph does not resolve as double/float is left untouched.
+/// Mirrors the boxed Float param-slot unbox in emit_expr.rs. Non-Float
+/// elements return the loaded i64 unchanged. To undo: bind `elem` directly
+/// at the destructure call site.
+fn unbox_tuple_float_element(
     backend: &mut LlvmBackend,
     out: &mut String,
     indent: &str,
     elem: &str,
     elem_ty: &Type,
 ) -> String {
-    let llvm_ty = backend.llvm_type(elem_ty);
-    if backend.is_protocol_member(elem_ty, "Float") {
-        let native = match llvm_ty.as_str() {
-            "double" => {
+    if !backend.is_protocol_member(elem_ty, "Float") {
+        return elem.to_string();
+    }
+    let native = match backend.llvm_type(elem_ty).as_str() {
+        "double" => {
             let d = backend.fun.gen_reg();
             writeln!(out, "{}{} = bitcast i64 {} to double", indent, d, elem).ok();
             d
-            }
-            "float" => {
+        }
+        "float" => {
             let bits = backend.fun.gen_reg();
             writeln!(out, "{}{} = trunc i64 {} to i32", indent, bits, elem).ok();
             let f = backend.fun.gen_reg();
             writeln!(out, "{}{} = bitcast i32 {} to float", indent, f, bits).ok();
             f
-            }
-            _ => return elem.to_string(),
-        };
-        backend.fun.reg_float_cache.insert(elem.to_string(), native.clone());
-        backend.fun.reg_float_cache.insert(native.clone(), native.clone());
-        return native;
-    }
-    if llvm_ty.starts_with('i') && llvm_ty != "i64" {
-        let native = backend.fun.gen_reg();
-        writeln!(out, "{}{} = trunc i64 {} to {}", indent, native, elem, llvm_ty).ok();
-        return native;
-    }
-    if llvm_ty == "ptr" {
-        let native = backend.fun.gen_reg();
-        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, native, elem).ok();
-        return native;
-    }
-    elem.to_string()
+        }
+        _ => return elem.to_string(),
+    };
+    // Cache the native register so later reads of the binding resolve the
+    // float value, not the boxed i64 it was loaded from.
+    backend.fun.reg_float_cache.insert(elem.to_string(), native.clone());
+    backend.fun.reg_float_cache.insert(native.clone(), native.clone());
+    native
 }
 
 pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statement, indent: &str) -> TypedRegister {
@@ -779,7 +776,8 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     _ => vec![Type::int(); names.len()],
                 };
                 let handle_p = backend.fun.gen_reg();
-                writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, handle_p, val.name).ok();
+                let hw = format!("i{}", backend.ctx.int_bits);
+                writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, handle_p, hw, val.name).ok();
                 for (i, n) in names.iter().enumerate() {
                     let slot = backend.fun.gen_reg();
                     writeln!(
@@ -789,9 +787,18 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     )
                     .ok();
                     let elem = backend.fun.gen_reg();
-                    writeln!(out, "{}{} = load i64, ptr {}", indent, elem, slot).ok();
                     let elem_ty = elem_tys.get(i).cloned().unwrap_or_else(Type::int);
-                    let bound = unbox_tuple_element(backend, out, indent, &elem, &elem_ty);
+                    // 2026-10-23 (wasm tuple ABI): tuple slots are i64, but
+                    // scalar elements (Int/Bool/Char and enum/obj handles) are
+                    // consumed at their target width.
+                    let elem_llvm = backend.llvm_type(&elem_ty);
+                    let load_ty = if matches!(elem_llvm.as_str(), "i8" | "i16" | "i32") {
+                        elem_llvm.clone()
+                    } else {
+                        "i64".to_string()
+                    };
+                    writeln!(out, "{}{} = load {}, ptr {}", indent, elem, load_ty, slot).ok();
+                    let bound = unbox_tuple_float_element(backend, out, indent, &elem, &elem_ty);
                     backend.fun.let_bindings.insert(n.clone(), bound.clone());
                     backend.fun.let_binding_types.insert(n.clone(), elem_ty.clone());
                     backend.fun.let_original_types.insert(n.clone(), elem_ty);
@@ -958,23 +965,26 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 return TypedRegister { name: result, ty: Type::int() };
             }
 
-            let val = if let (Expr::Identifier(name), Expr::List(_)) = (lhs, rhs) {
-                let target_ty = backend.fun.let_binding_types.get(name).cloned().or_else(|| {
-                    let index = backend.ctx.field_index_map.get(name)?;
-                    backend.ctx.field_briev_types.get(*index).cloned()
-                });
-                let is_collection = target_ty.as_ref().is_some_and(|ty| match ty {
-                    Type::Applied(base, _) | Type::Custom(base) => {
-                        backend.is_coll_type(ty) || backend.is_op_surface_coll(base)
-                    }
-                    _ => false,
-                });
-                if is_collection {
-                    target_ty
-                        .as_ref()
-                        .and_then(|ty| backend.construct_local_collection(out, indent, ty, rhs))
-                        .map(|(value, _)| value)
-                        .unwrap_or_else(|| backend.emit_expr(out, rhs, indent))
+            // 2026-10-25: a list literal assigned to a typed target needs the
+            // target's collection witness, exactly like a typed let. Without
+            // this, `server_ratings = []` reached the generic list arm and
+            // panicked (recommender login reset path).
+            let target_ty = match lhs {
+                Expr::Identifier(name) => backend
+                    .fun
+                    .let_binding_types
+                    .get(name)
+                    .cloned()
+                    .or_else(|| {
+                        backend.ctx.field_index_map.get(name).and_then(|idx| {
+                            backend.ctx.field_briev_types.get(*idx).cloned()
+                        })
+                    }),
+                _ => None,
+            };
+            let val = if let (Some(ty), crate::ast::Expr::List(_)) = (target_ty.as_ref(), rhs) {
+                if let Some((value, _)) = backend.construct_local_collection(out, indent, ty, rhs) {
+                    value
                 } else {
                     backend.emit_expr(out, rhs, indent)
                 }
@@ -983,18 +993,6 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             };
             match lhs {
                 Expr::Identifier(name) => {
-                    // 2026-10-25: whole-object assignments must update pooled
-                    // columns, just as initialization does. Otherwise returned
-                    // coordinator state disappears at the next reactor firing.
-                    // Keep this bridge until pools use the same value storage.
-                    if !backend.fun.let_bindings.contains_key(name)
-                        && backend.unpacked_instance_prefix(name).is_some_and(|(base, _)|
-                            !backend.ctx.dependent_pools.contains_key(&base)
-                                && !backend.ctx.boxed_offsets.contains_key(&base))
-                    {
-                        backend.emit_instance_seed_from_value(out, indent, name, &val);
-                        return TypedRegister { name: val.name, ty: Type::void() };
-                    }
                     // 2026-08-07 (object instance pools): a bare member
                     // target in an UNPACKED member body writes the instance's
                     // top-level slot — `total = 1` in `st`'s member → the
@@ -1354,9 +1352,29 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                             Type::Ptr(inner) => backend.llvm_type(inner),
                             _ => "i64".to_string(),
                         };
+                        // Mirror the read side: only genuine scalar pointees
+                        // use the native-width element path. A tuple/object/
+                        // string pointee is a boxed target-width handle even
+                        // when its fallback LLVM type is i64.
                         let scalar_pointee = matches!(
                             elem_llvm.as_str(),
                             "i8" | "i16" | "i32" | "i64" | "float" | "double"
+                        ) && !matches!(
+                            &obj_reg.ty,
+                            Type::Ptr(inner)
+                                if matches!(
+                                    inner.as_ref(),
+                                    Type::Tuple(_) | Type::Applied(_, _)
+                                        | Type::Dyn(_) | Type::Vector(_, _)
+                                )
+                                || matches!(
+                                    inner.as_ref(),
+                                    Type::Custom(n)
+                                        if (n.len() == 1
+                                            && n.chars().next().is_some_and(|c| c.is_uppercase()))
+                                            || backend.ctx.obj_types.contains(n)
+                                            || backend.ctx.coll_storage.contains_key(n)
+                                )
                         );
                         let vol_obj = match obj.as_ref() {
                             Expr::Identifier(n) => backend.fun.volatile_locals.contains(n),
@@ -1380,9 +1398,48 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                             );
                             writeln!(out, "{}store {}{} {}, ptr {}", indent, vol_prefix, elem_llvm, store_val, gep).ok();
                         } else {
-                            writeln!(out, "{}{} = getelementptr i64, ptr {}, i64 {}", indent, gep, ptr, offset).ok();
-                            let e64 = backend.adapt_to_i64(out, indent, &val);
-                            writeln!(out, "{}store {}i64 {}, ptr {}", indent, vol_prefix, e64, gep).ok();
+                            // 2026-10-27: non-scalar pointer slots carry
+                            // target-width boxed handles (i32 on wasm32).
+                            let slot_ty = format!("i{}", backend.ctx.int_bits);
+                            writeln!(out, "{}{} = getelementptr {}, ptr {}, i64 {}", indent, gep, slot_ty, ptr, offset).ok();
+                            let actual = match &val.ty {
+                                // A bare generic parameter's fallback LLVM type
+                                // is i64, but its register is the target-width
+                                // collection handle (i32 on wasm32).
+                                Type::Custom(n)
+                                    if n.len() == 1
+                                        && n.chars().next().is_some_and(|c| c.is_uppercase()) =>
+                                {
+                                    slot_ty.clone()
+                                }
+                                _ => backend.llvm_type(&val.ty),
+                            };
+                            let store_val = if actual == "ptr" {
+                                let r = backend.fun.gen_reg();
+                                writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, r, val.name, slot_ty).ok();
+                                r
+                            } else if actual == slot_ty {
+                                val.name.clone()
+                            } else if actual == "i64" && slot_ty == "i32" {
+                                let r = backend.fun.gen_reg();
+                                writeln!(out, "{}{} = trunc i64 {} to i32", indent, r, val.name).ok();
+                                r
+                            } else if actual == "i32" && slot_ty == "i64" {
+                                let r = backend.fun.gen_reg();
+                                writeln!(out, "{}{} = zext i32 {} to i64", indent, r, val.name).ok();
+                                r
+                            } else {
+                                let universe = backend.ctx.type_universe.clone();
+                                backend.ensure_typed_value(
+                                    out,
+                                    indent,
+                                    &slot_ty,
+                                    &val.name,
+                                    Some(val.ty.clone()),
+                                    universe.as_ref(),
+                                )
+                            };
+                            writeln!(out, "{}store {}{} {}, ptr {}", indent, vol_prefix, slot_ty, store_val, gep).ok();
                         }
                     }
                 }
@@ -1606,7 +1663,16 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     .map(is_event_type)
                     .unwrap_or(false);
                 if is_wire {
-                    if let Some(id_reg) = backend.fun.let_bindings.get(wname).cloned() {
+                    if let Some(mut id_reg) = backend.fun.let_bindings.get(wname).cloned() {
+                        // 2026-10-25: a reassigned Event parameter is bound to a
+                        // native parameter slot. The wire id is the loaded i64,
+                        // not the alloca address; passing the slot produced a
+                        // ptr-vs-i64 verifier error in async compiled events.
+                        if backend.fun.native_parameter_slots.contains(&id_reg) {
+                            let loaded = backend.fun.gen_reg();
+                            writeln!(out, "{indent}{loaded} = load i64, ptr {id_reg}").ok();
+                            id_reg = loaded;
+                        }
                         let val = backend.emit_expr(out, value, indent);
                         let boxed = backend.adapt_to_i64(out, indent, &val);
                         let events_i = backend.fun.gen_reg();
@@ -1871,21 +1937,19 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             if let Some(val) = val {
                 let saved_enum_ret = backend.fun.enum_return_context;
                 let saved_expected_enum = backend.fun.expected_enum_type.clone();
-                backend.fun.enum_return_context = backend.fun.item_return_type.as_ref()
-                    .and_then(|ty| backend.ctx.enum_layout_planner.as_ref()?.layout_for(ty))
-                    .is_some();
+                let returns_enum = backend.fun.item_return_type.as_ref()
+                    .map(|t| backend.ctx.enum_handle_types.contains(type_bare_name(t)))
+                    .unwrap_or(false);
+                backend.fun.enum_return_context = backend.fun.enum_out_slot.is_some() || returns_enum;
                 if let Some(t) = backend.fun.item_return_type.clone() {
                     if backend.ctx.enum_handle_types.contains(type_bare_name(&t)) {
                         backend.fun.expected_enum_type = Some(t);
                     }
                 }
-                // 2026-10-25: a typed list literal returned directly by `term`
-                // has no local-let or call-argument lowering site. Construct it
-                // through the declared function result collection's ops here;
-                // otherwise Expr::List reaches the deliberately rejecting
-                // generic expression emitter (repro: protocol_fields' tuple list).
-                // Undo when typed expressions carry their collection witness
-                // into all expression-lowering contexts.
+                // 2026-10-25: a list literal in return position has no
+                // inferred collection witness at codegen. Construct it from
+                // the declared return type instead of hitting the generic
+                // expression emitter (applies to `protocol_array`'s empty arm).
                 let returned_collection = if matches!(val, crate::ast::Expr::List(_)) {
                     backend.fun.item_return_type.clone().and_then(|ty| {
                         backend.construct_local_collection(out, indent, &ty, val)
@@ -1965,7 +2029,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // Emit no terminator and leave `terminated` unchanged so the
                     // enclosing body continues.
                 } else if backend.fun.fn_ret_ty != "void" {
-                    reg = backend.retain_enum_return(out, indent, &reg);
+                    let reg = backend.retain_enum_return(out, indent, &reg);
                     // 2026-07-26: Use actual expression LLVM type, not hardcoded "i64".
                     // Frgn calls may return ptr (for String/Data in C ABI).
                     let val_ty = backend.llvm_type(&reg.ty);

@@ -62,4 +62,43 @@ fn per_instantiation_list_each_builds_for_wasm() {
     let multi_html = std::fs::read_to_string(out.join("list_multi_each_wasm.html")).unwrap();
     assert_eq!(multi_html.matches("id=\"rbv-li-").count(), 2,
         "both b-each containers need stable ids:\n{multi_html}");
+
+    // Browser JSON scalar widths (int/bool/finite float) through the real
+    // WASM backend, not just an IR string check.
+    build_fixture(brievc, "browser_json_values", &out);
+
+    build_fixture(brievc, "state_list_clear_wasm", &out);
+    build_fixture(brievc, "bool_param_struct_wasm", &out);
+
+    // Int64 cast/arithmetic must widen before the i64 multiply (wasm32
+    // flexible Int is i32; the identity cast path used to return i32).
+    build_fixture(brievc, "int64_cast_wasm", &out);
+
+    // Portable browser stdlib surface: async HTTP, WebSocket, timers and
+    // secure nonces must compile through the generated host module.
+    build_fixture(brievc, "portable_web_imports", &out);
+
+    // JSON stringify exercises runtime `.^Length` on a collection parameter
+    // on wasm32 (target-width handle, i64 len header).
+    build_fixture(brievc, "json_stringify_wasm", &out);
+
+    // List of boxed tuples: index 1 must use the target-width handle stride
+    // (4 on wasm32) and unbox the i32 handle. A prior 8-byte read stride was
+    // the bug: append stored the second tuple at offset 4, read it at 8, and
+    // the HTTP request queue lost every second entry.
+    build_fixture(brievc, "list_tuple_index_wasm", &out);
+    let tuple_ir = std::fs::read_to_string(out.join("list_tuple_index_wasm.ll")).unwrap();
+    let body = tuple_ir.split("define i32 @read_second").nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("read_second definition");
+    assert!(body.contains("getelementptr i32, ptr"), "tuple list index must use target-width stride:\n{body}");
+    assert!(!body.contains("getelementptr i64, ptr %t24"), "tuple list index must not use an 8-byte list stride:\n{body}");
+
+    // Generic wasm regression corpus: a struct list scan plus Float/JSON
+    // conversion. No recommender-specific names.
+    build_fixture(brievc, "generic_wasm_scan", &out);
+
+    // Tuple return/destructure/field access on wasm32 (the float_fmt `sscale`
+    // shape used by JSON parsing).
+    build_fixture(brievc, "tuple_return_wasm", &out);
 }

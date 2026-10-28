@@ -11,32 +11,24 @@ use std::collections::HashMap;
 struct LogicalInputs<'a> { left: &'a Expr, right: &'a Expr, exit: bool }
 
 struct LogicalScope {
-    values: HashMap<String, String>,
     pointers: HashMap<String, String>,
-    state_pointers: HashMap<usize, (String, String)>,
-    expressions: HashMap<(String, String, String), String>,
+    fields: HashMap<usize, (String, String)>,
+    values: HashMap<String, String>,
 }
 
 impl LlvmBackend {
     fn logical_scope(&self) -> LogicalScope {
-        LogicalScope {
-            values: self.fun.last_val_temps.clone(),
-            pointers: self.fun.canonical_ptrs.clone(),
-            state_pointers: self.fun.state_ptr_cache.clone(),
-            expressions: self.fun.expr_dedup_cache.clone(),
-        }
+        LogicalScope { pointers: self.fun.canonical_ptrs.clone(),
+            fields: self.fun.state_ptr_cache.clone(), values: self.fun.last_val_temps.clone() }
     }
 
     fn merge_logical_scope(&mut self, before: LogicalScope) {
         // 2026-10-22: RHS-only registers do not dominate the skipped edge.
         // Keep only unchanged incoming caches; invalidations stay invalidated.
-        // 2026-10-25: pointer and expression caches obey the same dominance
-        // rule; remove these filters only when caches are CFG-aware.
+        self.fun.canonical_ptrs.retain(|key, value| before.pointers.get(key) == Some(value));
+        self.fun.state_ptr_cache.retain(|key, value| before.fields.get(key) == Some(value));
         self.fun.last_val_temps.retain(|key, value| before.values.get(key) == Some(value));
         self.fun.last_val_types.retain(|key, _| self.fun.last_val_temps.contains_key(key));
-        self.fun.canonical_ptrs.retain(|key, value| before.pointers.get(key) == Some(value));
-        self.fun.state_ptr_cache.retain(|key, value| before.state_pointers.get(key) == Some(value));
-        self.fun.expr_dedup_cache.retain(|key, value| before.expressions.get(key) == Some(value));
     }
 
     pub(super) fn parameter_is_reassigned(body: &[Statement], name: &str) -> bool {
@@ -57,7 +49,10 @@ impl LlvmBackend {
     // lazy branch is skipped. Bind mutable parameters at entry in their ABI
     // type, including pointers and vectors; no machine-word boxing is needed.
     pub(super) fn bind_mutable_parameter(&mut self, out: &mut String, name: &str, ty: &Type, raw: &str) {
-        let slot = self.fun.gen_reg();
+        // 2026-10-25: parameter slots are emitted before the body's %t
+        // counter is reset; sharing the %t namespace produced duplicate
+        // definitions in large functions (browser_catalogue_scan %t48).
+        let slot = self.fun.next_reg_with_prefix("ps");
         let physical = self.llvm_type(ty);
         writeln!(out, "  {} = alloca {}", slot, physical).ok();
         writeln!(out, "  store {} {}, ptr {}", physical, raw, slot).ok();

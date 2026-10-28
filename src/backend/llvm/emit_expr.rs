@@ -567,6 +567,12 @@ impl LlvmBackend {
                 // 2026-07-17: Remaining paths: local binding,
                 // phi register, state field, global constant.
                 if let Some(reg) = self.get_local(name) {
+                    if self.fun.native_parameter_slots.contains(&reg) {
+                        let ty = self.get_local_type(name);
+                        let loaded = self.fun.gen_reg();
+                        writeln!(out, "{}{} = load {}, ptr {}", indent, loaded, self.llvm_type(&ty), reg).ok();
+                        return TypedRegister { name: loaded, ty };
+                    }
                     // 2026-07-18: If the binding is an alloca (param slot,
                     // uninitialized let, or txn param slot), emit a load.
                     if self.fun.param_slots.values().any(|s| s == &reg)
@@ -659,15 +665,6 @@ impl LlvmBackend {
                             // the String/obj branches' guard.
                             let t = self.fun.gen_reg();
                             writeln!(out, "{}{} = trunc i64 {} to i32", indent, t, reg).ok();
-                            TypedRegister { name: t, ty: orig_ty }
-                        } else if ty == Type::int()
-                            && self.is_protocol_member(&orig_ty, "Bool")
-                        {
-                            // Boxed Bool parameters share the i64 slot ABI,
-                            // but their expressions use canonical i8 0/1.
-                            // Restore that register width on local reads.
-                            let t = self.fun.gen_reg();
-                            writeln!(out, "{}{} = trunc i64 {} to i8", indent, t, reg).ok();
                             TypedRegister { name: t, ty: orig_ty }
                         } else if (self.is_string_operand(&orig_ty)
                             || self.is_blob_operand(&orig_ty))
@@ -844,9 +841,24 @@ impl LlvmBackend {
                         // i{int_bits} (push_field_type), so `loaded` is already
                         // the arithmetic width — no trunc needed. Bool/String/
                         // Data/Ptr slots stay i64 and are boxed/unboxed above.
-                        TypedRegister {
-                            name: loaded,
-                            ty: briev_ty,
+                        let enum_handle = matches!(
+                            &briev_ty,
+                            Type::Custom(n) | Type::Applied(n, _)
+                                if self.ctx.enum_handle_types.contains(n)
+                        );
+                        if enum_handle && field_llvm_ty == "i64" && self.ctx.int_bits < 64 {
+                            let tr = self.fun.gen_reg();
+                            writeln!(out, "{}{} = trunc i64 {} to i32", indent, tr, loaded).ok();
+                            self.fun.reg_llvm_ty.insert(tr.clone(), "i32".to_string());
+                            TypedRegister { name: tr, ty: briev_ty }
+                        } else {
+                            if enum_handle {
+                                self.fun.reg_llvm_ty.insert(loaded.clone(), field_llvm_ty.clone());
+                            }
+                            TypedRegister {
+                                name: loaded,
+                                ty: briev_ty,
+                            }
                         }
                     }
                 } else if let Some((ty, _)) = self.ctx.constants.get(name) {
@@ -884,10 +896,14 @@ impl LlvmBackend {
                         writeln!(out, "{}{} = load {}, ptr @{}", indent, v, hw, name).ok();
                         TypedRegister { name: v.to_string(), ty: Type::int() }
                     } else {
-                        writeln!(out, "{}{} = load i64, ptr @{}", indent, v, name).ok();
+                        // 2026-10-22: use the same target-derived type as the
+                        // constant global. Flexible Int is i32 on wasm32; a
+                        // hardcoded i64 load made comparisons invalid.
+                        let llvm_ty = self.llvm_type(ty);
+                        writeln!(out, "{}{} = load {}, ptr @{}", indent, v, llvm_ty, name).ok();
                         TypedRegister {
                             name: v.to_string(),
-                            ty: Type::int(),
+                            ty: ty.clone(),
                         }
                     }
                 } else if let Some(init) = self.ctx.inits.get(name) {
@@ -936,7 +952,7 @@ impl LlvmBackend {
                     // destination register. The old call passed `v`, so
                     // payload-type lookup always missed (diagnosed by
                     // BRIEV_DIAG_ENUM_TYPE).
-                    self.emit_enum_construct(out, v, name, tag_idx, args, indent)
+                    self.emit_enum_construct(out, name, tag_idx, args, indent)
                 } else if self.ctx.struct_types.contains_key(name) {
                     // 2026-07-31 (A5): struct constructor call — `Stack()` /
                     // `Person("Alice", 30)` — emits a struct literal with the
@@ -964,13 +980,13 @@ impl LlvmBackend {
             }
 
             // ── BinaryOp ─────────────────────────────────────────────
+            // 2026-10-22: choose the evaluation edge before emitting operands;
+            // the existing register-only binary paths remain for eager ops.
+            Expr::BinaryOp(BinaryOpKind::And, lhs, rhs) =>
+                self.emit_short_circuit(out, (lhs, rhs), false, indent),
+            Expr::BinaryOp(BinaryOpKind::Or, lhs, rhs) =>
+                self.emit_short_circuit(out, (lhs, rhs), true, indent),
             Expr::BinaryOp(kind, lhs, rhs) => {
-                // 2026-10-25: guarded reads and calls require lazy boolean
-                // evaluation. Route both operators through the shared CFG
-                // lowering; retire only when expression IR preserves this edge.
-                if matches!(kind, BinaryOpKind::And | BinaryOpKind::Or) {
-                    return self.emit_short_circuit(out, (lhs, rhs), matches!(kind, BinaryOpKind::Or), indent);
-                }
                 // 2026-07-21: Mod with phi-tracked counter dividend — trunc i64
                 // to i32 so LLVM uses imul $magic (1 uop) instead of mul %reg
                 // (3 uops, 128-bit) for modulo-by-constant optimization. The
@@ -1015,13 +1031,7 @@ impl LlvmBackend {
                         };
                         self.emit_binary_op(out, v, kind, &conv_l, &conv_r, indent)
                     } else {
-                        if let Some((conv_l, conv_r)) =
-                            self.adapt_mixed_integer_operands(out, indent, &l, &r)
-                        {
-                            self.emit_binary_op(out, v, kind, &conv_l, &conv_r, indent)
-                        } else {
-                            self.emit_binary_op(out, v, kind, &l, &r, indent)
-                        }
+                        self.emit_binary_op(out, v, kind, &l, &r, indent)
                     }
                 }
             }
@@ -1164,7 +1174,8 @@ impl LlvmBackend {
                 if let Ok(n) = field.parse::<usize>() {
                     if let crate::ast::Type::Tuple(ts) = &obj_reg.ty {
                         let handle_p = self.fun.gen_reg();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, handle_p, obj_reg.name).ok();
+                        let hw = format!("i{}", self.ctx.int_bits);
+                        writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, handle_p, hw, obj_reg.name).ok();
                         let slot = self.fun.gen_reg();
                         writeln!(
                             out,
@@ -1172,9 +1183,15 @@ impl LlvmBackend {
                             indent, slot, handle_p, n + 1
                         )
                         .ok();
-                        let elem = self.fun.gen_reg();
-                        writeln!(out, "{}{} = load i64, ptr {}", indent, elem, slot).ok();
                         let elem_ty = ts.get(n).cloned().unwrap_or_else(Type::int);
+                        let elem = self.fun.gen_reg();
+                        let elem_llvm = self.llvm_type(&elem_ty);
+                        let load_ty = if matches!(elem_llvm.as_str(), "i8" | "i16" | "i32") {
+                            elem_llvm.clone()
+                        } else {
+                            "i64".to_string()
+                        };
+                        writeln!(out, "{}{} = load {}, ptr {}", indent, elem, load_ty, slot).ok();
                         // 2026-10-05 (json.bv): a String/Data tuple element is
                         // stored as a boxed i64 handle — inttoptr it back to a
                         // ptr so consumers (briev_str_eq, length, slice) see a
@@ -1186,30 +1203,6 @@ impl LlvmBackend {
                         {
                             let c = self.fun.gen_reg();
                             writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, c, elem).ok();
-                            c
-                        } else if self.llvm_type(&elem_ty) == "ptr" {
-                            let c = self.fun.gen_reg();
-                            writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, c, elem).ok();
-                            c
-                        } else if matches!(self.llvm_type(&elem_ty).as_str(), "float" | "double") {
-                            let float_ty = self.llvm_type(&elem_ty);
-                            let bits = if float_ty == "float" {
-                                let narrow = self.fun.gen_reg();
-                                writeln!(out, "{}{} = trunc i64 {} to i32", indent, narrow, elem).ok();
-                                narrow
-                            } else {
-                                elem.clone()
-                            };
-                            let value = self.fun.gen_reg();
-                            let int_ty = if float_ty == "float" { "i32" } else { "i64" };
-                            writeln!(out, "{}{} = bitcast {} {} to {}", indent, value, int_ty, bits, float_ty).ok();
-                            value
-                        } else if self.llvm_type(&elem_ty).starts_with('i')
-                            && self.llvm_type(&elem_ty) != "i64"
-                        {
-                            let target_ty = self.llvm_type(&elem_ty);
-                            let c = self.fun.gen_reg();
-                            writeln!(out, "{}{} = trunc i64 {} to {}", indent, c, elem, target_ty).ok();
                             c
                         } else {
                             elem
@@ -1622,6 +1615,15 @@ impl LlvmBackend {
                     // Raw Ptr<T> from Malloc# has no header — offset is the index.
                     let is_list_type = matches!(&obj_reg.ty, Type::Applied(n, _) if n == "List")
                         || is_seq_literal;
+                    // 2026-10-27: list slots are target-width handles, not
+                    // always 64-bit words. On wasm32 append writes i32 slots;
+                    // reading with an i64 stride skipped every second entry
+                    // (HTTP request queue corruption).
+                    let slot_ty = if is_list_type || matches!(obj_reg.ty, Type::Ptr(_)) {
+                        format!("i{}", self.ctx.int_bits)
+                    } else {
+                        "i64".to_string()
+                    };
                     let gep_idx = self.gep_index(out, indent, &idx_clone);
                     if is_list_type {
                         writeln!(out, "{}{} = add i64 {}, 1", indent, offset, gep_idx).ok();
@@ -1638,16 +1640,28 @@ impl LlvmBackend {
                     // 8-byte — the recommender regression). List/seq slots
                     // and non-scalar pointees keep the i64-carrier paths
                     // below (boxed handles, fat pointers, string boxes).
-                    let elem_llvm = match &obj_reg.ty {
-                        Type::Ptr(inner) => self.llvm_type(inner),
-                        _ => "i64".to_string(),
+                    let (elem_llvm, scalar_pointee) = match &obj_reg.ty {
+                        Type::Ptr(inner) => {
+                            // 2026-10-25: a boxed tuple handle lowers to i32 on
+                            // wasm32, but the canonical Collection slot is an
+                            // 8-byte word. Classifying it as a scalar pointee
+                            // made List<(...)> index with a 4-byte stride and
+                            // read the padding at index 1 (strict JSON object
+                            // lookup). Scalar here means a flat protocol value,
+                            // never an aggregate/boxed handle.
+                            let scalar = matches!(inner.as_ref(), Type::Bits(_))
+                                || (self.ctx.type_universe.as_ref().map_or(false, |u| {
+                                    crate::type_universe::protocol_category(u, inner).map_or(false, |cat| {
+                                        matches!(cat.as_str(), "Int" | "UInt" | "Float" | "Bool" | "Char")
+                                    })
+                                }) && !matches!(inner.as_ref(), Type::Tuple(_)));
+                            (self.llvm_type(inner), scalar)
+                        }
+                        _ => ("i64".to_string(), false),
                     };
                     let raw_ptr_scalar = matches!(obj_reg.ty, Type::Ptr(_))
                         && !is_list_type
-                        && matches!(
-                            elem_llvm.as_str(),
-                            "i8" | "i16" | "i32" | "i64" | "float" | "double"
-                        );
+                        && scalar_pointee;
                     if raw_ptr_scalar {
                         writeln!(
                             out,
@@ -1675,8 +1689,8 @@ impl LlvmBackend {
                     }
                     writeln!(
                         out,
-                        "{}{} = getelementptr i64, ptr {}, i64 {}",
-                        indent, gep, ptr, offset
+                        "{}{} = getelementptr {}, ptr {}, i64 {}",
+                        indent, gep, slot_ty, ptr, offset
                     )
                     .ok();
                     // 2026-08-01 (E): `vol let` — Ptr-Index reads emit
@@ -1688,17 +1702,21 @@ impl LlvmBackend {
                     if self.is_string_operand(&index_elem_ty) {
                         let raw = self.fun.gen_reg();
                         writeln!(out, "{}{} = load {}{}, ptr {}", indent, raw,
-                            if self.fun.volatile_read { "volatile " } else { "" }, "i64", gep).ok();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, v, raw).ok();
+                            if self.fun.volatile_read { "volatile " } else { "" }, slot_ty, gep).ok();
+                        writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, v, slot_ty, raw).ok();
                     } else if self.is_protocol_member(&index_elem_ty, "Float") {
                         // 2026-08-07 (Phase 7): a Float (f32) element is
                         // stored in the i64 list slot as
                         // `zext(bitcast float to i32)` — invert it.
                         let raw = self.fun.gen_reg();
                         writeln!(out, "{}{} = load {}{}, ptr {}", indent, raw,
-                            if self.fun.volatile_read { "volatile " } else { "" }, "i64", gep).ok();
+                            if self.fun.volatile_read { "volatile " } else { "" }, slot_ty, gep).ok();
                         let tr = self.fun.gen_reg();
-                        writeln!(out, "{}{} = trunc i64 {} to i32", indent, tr, raw).ok();
+                        if slot_ty == "i64" {
+                            writeln!(out, "{}{} = trunc i64 {} to i32", indent, tr, raw).ok();
+                        } else {
+                            writeln!(out, "{}{} = trunc i32 {} to i32", indent, tr, raw).ok();
+                        }
                         writeln!(out, "{}{} = bitcast i32 {} to float", indent, v, tr).ok();
                     } else if self.is_protocol_member(&index_elem_ty, "Int") {
                         // 2026-08-12 (slice 4, wasm32 maze): an Int element is
@@ -1761,8 +1779,10 @@ impl LlvmBackend {
                         writeln!(out, "{}store i64 {}, ptr {}", indent, table_addr, fat_table).ok();
                         writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, v, fat_p).ok();
                     } else {
+                        // List slots carry target-width handles; native i64,
+                        // wasm32 i32.
                         writeln!(out, "{}{} = load {}{}, ptr {}", indent, v,
-                            if self.fun.volatile_read { "volatile " } else { "" }, "i64", gep).ok();
+                            if self.fun.volatile_read { "volatile " } else { "" }, slot_ty, gep).ok();
                     }
                 } else if self.is_string_operand(&obj_reg.ty) {
                     // 2026-10-05 (json.bv): String indexing `s[i]` — the
@@ -1779,15 +1799,22 @@ impl LlvmBackend {
                         writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, p, recv_llvm, obj_reg.name).ok();
                         p
                     };
+                    let idx_llvm = self.llvm_type(&idx_reg.ty);
+                    let idx64 = if idx_llvm == "i64" {
+                        idx_reg.name.clone()
+                    } else {
+                        let w = self.fun.gen_reg();
+                        writeln!(out, "{}{} = sext {} {} to i64", indent, w, idx_llvm, idx_reg.name).ok();
+                        w
+                    };
                     let off = self.fun.gen_reg();
-                    let idx_i64 = self.gep_index(out, indent, &idx_reg);
-                    writeln!(out, "{}{} = add i64 {}, 8", indent, off, idx_i64).ok();
+                    writeln!(out, "{}{} = add i64 {}, 8", indent, off, idx64).ok();
                     let gep = self.fun.gen_reg();
                     writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, gep, base, off).ok();
                     let byte = self.fun.gen_reg();
                     writeln!(out, "{}{} = load i8, ptr {}", indent, byte, gep).ok();
-                    let int_ty = self.llvm_type(&Type::int());
-                    writeln!(out, "{}{} = zext i8 {} to {}", indent, v, byte, int_ty).ok();
+                    let hw = format!("i{}", self.ctx.int_bits);
+                    writeln!(out, "{}{} = zext i8 {} to {}", indent, v, byte, hw).ok();
                 } else {
                     writeln!(
                         out,
@@ -2098,12 +2125,12 @@ impl LlvmBackend {
                 let arr_is_str = self.is_semantic_string(array, &array_reg);
                 if arr_is_str {
                     let sp = self.string_ptr(out, indent, &array_reg);
+                    let hw = format!("i{}", self.ctx.int_bits);
                     let lo = match start {
                         Some(s) => self.emit_expr(out, s, indent),
                         None => {
                             let z = self.fun.gen_reg();
-                            let int_ty = self.llvm_type(&Type::int());
-                            writeln!(out, "{}{} = add {} 0, 0", indent, z, int_ty).ok();
+                            writeln!(out, "{}{} = add {} 0, 0", indent, z, hw).ok();
                             TypedRegister { name: z, ty: Type::int() }
                         }
                     };
@@ -2111,20 +2138,21 @@ impl LlvmBackend {
                         Some(e) => self.emit_expr(out, e, indent),
                         None => {
                             let n = self.fun.gen_reg();
-                            let int_ty = self.llvm_type(&Type::int());
-                            writeln!(out, "{}{} = add {} 0, 0", indent, n, int_ty).ok();
+                            writeln!(out, "{}{} = add {} 0, 0", indent, n, hw).ok();
                             TypedRegister { name: n, ty: Type::int() }
                         }
                     };
                     let _ = stride;
                     let sub = self.fun.gen_reg();
+                    let lo_name = self.ensure_typed_value(
+                        out, indent, &hw, &lo.name, Some(lo.ty), self.ctx.type_universe.clone().as_ref());
+                    let hi_name = self.ensure_typed_value(
+                        out, indent, &hw, &hi.name, Some(hi.ty), self.ctx.type_universe.clone().as_ref());
                     // 2026-09-09 (Family C): state prefix when the symbol is
                     // a pure-Briev defn (all defns carry %state).
                     let st_sub = if self.ctx.defn_takes_state("briev_str_substr") { "ptr %state, " } else { "" };
-                    let lo_ty = self.llvm_type(&lo.ty);
-                    let hi_ty = self.llvm_type(&hi.ty);
                     writeln!(out, "{}{} = call ptr @briev_str_substr({}ptr {}, {} {}, {} {})",
-                        indent, sub, st_sub, sp, lo_ty, lo.name, hi_ty, hi.name).ok();
+                        indent, sub, st_sub, sp, hw, lo_name, hw, hi_name).ok();
                     return TypedRegister { name: sub, ty: crate::ast::Type::Custom("String".to_string()) };
                 }
                 // 2026-08-22 (spec-conformance plan Phase 6b): VECTOR slices
@@ -2707,7 +2735,8 @@ impl LlvmBackend {
             let hdr = self.fun.gen_reg();
             writeln!(out, "{}{} = bitcast ptr {} to ptr", indent, hdr, raw).ok();
             writeln!(out, "{}store i64 0, ptr {}", indent, hdr).ok();
-            writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, v, hdr).ok();
+            let hw = format!("i{}", self.ctx.int_bits);
+            writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, v, hdr, hw).ok();
         } else {
             let total = (2 + count) * 8;
             let raw = self.fun.gen_reg();
@@ -2733,7 +2762,8 @@ impl LlvmBackend {
                 let e64 = self.adapt_to_i64(out, indent, &e);
                 writeln!(out, "{}store i64 {}, ptr {}", indent, e64, slot).ok();
             }
-            writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, v, hdr).ok();
+            let hw = format!("i{}", self.ctx.int_bits);
+            writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, v, hdr, hw).ok();
         }
         // 2026-08-13 (obj value ABI): the seq value is a BOXED i64 handle
         // (ptrtoint'd above), so its register type is Int — NOT Ptr. A Ptr
@@ -2893,7 +2923,13 @@ impl LlvmBackend {
         // loop body (flush_pending_struct_allocas) — an allocation in the loop
         // makes clang -O3 peel the loop and emit a bogus exit assumption (the
         // node fires once). Elsewhere it stays inline.
-        if self.fun.defer_struct_allocas {
+        // 2026-10-27: only constant-field literals may share one preheader
+        // allocation. A dynamic field is re-evaluated per iteration; hoisting
+        // its allocation made every list/collection entry alias the last
+        // iteration's object (`List<Item>` parsed from JSON read the final
+        // title for every element). Dynamic literals allocate per evaluation.
+        let const_fields = fields.iter().all(|(_, expr)| is_compile_time_const(expr));
+        if self.fun.defer_struct_allocas && const_fields {
             self.fun.pending_struct_allocas.push(format!("{}  {} = call ptr @malloc(i64 {})", indent, alloca_reg, total_size));
         } else {
             writeln!(out, "{}  {} = call ptr @malloc(i64 {})", indent, alloca_reg, total_size).ok();
@@ -2939,8 +2975,17 @@ impl LlvmBackend {
                 writeln!(out, "{}  {} = inttoptr i64 {} to ptr", indent, conv, val.name).ok();
                 writeln!(out, "{}  store ptr {}, ptr {}", indent, conv, ptr_reg).ok();
             } else {
-                let fty = self.llvm_type(&val.ty);
-                writeln!(out, "{}  store {} {}, ptr {}", indent, fty, val.name, ptr_reg).ok();
+                // 2026-10-25: store through the DECLARED field type, not the
+                // value's register type. A boxed Bool parameter arrives as an
+                // i64 handle but its struct field is i8; storing by val.ty
+                // emitted `store i32 %ac3` on wasm and rejected the module.
+                let field_ty = self.ctx.struct_types.get(type_name)
+                    .and_then(|fields| fields.iter().find(|(name, _)| name == field_name))
+                    .map(|(_, ty)| ty.clone())
+                    .unwrap_or_else(|| val.ty.clone());
+                let stored = self.coerce_register_value(out, indent, &val, &field_ty);
+                let fty = self.llvm_type(&field_ty);
+                writeln!(out, "{}  store {} {}, ptr {}", indent, fty, stored.name, ptr_reg).ok();
             }
         }
 
@@ -3126,7 +3171,7 @@ impl LlvmBackend {
                 break;
             }
             if !packed && !is_union {
-                offset += self.field_storage_size(fty);
+                offset += types::type_size(fty, self.ctx.type_universe.as_ref());
             }
         }
         let field_ty = field_ty.unwrap_or_else(|| {
@@ -4431,7 +4476,7 @@ impl LlvmBackend {
                 let count = self.vector_element_count(&recv_reg.ty);
                 let r = self.fun.gen_reg();
                 writeln!(out, "{}{} = add i64 0, {}", indent, r, count).ok();
-                TypedRegister { name: r, ty: Type::int() }
+                TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
             }
             // 2026-08-14 (Boxed Cat, iterable-protocol §10.4, tri-partite rule):
             // runtime `.^Size` is DELETED — the element count of a collection
@@ -4455,29 +4500,25 @@ impl LlvmBackend {
                 // prefix of the [len][bytes] buffer). For non-strings, the
                 // compile-time type size.
                 if self.is_string_operand(&recv_reg.ty) {
-                    let loaded = self.fun.gen_reg();
-                    writeln!(out, "{}{} = load i64, ptr {}", indent, loaded, recv_reg.name).ok();
-                    let int_ty = self.llvm_type(&Type::int());
-                    let r = if int_ty == "i64" {
-                        loaded
-                    } else {
-                        let narrowed = self.fun.gen_reg();
-                        writeln!(out, "{}{} = trunc i64 {} to {}", indent, narrowed, loaded, int_ty).ok();
-                        narrowed
-                    };
-                    return TypedRegister { name: r, ty: Type::int() };
+                    let r = self.fun.gen_reg();
+                    writeln!(out, "{}{} = load i64, ptr {}", indent, r, recv_reg.name).ok();
+                    return TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() };
                 }
-                let sz = self.reflected_type_size(&recv_reg.ty);
+                // 2026-10-25: ABI headers are i64, but the declared Int is
+                // target-width (i32 on wasm32). Adapt before comparison.
+                let resolved = self.llvm_type(&recv_reg.ty);
+                let sz = resolved.strip_prefix('i').and_then(|bits| bits.parse::<u64>().ok())
+                    .map(|bits| bits.div_ceil(8))
+                    .unwrap_or_else(|| types::type_size(&recv_reg.ty, self.ctx.type_universe.as_ref()));
                 let r = self.fun.gen_reg();
-                let int_ty = self.llvm_type(&Type::int());
-                writeln!(out, "{}{} = add {} 0, {}", indent, r, int_ty, sz).ok();
-                TypedRegister { name: r, ty: Type::int() }
+                writeln!(out, "{}{} = add i64 0, {}", indent, r, sz).ok();
+                TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
             }
             ("Alignment", ReflectKind::CompileTime) => {
                 let align = self.type_alignment(&recv_reg.ty);
                 let r = self.fun.gen_reg();
                 writeln!(out, "{}{} = add i64 0, {}", indent, r, align).ok();
-                TypedRegister { name: r, ty: Type::int() }
+                TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
             }
             ("Ptr", ReflectKind::Runtime) => {
                 // x.^Ptr ≡ &x — reuse the address-of path.
@@ -4489,7 +4530,7 @@ impl LlvmBackend {
                     let count = self.vector_element_count(&recv_reg.ty);
                     let r = self.fun.gen_reg();
                     writeln!(out, "{}{} = add i64 0, {}", indent, r, count).ok();
-                    TypedRegister { name: r, ty: Type::int() }
+                    TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
                 }
                  // 2026-08-12 (Iterable protocol): `x.^Length` on a String is
                  // the STORED byte count — the [len] header of the
@@ -4561,20 +4602,14 @@ impl LlvmBackend {
                          _ => {
                              let p = self.fun.gen_reg();
                              let gep = self.fun.gen_reg();
-                             let r = self.fun.gen_reg();
-                             let handle_ty = format!("i{}", self.ctx.int_bits);
-                             writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, p, handle_ty, recv_reg.name).ok();
+                             let full = self.fun.gen_reg();
+                             // Collection handles are target-width on wasm32;
+                             // the hidden len slot remains an i64 header.
+                             self.emit_inttoptr(out, indent, &p, &recv_reg.name);
                              writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 16", indent, gep, p).ok();
-                             let loaded = self.fun.gen_reg();
-                             writeln!(out, "{}{} = load i64, ptr {}", indent, loaded, gep).ok();
-                             let native_int = format!("i{}", self.ctx.int_bits);
-                             let length = if native_int == "i64" {
-                                 loaded
-                             } else {
-                                 writeln!(out, "{}{} = trunc i64 {} to {}", indent, r, loaded, native_int).ok();
-                                 r
-                             };
-                             TypedRegister { name: length, ty: Type::int() }
+                             writeln!(out, "{}{} = load i64, ptr {}", indent, full, gep).ok();
+                             let r = self.adapt_from_i64(out, indent, &full, &Type::int());
+                             TypedRegister { name: r, ty: Type::int() }
                          }
                      }
                  }
@@ -4596,7 +4631,7 @@ impl LlvmBackend {
                 let code = self.type_category_code(&recv_reg.ty);
                 let r = self.fun.gen_reg();
                 writeln!(out, "{}{} = add i64 0, {}", indent, r, code).ok();
-                TypedRegister { name: r, ty: Type::int() }
+                TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
             }
             // 2026-08-14 (boundary plan): `x.^^Element` — a frozen descriptor =
             // the ELEMENT type's category code, folded exactly like `.^^Type`
@@ -4608,7 +4643,7 @@ impl LlvmBackend {
                 let code = self.type_category_code(&elem_ty);
                 let r = self.fun.gen_reg();
                 writeln!(out, "{}{} = add i64 0, {}", indent, r, code).ok();
-                TypedRegister { name: r, ty: Type::int() }
+                TypedRegister { name: self.adapt_from_i64(out, indent, &r, &Type::int()), ty: Type::int() }
             }
             _ => panic!(
                 "reflection '{}' with kind '{:?}' reached codegen without emission",
@@ -4692,31 +4727,17 @@ impl LlvmBackend {
     /// 2026-07-31: Alignment of a type in bytes (compile-time reflection).
     fn type_alignment(&self, ty: &Type) -> u64 {
         match ty {
+            Type::Ptr(_) => 8,
             Type::Vector(inner, _) => self.type_alignment(inner),
-            _ => self.reflected_type_size(ty).clamp(1, 8),
+            Type::Custom(s) => match s.as_str() {
+                "Int" | "Int64" | "Float64" | "String" | "Ptr" => 8,
+                "Int32" | "Float" => 4,
+                "Int16" => 2,
+                "Int8" | "Bool" | "Char" | "Byte" => 1,
+                _ => 8,
+            },
+            _ => 8,
         }
-    }
-
-    /// 2026-10-25: physical reflection follows the target casting graph.
-    /// Host-sized defaults made wasm32 integer bounds shift by 63 and poison
-    /// JSON parsing. Structural layouts retain their universe metadata.
-    fn reflected_type_size(&self, ty: &Type) -> u64 {
-        if let Type::Vector(inner, dims) = ty {
-            let count: u64 = dims.iter().map(|dim| match dim {
-                crate::ast::Dimension::Anonymous(n) | crate::ast::Dimension::Named(_, n) => *n as u64,
-            }).product();
-            return self.reflected_type_size(inner) * count;
-        }
-        let Some(universe) = self.ctx.type_universe.as_ref() else {
-            return types::type_size(ty, None);
-        };
-        let Some(graph) = self.ctx.casting_graph.as_ref() else {
-            return types::type_size(ty, Some(universe));
-        };
-        let llvm = graph.resolve_llvm_type(universe, ty, self.ctx.int_bits);
-        if llvm == "ptr" { return u64::from(self.ctx.int_bits) / 8; }
-        super::emit_toplevel::llvm_type_bytes(&llvm, None)
-            .unwrap_or_else(|| types::type_size(ty, Some(universe)))
     }
 
     // 2026-07-24: Struct array list literal — detect when all elements
@@ -4860,18 +4881,6 @@ impl LlvmBackend {
     /// — Σ type_size over-counts sub-byte fields (Bits(12)+Bits(4) is 3 bytes
     /// as type_sizes, 2 bytes packed).
     pub(crate) fn struct_type_size(&self, type_name: &str) -> u64 {
-        // 2026-10-25 (nested-object handle layout): an `obj` field stores the
-        // target-width handle, not the full byte size of the referenced obj's
-        // body. ResolvedType.bytes describes that body's layout and therefore
-        // over-allocates/under-allocates parent objects when its field offsets
-        // are computed from the stored ABI values. Keep parent allocation and
-        // lookup_field_offset on the same representation; undo only when the
-        // object ABI changes to inline nested-object storage.
-        if self.ctx.obj_types.contains(type_name) {
-            return self.ctx.struct_types.get(type_name)
-                .map(|fields| fields.iter().map(|(_, ty)| self.field_storage_size(ty)).sum())
-                .unwrap_or(8);
-        }
         // Try type universe first
         if let Some(ref u) = self.ctx.type_universe {
             if let Some(info) = u.types.get(type_name) {
@@ -4899,24 +4908,9 @@ impl LlvmBackend {
         }
         self.ctx.struct_types.get(type_name)
             .map(|fields| {
-                fields.iter().map(|(_, ty)| self.field_storage_size(ty)).sum()
+                fields.iter().map(|(_, ty)| types::type_size(ty, self.ctx.type_universe.as_ref())).sum()
             })
             .unwrap_or(8)
-    }
-
-    /// Size a field by the representation stored in its parent. Named obj
-    /// values are boxed target-width handles; their ResolvedType byte size is
-    /// the pointee layout and must not be used as the slot width.
-    pub(crate) fn field_storage_size(&self, ty: &Type) -> u64 {
-        let base = match ty {
-            Type::Custom(name) | Type::Applied(name, _) => name.as_str(),
-            _ => "",
-        };
-        let base = base.split_once('<').map_or(base, |(name, _)| name);
-        if self.ctx.obj_types.contains(base) {
-            return (self.ctx.int_bits / 8).max(1);
-        }
-        types::type_size(ty, self.ctx.type_universe.as_ref())
     }
 
     /// 2026-07-24: Computes offsets from field types using type_size (pack=1).
@@ -4943,7 +4937,7 @@ impl LlvmBackend {
                 if fname == field_name {
                     return offset;
                 }
-                offset += self.field_storage_size(ftype);
+                offset += types::type_size(ftype, self.ctx.type_universe.as_ref());
             }
         }
         0
@@ -5771,7 +5765,8 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         member_ty: &Type,
     ) -> TypedRegister {
         let base = self.fun.gen_reg();
-        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base, handle).ok();
+        let hw = format!("i{}", self.ctx.int_bits);
+        writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, handle).ok();
         let slot = self.fun.gen_reg();
         writeln!(out, "{}{} = getelementptr i64, ptr {}, i64 1", indent, slot, base).ok();
         let raw = self.fun.gen_reg();
@@ -5879,7 +5874,6 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         &mut self,
         out: &mut String,
         v: &str,
-        variant_name: &str,
         tag_idx: usize,
         args: &[Expr],
         indent: &str,
@@ -5894,7 +5888,8 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         let out_used = inline_slot.is_none()
             && self.fun.enum_return_context
             && !self.fun.enum_out_busy
-            && self.fun.enum_out_slot.is_some();
+            && self.fun.enum_out_slot.is_some()
+            && self.fun.expected_enum_type.as_ref() == self.fun.enum_out_type.as_ref();
         if out_used {
             self.fun.enum_out_busy = true;
         }
@@ -5926,14 +5921,14 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         let saved_expected_enum = self.fun.expected_enum_type.clone();
         let payload_expected = saved_expected_enum
             .as_ref()
-            .and_then(|t| self.enum_payload_type(t, variant_name));
+            .and_then(|t| self.enum_payload_type(t, v));
         if std::env::var_os("BRIEV_DIAG_ENUM_TYPE").is_some() {
             let layout = saved_expected_enum
                 .as_ref()
                 .and_then(|t| self.ctx.enum_layout_planner.as_ref().and_then(|p| p.layout_for(t)));
             eprintln!(
                 "diag enum: variant='{}' expected={:?} payload={:?} layout={:?}",
-                variant_name, saved_expected_enum, payload_expected, layout
+                v, saved_expected_enum, payload_expected, layout
             );
         }
         if payload_expected.is_some() {
@@ -6013,12 +6008,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     // The layout said inline but the value's concrete type is
                     // not a known enum image. Keep the boxed fallback rather
                     // than writing a partial image.
-                    None => {
-                        let preg = payload_expected.as_ref()
-                            .map(|expected| self.coerce_register_value(out, indent, &preg, expected))
-                            .unwrap_or(preg);
-                        Some(self.adapt_to_i64(out, indent, &preg))
-                    }
+                    None => Some(self.adapt_to_i64(out, indent, &preg)),
                 }
             }
         } else {
@@ -6028,16 +6018,24 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 let tv = self.fun.gen_reg();
                 self.emit_tuple(out, &tv, args, indent)
             };
-            let preg = payload_expected.as_ref()
-                .map(|expected| self.coerce_register_value(out, indent, &preg, expected))
-                .unwrap_or(preg);
             // 2026-10-05 (json.bv match-binding): box through the shared
             // adapter. The old inline match keyed on `llvm_type`, which
             // reports "ptr" for a struct handle whose register is ALREADY an
             // i64 (struct literals box to i64) — emitting `ptrtoint ptr <i64>`
             // and breaking clang. adapt_to_i64 is the protocol-driven source
             // of truth (pass-through for handles, bitcast for Float, …).
-            Some(self.adapt_to_i64(out, indent, &preg))
+            // The enum payload slot is always an i64 word. Scalar payloads
+            // (Bool i8, Int/Char i32, struct/obj handles i32 on wasm32) widen
+            // directly; pointer payloads ptrtoint through adapt_to_i64.
+            let handle_llvm = self.llvm_type(&preg.ty);
+            let word = if matches!(handle_llvm.as_str(), "i8" | "i16" | "i32") {
+                let w = self.fun.gen_reg();
+                writeln!(out, "{}{} = zext {} {} to i64", indent, w, handle_llvm, preg.name).ok();
+                w
+            } else {
+                self.adapt_to_i64(out, indent, &preg)
+            };
+            Some(word)
         };
         if let Some(payload_i64) = payload_i64 {
             let payload_slot = self.fun.gen_reg();
@@ -6050,21 +6048,13 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             writeln!(out, "{}store i64 {}, ptr {}", indent, payload_i64, payload_slot).ok();
         }
         let handle = self.fun.gen_reg();
-        writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, handle, raw).ok();
-        let result_ty = self.enum_variant_ctor(variant_name)
-            .map(|(enum_name, _)| {
-                match self.fun.expected_enum_type.as_ref() {
-                    Some(expected @ Type::Custom(name)) if name == &enum_name => expected.clone(),
-                    Some(expected @ Type::Applied(name, _)) if name == &enum_name => expected.clone(),
-                    _ => Type::Custom(enum_name),
-                }
-            })
-            .unwrap_or_else(Type::int);
+        let hw = format!("i{}", self.ctx.int_bits);
+        writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, handle, raw, hw).ok();
         self.fun.expected_enum_type = saved_expected_enum;
         if out_used {
             self.fun.enum_out_busy = false;
         }
-        TypedRegister { name: handle, ty: result_ty }
+        TypedRegister { name: handle, ty: Type::int() }
     }
 
     /// 2026-10-13 (static trait-constrained generics, SPEC §8.6, S6-M2):
@@ -6088,12 +6078,11 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         if type_params.is_empty() {
             return None;
         }
-        let parameters = self.ctx.generic_defns.get(name).map(|d| d.parameters.clone())
-            .or_else(|| self.ctx.generic_txns.get(name).map(|t| t.parameters.clone()))?;
+        let defn = self.ctx.generic_defns.get(name).cloned()?;
         // Infer each type param's concrete binding by unifying the declared
         // parameter types against the argument registers' concrete types.
         let mut subst: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
-        for (idx, (_, declared)) in parameters.iter().enumerate() {
+        for (idx, (_, declared)) in defn.parameters.iter().enumerate() {
             if let Some(reg) = arg_regs.get(idx) {
                 unify_generic_binding(declared, &reg.ty, &type_params, &mut subst);
             }
@@ -6113,7 +6102,8 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         // Enqueue the specialization once (dedup across call sites). Register
         // its ABI metadata so the call tail resolves params/return/state.
         if self.ctx.emitted_defn_specializations.insert(mangled.clone()) {
-            let param_tys: Vec<Type> = parameters
+            let param_tys: Vec<Type> = defn
+                .parameters
                 .iter()
                 .map(|(_, ty)| crate::typechecker::substitute_type(ty, &subst))
                 .collect();
@@ -6410,6 +6400,19 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         Some(TypedRegister { name: v.to_string(), ty })
     }
 
+    /// 2026-10-27: enum/Result handles use target-width call ABI even when
+    /// the generic type's fallback `llvm_type` is i64.
+    fn call_param_llvm_type(&self, ty: &Type) -> String {
+        match ty {
+            Type::Custom(n) | Type::Applied(n, _)
+                if self.ctx.enum_handle_types.contains(n) =>
+            {
+                format!("i{}", self.ctx.int_bits)
+            }
+            _ => self.llvm_type(ty),
+        }
+    }
+
     /// 2026-10-13 (refactor for S6): the ABI-adapting call tail of
     /// `emit_user_call`, keyed by `callee`. Shared by the ordinary user-call
     /// path and the monomorphized-generic path (which passes the specialized
@@ -6521,11 +6524,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 carrier_replace.insert(carrier.param_index);
             }
         }
-        // 2026-10-25: stateless definitions still require their declared ABI.
-        // Selecting argument conversion by hidden parameters left narrow
-        // literals unconverted for wide parameters, trapping in WebAssembly.
-        // Keep this until all direct calls share a signature-based marshaller.
-        if is_defn {
+        if takes_state || takes_plain || takes_sret {
             if takes_state {
                 call_args.push("ptr %state".to_string());
             }
@@ -6536,7 +6535,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             if takes_sret {
                 let slot = self.fun.hoisted_sret_params.get(name).cloned().or_else(|| {
                     self.fun.sret_call_slot.clone().or_else(|| {
-                        if self.fun.enum_return_context && !self.fun.enum_out_busy {
+                        if self.fun.enum_return_context {
                             self.fun.enum_out_slot.clone()
                         } else {
                             None
@@ -6545,10 +6544,11 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 }).unwrap_or_else(|| {
                     let s = self.fun.next_reg_with_prefix("esrt");
                     let words = self.enum_image_words_for_defn(name);
-                    // 2026-10-25: a boxed caller returning an sret callee must
-                    // retain the result beyond its frame. A local alloca here
-                    // made forwarded parser results dangle under LTO. Reuse
-                    // caller output above when available; otherwise own it.
+                    // 2026-10-25: a BOXED enum-returning function that returns
+                    // an sret callee must return a heap box, not a pointer into
+                    // its own frame. The slot becomes the returned handle; an
+                    // alloca here dangled after return (JSON parse_number via
+                    // json_value_depth). Sret functions use %enum_out above.
                     if self.fun.enum_return_context && self.fun.enum_out_slot.is_none() {
                         writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, s, words * 8).ok();
                     } else {
@@ -6569,7 +6569,35 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 if carrier_replace.contains(&i) {
                     continue;
                 }
-                let reg_llvm_ty = self.llvm_type(&reg.ty);
+                let reg_llvm_ty = self
+                    .fun
+                    .reg_llvm_ty
+                    .get(&reg.name)
+                    .cloned()
+                    .unwrap_or_else(|| self.llvm_type(&reg.ty));
+                // A boxed Bool/Char parameter is an i64 SSA register, but the
+                // callee's native ABI parameter is i8/i32 on wasm32. Unbox at
+                // the call boundary instead of forwarding the i64 register.
+                let original_boxed = self
+                    .fun
+                    .let_bindings
+                    .iter()
+                    .find(|(_, value)| *value == &reg.name)
+                    .and_then(|(binding, _)| self.fun.let_original_types.get(binding))
+                    .map(|ty| self.is_boxed_int_type(ty))
+                    .unwrap_or(false);
+                if (self.fun.boxed_scalar_regs.contains(&reg.name) || original_boxed) && reg.name.starts_with("%ac") {
+                    let dst = param_tys
+                        .get(i)
+                        .map(|pt| self.llvm_type(pt))
+                        .unwrap_or_else(|| reg_llvm_ty.to_string());
+                    if dst != "i64" && dst.starts_with('i') {
+                        let conv = self.fun.gen_reg();
+                        writeln!(out, "{}{} = trunc i64 {} to {}", indent, conv, reg.name, dst).ok();
+                        call_args.push(format!("{} {}", dst, conv));
+                        continue;
+                    }
+                }
                 // 2026-07-17: Get the function's expected parameter type.
                 // If available, use llvm_type() to determine the expected
                 // LLVM type and insert conversions (i64 → ptr for String/Data).
@@ -6608,13 +6636,6 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     let conv = self.fun.gen_reg();
                     writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, conv, reg.name).ok();
                     call_args.push(format!("i64 {}", conv));
-                } else if param_llvm_ty.starts_with('i')
-                    && reg_llvm_ty.starts_with('i')
-                    && param_llvm_ty != reg_llvm_ty
-                {
-                    let param_ty = param_tys.get(i).cloned().unwrap_or_else(|| reg.ty.clone());
-                    let converted = self.coerce_register_value(out, indent, reg, &param_ty);
-                    call_args.push(format!("{} {}", param_llvm_ty, converted.name));
                 } else {
                     call_args.push(format!("{} {}", reg_llvm_ty, reg.name));
                 }
@@ -6631,11 +6652,62 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 // 2026-07-30: Non-defn calls (or calls where defn not found in
                 // defn_params) also need inttoptr for Ptr-typed arguments, since
                 // the register holds the i64 internal representation.
+                let original_ty = self
+                    .fun
+                    .let_bindings
+                    .iter()
+                    .find(|(_, value)| *value == &reg.name)
+                    .and_then(|(binding, _)| self.fun.let_original_types.get(binding))
+                    .cloned();
+                let original_boxed = original_ty
+                    .as_ref()
+                    .map(|ty| self.is_boxed_int_type(ty))
+                    .unwrap_or(false);
+                if (self.fun.boxed_scalar_regs.contains(&reg.name) || original_boxed) && reg.name.starts_with("%ac") {
+                    let dst = match original_ty.as_ref() {
+                        Some(ty) if self.is_protocol_member(ty, "Bool") => "i8".to_string(),
+                        Some(ty) if self.is_protocol_member(ty, "Char") => {
+                            format!("i{}", self.ctx.int_bits)
+                        }
+                        _ => self.llvm_type(&reg.ty),
+                    };
+                    if dst != "i64" && dst.starts_with('i') {
+                        let conv = self.fun.gen_reg();
+                        writeln!(out, "{}{} = trunc i64 {} to {}", indent, conv, reg.name, dst).ok();
+                        call_args.push(format!("{} {}", dst, conv));
+                        continue;
+                    }
+                }
+                let actual_ty = self
+                    .fun
+                    .reg_llvm_ty
+                    .get(&reg.name)
+                    .cloned()
+                    .unwrap_or_else(|| self.llvm_type(&reg.ty));
+                let expected_ty = defn_param_tys
+                    .as_ref()
+                    .and_then(|tys| tys.get(i))
+                    .map(|pt| self.call_param_llvm_type(pt))
+                    .unwrap_or_else(|| actual_ty.clone());
                 if matches!(reg.ty, Type::Ptr(_)) {
                     let conv = self.canonical_ptr(out, indent, &reg.name);
                     call_args.push(format!("ptr {}", conv));
+                } else if expected_ty == "i64"
+                    && actual_ty.starts_with('i')
+                    && actual_ty != "i64"
+                {
+                    let conv = self.fun.gen_reg();
+                    writeln!(out, "{}{} = sext {} {} to i64", indent, conv, actual_ty, reg.name).ok();
+                    call_args.push(format!("i64 {}", conv));
+                } else if actual_ty == "i64"
+                    && expected_ty.starts_with('i')
+                    && expected_ty != "i64"
+                {
+                    let conv = self.fun.gen_reg();
+                    writeln!(out, "{}{} = trunc i64 {} to {}", indent, conv, reg.name, expected_ty).ok();
+                    call_args.push(format!("{} {}", expected_ty, conv));
                 } else {
-                    call_args.push(format!("{} {}", self.llvm_type(&reg.ty), reg.name));
+                    call_args.push(format!("{} {}", actual_ty, reg.name));
                 }
             }
         }
@@ -6937,12 +7009,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         let probe_types = if let Some(expected) = expected_enum_result {
             vec![expected.clone(); arms.len()]
         } else {
-            self.probe_match_result_types(
-                arms,
-                &scrut,
-                indent,
-                match_result_hint.as_ref(),
-            )
+            self.probe_match_result_types(arms, &scrut, indent, match_result_hint.as_ref())
         };
         // 2026-10-05 (json.bv): canonicalize enum-handle probe types. An enum
         // CONSTRUCTOR (`Err(e)`) reports `Type::int()` (the i64 handle) while
@@ -7065,9 +7132,6 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             .first()
             .map(|(_, _, ty)| ty.clone())
             .unwrap_or_else(crate::ast::Type::int);
-        if let Some(expected) = expected_enum_result {
-            result_ty = expected.clone();
-        }
         if heterogeneous {
             result_ty = synth_ty;
         }
@@ -7163,7 +7227,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     return r;
                 };
                 let base = self.fun.gen_reg();
-                writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base, scrut).ok();
+                { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
                 let slot = self.fun.gen_reg();
                 writeln!(
                     out,
@@ -7207,7 +7271,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     };
                     let Some(elem_val) = scalar else { continue };
                     let base = self.fun.gen_reg();
-                    writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base, scrut).ok();
+                    { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
                     let slot = self.fun.gen_reg();
                     writeln!(
                         out,
@@ -7375,7 +7439,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                         .unwrap_or(false);
                     let payload = if inline_payload {
                         let base = self.fun.gen_reg();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base, scrut).ok();
+                        { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
                         let nested = self.fun.gen_reg();
                         writeln!(
                             out,
@@ -7384,7 +7448,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                         )
                         .ok();
                         let handle = self.fun.gen_reg();
-                        writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, handle, nested).ok();
+                        { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, handle, nested, hw).ok(); }
                         TypedRegister { name: handle, ty: pty.clone() }
                     } else {
                         self.unwrap_union_payload(out, indent, scrut, &pty)
@@ -7400,7 +7464,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     }
                 } else {
                     let base = self.fun.gen_reg();
-                    writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base, scrut).ok();
+                    { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
                     let slot = self.fun.gen_reg();
                     writeln!(
                         out,
@@ -7604,10 +7668,20 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             return reg.clone();
         }
         let v = self.fun.gen_reg();
-        if ty_str == "i1" {
+        // 2026-10-25: boxed Bool/Char parameters are i64 in SSA while their
+        // Briev binding type says Int; truncating by llvm_type(Int)=i32
+        // produced `trunc i32 %ac3` on an i64 register.
+        let actual_ty = if self.fun.boxed_scalar_regs.contains(&reg.name)
+            || reg.name.starts_with("%ac")
+        {
+            "i64"
+        } else {
+            ty_str.as_str()
+        };
+        if actual_ty == "i1" {
             writeln!(out, "{}{} = zext i1 {} to i8", indent, v, reg.name).ok();
         } else {
-            writeln!(out, "{}{} = trunc {} {} to i8", indent, v, ty_str, reg.name).ok();
+            writeln!(out, "{}{} = trunc {} {} to i8", indent, v, actual_ty, reg.name).ok();
         }
         TypedRegister {
             name: v,
@@ -7664,13 +7738,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         // and "double" for Float64 (64-bit). The old code always used "double"
         // for all float operations, producing invalid IR when operands were
         // actually 32-bit float values loaded from constants or state fields.
-        let int_ty = if self.llvm_type(&l.ty).starts_with('i')
-            && self.llvm_type(&l.ty) == self.llvm_type(&r.ty)
-        {
-            self.llvm_type(&l.ty)
-        } else {
-            self.binop_int_type()
-        };
+        let int_ty = self.binop_int_type();
         let ty_str: &str = if is_double {
             "double"
         } else if is_float {
@@ -7684,6 +7752,10 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         } else if is_float {
             if l_fbits.is_some() { l.ty.clone() } else { r.ty.clone() }
         } else if self.llvm_type(&l.ty) == self.llvm_type(&r.ty) {
+            // 2026-10-25: same-width integer arithmetic keeps its declared
+            // type (Int64 * Int64 is Int64). Returning flexible Int made the
+            // result i64 in IR but i32 in the type map, so a following cast
+            // emitted `zext i32 %i64reg`.
             l.ty.clone()
         } else {
             Type::int()
@@ -7763,7 +7835,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     )
                     .ok();
                 } else {
-                    let op_bits = int_ty.clone();
+                    let op_bits = self.binop_int_type();
                     writeln!(out, "{}{} = add nuw nsw {} {}, {}", indent, v, op_bits, l.name, r.name).ok();
                 }
                 TypedRegister {
@@ -7783,7 +7855,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 } else {
                     // 2026-07-25: Use binop_int_type() so narrowing pass controls width.
                     // Was hardcoded i64 — broke WASM i32 by emitting sub nsw i64 on i32 registers.
-                    let op_bits = int_ty.clone();
+                    let op_bits = self.binop_int_type();
                     writeln!(out, "{}{} = sub nsw {} {}, {}", indent, v, op_bits, l.name, r.name).ok();
                 }
                 TypedRegister {
@@ -7802,7 +7874,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     .ok();
                 } else {
                     // 2026-07-25: Use binop_int_type() so narrowing pass controls width.
-                    let op_bits = int_ty.clone();
+                    let op_bits = self.binop_int_type();
                     writeln!(out, "{}{} = mul nsw {} {}, {}", indent, v, op_bits, l.name, r.name).ok();
                 }
                 TypedRegister {
@@ -7820,7 +7892,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     .ok();
                 } else {
                     // 2026-07-25: Use binop_int_type() so narrowing pass controls width.
-                let op_bits = int_ty.clone();
+                    let op_bits = self.binop_int_type();
                     writeln!(out, "{}{} = sdiv {} {}, {}", indent, v, op_bits, l.name, r.name).ok();
                 }
                 TypedRegister {
@@ -7830,7 +7902,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             }
             crate::ast::BinaryOpKind::Mod => {
                 // 2026-07-25: Use binop_int_type() so narrowing pass controls width.
-                let op_bits = int_ty.clone();
+                let op_bits = self.binop_int_type();
                 writeln!(out, "{}{} = srem {} {}, {}", indent, v, op_bits, l.name, r.name).ok();
                 TypedRegister {
                     name: v.to_string(),
@@ -8385,24 +8457,19 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 writeln!(out, "{}{} = {} {} {} to {}", indent, reg, op, src_ll, src.name, target_ll).ok();
                 return Some(TypedRegister { name: reg, ty: target.clone() });
             }
-            // 2026-10-25 (wasm32 Int64 casts): primitive integer casts can
-            // have an empty graph path when both types share the Int protocol,
-            // but their LLVM widths still differ (for example Int i32 →
-            // Int64 i64). Returning the source register with the target type
-            // mislabels the actual register and lets later operators emit
-            // invalid mixed-width IR. Materialize the representation change
-            // even for an identity protocol path.
+            // 2026-10-25: a same-protocol integer width change (Int → Int64)
+            // has an empty graph path but different LLVM widths. Returning the
+            // source register made `1000000000 as Int64` stay i32 and broke
+            // wasm `mul i64`. Widening is signed (Int), narrowing is trunc.
             if src_ll.starts_with('i') && target_ll.starts_with('i') && src_ll != target_ll {
-                let src_bits = src_ll[1..].parse::<u32>().ok()?;
-                let target_bits = target_ll[1..].parse::<u32>().ok()?;
-                let reg = self.fun.gen_reg();
-                let op = if src_bits < target_bits {
-                    if self.is_protocol_member(&src.ty, "UInt") { "zext" } else { "sext" }
-                } else {
-                    "trunc"
-                };
-                writeln!(out, "{}{} = {} {} {} to {}", indent, reg, op, src_ll, src.name, target_ll).ok();
-                return Some(TypedRegister { name: reg, ty: target.clone() });
+                let src_bits = src_ll[1..].parse::<u32>().ok();
+                let dst_bits = target_ll[1..].parse::<u32>().ok();
+                if let (Some(src_bits), Some(dst_bits)) = (src_bits, dst_bits) {
+                    let reg = self.fun.gen_reg();
+                    let op = if src_bits < dst_bits { "sext" } else { "trunc" };
+                    writeln!(out, "{}{} = {} {} {} to {}", indent, reg, op, src_ll, src.name, target_ll).ok();
+                    return Some(TypedRegister { name: reg, ty: target.clone() });
+                }
             }
             return Some(TypedRegister { name: src.name.clone(), ty: target.clone() });
         }
@@ -8453,23 +8520,6 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                 }
             };
 
-            // Bitcast is also used for protocol-preserving integer casts.
-            // If both representations already have the same width, LLVM has
-            // no cast instruction to emit (`zext i32 ... to i32` is invalid).
-            if cur_ll == dst_ll
-                && matches!(
-                    step.lane,
-                    crate::casting::graph::LaneKind::Bitcast
-                        | crate::casting::graph::LaneKind::ZExt
-                        | crate::casting::graph::LaneKind::Trunc
-                )
-            {
-                if is_last {
-                    return Some(TypedRegister { name: cur, ty: target.clone() });
-                }
-                continue;
-            }
-
             match &step.lane {
                 crate::casting::graph::LaneKind::Bitcast => {
                     // 2026-08-13 (pack): LLVM `bitcast` requires equal-width
@@ -8504,8 +8554,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                         let (cw, dw) = (cur_ll[1..].parse::<u64>().unwrap_or(64),
                                         dst_ll[1..].parse::<u64>().unwrap_or(64));
                         if cw < dw {
-                            let op = if self.is_protocol_member(&src.ty, "UInt") { "zext" } else { "sext" };
-                            writeln!(out, "{}{} = {} {} {} to {}", indent, dst, op, cur_ll, cur, dst_ll).ok();
+                            writeln!(out, "{}{} = zext {} {} to {}", indent, dst, cur_ll, cur, dst_ll).ok();
                         } else {
                             writeln!(out, "{}{} = trunc {} {} to {}", indent, dst, cur_ll, cur, dst_ll).ok();
                         }
@@ -8536,11 +8585,13 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     // 2026-08-13: a native Char source (i32, from a boxed Char
                     // param unboxed at read) must be widened to the boxed i64
                     // the runtime helpers expect (`char_to_str(int64_t)`).
-                    let declared_arg = self.ctx.defn_params.get(*fn_name)
-                        .and_then(|params| params.first()).map(|ty| self.llvm_type(ty));
-                    let (arg_ll, arg) = if declared_arg.as_deref() == Some(cur_ll.as_str()) {
-                        (cur_ll.clone(), cur.clone())
-                    } else if cur_ll == "i32" && self.is_protocol_member(&src.ty, "Char") {
+                    // A registered Briev defn already uses the target ABI
+                    // (Char → i32 on wasm32); only a C-runtime helper needs
+                    // the legacy i64 char widening.
+                    let c_char = cur_ll == "i32"
+                        && self.is_protocol_member(&src.ty, "Char")
+                        && !self.ctx.defn_params.contains_key(&fn_name.to_string());
+                    let (arg_ll, arg) = if c_char {
                         let w = self.fun.gen_reg();
                         writeln!(out, "{}{} = zext i32 {} to i64", indent, w, cur).ok();
                         ("i64".to_string(), w)
@@ -8653,12 +8704,22 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     }
                 }
                 crate::casting::graph::LaneKind::ZExt => {
-                    writeln!(out, "{}{} = zext {} {} to {}",
-                        indent, dst, cur_ll, cur, dst_ll).ok();
+                    if cur_ll == dst_ll {
+                        // wasm32 Char→Int (both i32) selects the ZExt lane by
+                        // protocol identity; equal widths are an identity copy.
+                        writeln!(out, "{}{} = add {} {}, 0", indent, dst, dst_ll, cur).ok();
+                    } else {
+                        writeln!(out, "{}{} = zext {} {} to {}",
+                            indent, dst, cur_ll, cur, dst_ll).ok();
+                    }
                 }
                 crate::casting::graph::LaneKind::Trunc => {
-                    writeln!(out, "{}{} = trunc {} {} to {}",
-                        indent, dst, cur_ll, cur, dst_ll).ok();
+                    if cur_ll == dst_ll {
+                        writeln!(out, "{}{} = add {} {}, 0", indent, dst, dst_ll, cur).ok();
+                    } else {
+                        writeln!(out, "{}{} = trunc {} {} to {}",
+                            indent, dst, cur_ll, cur, dst_ll).ok();
+                    }
                 }
                 crate::casting::graph::LaneKind::FloatWidth => {
                     // 2026-08-03: the Float protocol's width cast — fpext/
@@ -8685,25 +8746,6 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     // briev_cstr_to_briev materializes the [len][bytes] header
                     // by construction (length derived from the bytes). The
                     // header is never inherited from the bits — it is created.
-                    // `Data` is the universal bit representation, while the
-                    // String ABI is already a pointer to its length-prefixed
-                    // bytes. A Data↔String cast therefore preserves the same
-                    // address. Re-materializing it with briev_bits_to_str
-                    // treats allocator/header bytes as payload and can corrupt
-                    // otherwise valid strings (2026-10-25). Keep encoding only
-                    // for actual Bit-to-String casts, where the source is a
-                    // content address supplied by the cast path.
-                    if let Some(step) = path.get(i) {
-                        if step.src_category == "Data" && dst_ll == "ptr" {
-                            if cur_ll == "ptr" {
-                                return Some(TypedRegister { name: cur, ty: target.clone() });
-                            }
-                            writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, dst, cur_ll, cur).ok();
-                            cur = dst;
-                            cur_ll = dst_ll;
-                            continue;
-                        }
-                    }
                     let override_fn = match target.universe_key() {
                         Some(key) => self
                             .ctx
@@ -8836,7 +8878,12 @@ impl LlvmBackend {
         if let Some(fields) = self.get_struct_fields(type_name) {
             return fields
                 .iter()
-                .map(|(_, fty)| self.field_storage_size(fty))
+                .map(|(_, fty)| {
+                    crate::backend::llvm::types::type_size(
+                        fty,
+                        self.ctx.type_universe.as_ref(),
+                    )
+                })
                 .sum();
         }
         8
@@ -8858,8 +8905,18 @@ impl crate::backend::llvm::LlvmBackend {
     /// pass `%state` when present — the old stateless call could never
     /// resolve to the defn (pre-existing latent bug, fixed here).
     fn emit_event_trap_call(&mut self, out: &mut String) {
-        let st = if self.ctx.defn_takes_state("event_strict_trap") { "ptr %state, " } else { "" };
-        writeln!(out, "  call i64 @event_strict_trap({})", st).ok();
+        // 2026-10-25: strict event reads inside a stateless defn have no
+        // %state. event_strict_trap is stateful (it prints), so calling it
+        // there emitted `use of undefined value '%state'`. Trap directly;
+        // the caller immediately emits `unreachable`.
+        if self.fun.stateless_body {
+            writeln!(out, "  call void @llvm.trap()").ok();
+            return;
+        }
+        // A stateful callee takes exactly `ptr %state`; the old trailing
+        // comma produced `call i64 @event_strict_trap(ptr %state, )`.
+        let args = if self.ctx.defn_takes_state("event_strict_trap") { "ptr %state" } else { "" };
+        writeln!(out, "  call i64 @event_strict_trap({args})").ok();
     }
 
     fn emit_event_payload_read(
@@ -8962,7 +9019,10 @@ impl crate::backend::llvm::LlvmBackend {
                     if fname == field {
                         break;
                     }
-                    off += self.field_storage_size(fty);
+                    off += crate::backend::llvm::types::type_size(
+                        fty,
+                        self.ctx.type_universe.as_ref(),
+                    );
                 }
                 let gp = self.fun.gen_reg();
                 writeln!(out, "  {gp} = getelementptr i8, ptr {fp}, i64 {off}").ok();

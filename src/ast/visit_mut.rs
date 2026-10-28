@@ -1,6 +1,8 @@
 //===----------------------------------------------------------------------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
+// Authored by Otto Westerlund (@odecode); adopted with attribution, see
+// docs/contributors/otto-westerlund.md.
 //! Exhaustive mutable postorder AST traversal.
 //! 2026-10-22: print expansion missed foreach and operand/container positions.
 //! One rewrite walker covers those payloads without partial per-plugin trees.
@@ -277,6 +279,7 @@ pub fn walk_toplevel<F: FnMut(&mut Expr)>(item: &mut TopLevel, f: &mut F) {
                 walk_expr(&mut b.expr, f);
             }
         }
+        TopLevel::Export(export) => walk_toplevel(&mut export.inner, f),
         TopLevel::SyncGroup { item, .. } => walk_toplevel(item, f),
         TopLevel::Cfg(guard) => {
             for it in &mut guard.items {
@@ -297,7 +300,6 @@ pub fn walk_toplevel<F: FnMut(&mut Expr)>(item: &mut TopLevel, f: &mut F) {
         // fab/svg blocks are strings and placements; data tables and module
         // config are compile-time data.
         TopLevel::Import(_)
-        | TopLevel::Export(_)
         | TopLevel::ForeignBinding(_)
         | TopLevel::Enum(_)
         | TopLevel::StateDecl(_)

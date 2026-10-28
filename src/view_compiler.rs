@@ -956,8 +956,9 @@ impl ViewCompiler {
 
     fn unsupported_item_msg(&self, expr: &str, item_name: &str) -> String {
         format!(
-            "Cannot evaluate '{}' for each item. Use `{}`, a direct item field, \
-             a number or boolean, or a `{} <op> <literal>` comparison.",
+            "item-scoped expression '{}' is unsupported in b-each (Phase 2a3) — \
+             only `{}` or `{} <op> <literal>` comparisons are rendered per item; \
+             state-field expressions land with the Phase 2b component plan",
             expr, item_name, item_name
         )
     }
@@ -1018,8 +1019,9 @@ impl ViewCompiler {
                     continue;
                 }
             }
-            result.push(html.chars().nth(pos).unwrap_or(' '));
-            pos += 1;
+            let character = html[pos..].chars().next().unwrap_or(' ');
+            result.push(character);
+            pos += character.len_utf8();
         }
         result
     }
@@ -2091,10 +2093,7 @@ mod tests {
             html.contains("<p id=\"rbv-p-1\" b-text=\"status\">Ready</p>"),
             "later directive tag was corrupted: {html}"
         );
-        assert!(
-            html.ends_with("</main>"),
-            "closing markup was corrupted: {html}"
-        );
+        assert!(html.ends_with("</main>"), "closing markup was corrupted: {html}");
     }
 
     #[test]
@@ -2320,6 +2319,18 @@ mod tests {
     }
 
     #[test]
+    fn distinct_events_on_one_element_keep_their_handlers() {
+        let mut compiler = ViewCompiler::new();
+        let (bindings, _, _) = compiler.compile(
+            r#"<section b-window:first="receive(1)" b-window:second="retry(2)" b-trigger:click="choose" b-trigger:input="edit"></section>"#);
+        let events: Vec<_> = bindings.iter().filter_map(|binding| match &binding.directive {
+            Directive::Trigger { event, txn, .. } => Some((event.as_str(), txn.as_str())),
+            _ => None,
+        }).collect();
+        assert_eq!(events, [("first", "receive"), ("second", "retry"), ("click", "choose"), ("input", "edit")]);
+    }
+
+    #[test]
     fn b_each_captures_item_bindings_and_marks_template() {
         let mut vc = ViewCompiler::new();
         let (bindings, _, diagnostics) = vc.compile(
@@ -2377,7 +2388,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.contains("Cannot evaluate") && d.contains("item == selected")),
+                .any(|d| d.contains("unsupported in b-each") && d.contains("item == selected")),
             "{:?}",
             diagnostics
         );
@@ -2589,6 +2600,28 @@ mod tests {
 
     // ── 2026-10-07 (popstate): `b-window:<event>` ─────────────────────
 
+    /// 2026-10-26: DOM event names may contain hyphens. The suffix scanner
+    /// previously stopped at '-', so `b-window:recommender-live` bound
+    /// "recommender" and the websocket open event never reached its txn.
+    #[test]
+    fn b_window_event_name_preserves_hyphens() {
+        let mut vc = ViewCompiler::new();
+        let (bindings, _, diagnostics) =
+            vc.compile(r#"<div b-window:recommender-live="live_event"></div>"#);
+        assert!(diagnostics.is_empty(), "unexpected diagnostics: {diagnostics:?}");
+        let t = bindings
+            .iter()
+            .find(|b| matches!(&b.directive, Directive::Trigger { .. }))
+            .expect("window trigger binding");
+        match &t.directive {
+            Directive::Trigger { event, txn, .. } => {
+                assert_eq!(event, "recommender-live");
+                assert_eq!(txn, "live_event");
+            }
+            other => panic!("expected Trigger, got {other:?}"),
+        }
+    }
+
     /// A window-scoped trigger parses to a `Directive::Trigger` with
     /// `scope = Window` and the event name — the shim binds `window`.
     #[test]
@@ -2612,18 +2645,6 @@ mod tests {
             vc.get_user_triggered_transactions().contains("sync_route"),
             "window trigger txn must be user-triggered"
         );
-    }
-
-    #[test]
-    fn distinct_events_on_one_element_keep_their_handlers() {
-        let mut compiler = ViewCompiler::new();
-        let (bindings, _, _) = compiler.compile(
-            r#"<section b-window:first="receive(1)" b-window:second="retry(2)" b-trigger:click="choose" b-trigger:input="edit"></section>"#);
-        let events: Vec<_> = bindings.iter().filter_map(|binding| match &binding.directive {
-            Directive::Trigger { event, txn, .. } => Some((event.as_str(), txn.as_str())),
-            _ => None,
-        }).collect();
-        assert_eq!(events, [("first", "receive"), ("second", "retry"), ("click", "choose"), ("input", "edit")]);
     }
 
     /// An element-scoped trigger keeps `scope = Element` (regression: the

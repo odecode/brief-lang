@@ -426,6 +426,60 @@ fn trait_generics_golden_output() {
 /// regression in the member liveness or type-dependent needs-state paths is
 /// caught in CI.
 #[test]
+fn rating_population_gate_golden_output() {
+    let out = build_link_run("rating_population_gate", "golden", &[]);
+    assert_eq!(out, "rating_population=true\n", "rating population golden drifted: {out:?}");
+}
+
+#[test]
+fn pg_buffer_gate_golden_output() {
+    let out = build_link_run("pg_buffer_gate", "golden", &[]);
+    assert_eq!(out, "pg_received_prefix=true\n", "PG receive-buffer golden drifted: {out:?}");
+}
+
+#[test]
+fn enum_aggregate_lifetime_golden_output() {
+    let out = build_link_run("enum_aggregate_lifetime", "golden", &[]);
+    assert_eq!(out, "aggregate_result_lifetime=true\n", "aggregate lifetime golden drifted: {out:?}");
+}
+
+#[test]
+fn enum_local_return_golden_output() {
+    let out = build_link_run("enum_local_return", "golden", &[]);
+    assert_eq!(out, "local_result_lifetime=true\n", "local enum lifetime golden drifted: {out:?}");
+}
+
+#[test]
+fn result_object_gate_golden_output() {
+    let out = build_link_run("result_object_gate", "golden", &[]);
+    assert_eq!(out, "object_unwraps=true\n", "Result object unwrap golden drifted: {out:?}");
+}
+
+#[test]
+fn collection_rebind_gate_golden_output() {
+    let out = build_link_run("collection_rebind_gate", "golden", &[]);
+    assert_eq!(out, "collection_rebind_and_explicit_push=true\n", "collection rebind golden drifted: {out:?}");
+}
+
+#[test]
+fn json_parse_gate_golden_output() {
+    let out = build_link_run("json_parse_gate", "golden", &[]);
+    assert_eq!(out, "json_literals=true containers=true strings=true numbers=true progress=true\n", "strict JSON parse golden drifted: {out:?}");
+}
+
+#[test]
+fn json_stringify_gate_golden_output() {
+    let out = build_link_run("json_stringify_gate", "golden", &[]);
+    assert_eq!(out, "json_encode_all_variants=true unicode_control_roundtrip=true\n", "JSON stringify golden drifted: {out:?}");
+}
+
+#[test]
+fn matrix_primitives_golden_output() {
+    let out = build_link_run("matrix_primitives_smoke", "golden", &[]);
+    assert_eq!(out, "matrix_vector_intvec=true\n", "matrix primitive golden drifted: {out:?}");
+}
+
+#[test]
 fn byte_sink_trait_golden_output() {
     if !has("clang") {
         eprintln!("SKIP: clang not available");

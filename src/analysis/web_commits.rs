@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 //! Possible global writes at browser commit boundaries, including helper calls.
+//! Authored by Otto Westerlund (@odecode); adopted with attribution, see
+//! docs/contributors/otto-westerlund.md.
 //! 2026-10-21: compute the closure once in the frontend; codegen consumes it.
 //! These sets select DOM updates, not optimization or concurrency proofs.
 use crate::ast::{Expr, Statement, TopLevel, Type};

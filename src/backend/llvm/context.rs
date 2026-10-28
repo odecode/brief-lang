@@ -5,10 +5,8 @@
 // 7+ fields at every inline txn boundary (see dispatch.rs emit_inline_txn_body).
 //
 // Why three contexts instead of one:
-//   CompilerContext — module lifetime. Holds stable AST/type/target facts and
-//     module emission state. 2026-10-22: metadata allocation/definitions remain
-//     mutable across functions; cloning or resetting them per function loses
-//     LLVM's module-wide ID and definition invariants.
+//   CompilerContext — global, read-only during codegen. Holds AST definitions,
+//     target spec, FFI signatures, type info. Never modified once codegen starts.
 //   FunctionContext — per-function, mutable. Holds SSA counter, local bindings,
 //     phi state, arena slots. Cloned at inline boundaries; restored after.
 //   BlockContext — per-basic-block, lightweight. Tracks current label and
@@ -35,10 +33,10 @@ use std::collections::{HashMap, HashSet};
 
 // ── CompilerContext ───────────────────────────────────────────────────
 //
-// Module context: stable compilation facts and mutable emission state.
-// 2026-10-22: metadata IDs and definitions span functions/transactions. Keep
-// them here so function resets cannot erase definitions or reuse numeric IDs;
-// move them only if another module-lifetime owner replaces this context.
+// Global compilation context — immutable once code generation begins.
+// Holds everything that does not change between functions/transactions.
+// Previously part of the LlvmBackend god object; extracted to prevent
+// accidental mutation during per-function codegen.
 #[derive(Debug, Clone)]
 pub struct CompilerContext {
     // Target & Spec
@@ -146,6 +144,10 @@ pub struct CompilerContext {
     /// effects — `print_str` reaches `SysCall#` via `write_all`; with #8
     /// (argmem-only) LLVM deleted every store that filled the write buffer.
     pub defn_touches_raw_memory: std::collections::HashSet<String>,
+    /// Defns that may trap/halt directly or through a callee. Their calls are
+    /// observable even when the result is unused and must not carry
+    /// `willreturn`.
+    pub defn_may_trap: std::collections::HashSet<String>,
     /// 2026-10-15 (type-dependent member statefulness): concrete type names
     /// with at least one state-taking member (export_abi::type_stateful_members).
     /// A monomorphized trait default/generic specialized to such a type must
@@ -158,12 +160,12 @@ pub struct CompilerContext {
     /// Used by load_field_type() to look up !range metadata by field index.
     pub idx_to_field_name: HashMap<usize, String>,
     // 2026-07-04: Metadata ID for the !StateAliasScope used by !noalias
-    // on Ptr<T> volatile accesses. 2026-10-22: reserve it with the module
-    // allocator before emission; no fixed ID can bound an evolving universe.
+    // on Ptr<T> volatile accesses. Set during IR emission, then read-only
+    // by intrinsics.rs volatile_load#/volatile_store# emission.
     pub state_alias_scope_md: usize,
-    // 2026-10-22: LLVM metadata IDs and definitions belong to the module.
-    // Fixed reservations overlapped on large type universes; function resets
-    // also dropped pending nodes. All non-TBAA nodes share this allocator.
+    /// 2026-10-22: LLVM metadata IDs and definitions belong to the module.
+    /// Fixed reservations overlapped on large type universes; function resets
+    /// also dropped pending nodes. All non-TBAA nodes share this allocator.
     pub metadata_counter: usize,
     pub pending_metadata: String,
     pub exit_condition: Option<Box<Expr>>,
@@ -240,7 +242,6 @@ pub struct CompilerContext {
     /// concrete instantiation at the call site, reading the body/params from
     /// here, substituting the type params, and emitting a specialized symbol.
     pub generic_defns: HashMap<String, crate::ast::top::Definition>,
-    pub generic_txns: HashMap<String, crate::ast::Transaction>,
     /// 2026-10-13 (S6): type-param names per generic defn (`bump_twice` →
     /// ["T"]), the substitution key order for mangling + param substitution.
     pub generic_defn_type_params: HashMap<String, Vec<String>>,
@@ -401,10 +402,6 @@ pub atomic_fields: std::collections::HashMap<String, String>,
     /// (`obj Stack<T, N>` → ["T", "N"]). Used to substitute a receiver's
     /// concrete type args into the generic slots/members (monomorphization).
     pub obj_type_params: HashMap<String, Vec<String>>,
-    /// 2026-10-21: retain concrete type arguments beside their display key.
-    /// Member substitution must never reconstruct types from selected names.
-    pub mono_types: HashMap<String, Type>,
-    pub web_commit_writes: HashMap<String, HashSet<String>>,
     pub enum_types: HashMap<String, EnumDefinition>,
     pub cell_defs: HashMap<String, CellDef>,
     pub cell_state_types: HashMap<String, (HashMap<String, usize>, Vec<String>)>,
@@ -447,6 +444,9 @@ pub atomic_fields: std::collections::HashMap<String, String>,
     /// (induction variable, bound, direction) and increments per transaction name.
     /// Used by emit_toplevel.rs for precise !prof branch weights on guard conditions.
     pub transition_graph: Option<crate::analysis::transition_graph::ReactorTransitionGraph>,
+    /// Possible state writes at browser commit boundaries, including helper
+    /// calls. Frontend-computed; the web flush batch consumes it.
+    pub web_commit_writes: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// 2026-08-07 (object instance pools): the proven maximum live instances
     /// per obj base — the member column sizes (predictably inexhaustible).
     pub spawn_pools: std::collections::HashMap<String, usize>,
@@ -656,6 +656,7 @@ impl CompilerContext {
             tail_carrier: crate::analysis::tail_carrier::TailCarrierPlan::default(),
             enum_layout_planner: None,
             defn_touches_raw_memory: std::collections::HashSet::new(),
+            defn_may_trap: std::collections::HashSet::new(),
             type_stateful_members: HashSet::new(),
             idx_to_field_name: HashMap::new(),
             collection_iterables: std::collections::HashSet::new(),
@@ -683,7 +684,6 @@ impl CompilerContext {
             defn_params: HashMap::new(),
             defn_return_types: HashMap::new(),
             generic_defns: HashMap::new(),
-            generic_txns: HashMap::new(),
             generic_defn_type_params: HashMap::new(),
             pending_defn_specializations: Vec::new(),
             emitted_defn_specializations: std::collections::HashSet::new(),
@@ -716,8 +716,6 @@ impl CompilerContext {
             dyn_concrete_tag_of: HashMap::new(),
             dyn_collection_info: std::collections::HashMap::new(),
             obj_type_params: HashMap::new(),
-            mono_types: HashMap::new(),
-            web_commit_writes: HashMap::new(),
             enum_types: HashMap::new(),
             cell_defs: HashMap::new(),
             cell_state_types: HashMap::new(),
@@ -740,6 +738,7 @@ impl CompilerContext {
             has_cycles: false,
             state_size_bytes: 0,
             transition_graph: None,
+            web_commit_writes: std::collections::HashMap::new(),
             spawn_pools: std::collections::HashMap::new(),
             dependent_pools: std::collections::HashMap::new(),
             spawn_storage: std::collections::HashMap::new(),
@@ -1129,6 +1128,9 @@ pub struct FunctionContext {    // SSA register counters — NEVER rewound (prev
     /// 2026-10-21 (P2-1 ReturnedSmall): hidden caller slot for an
     /// enum-returning defn, active only in return context.
     pub enum_out_slot: Option<String>,
+    /// Concrete enum type owned by `enum_out_slot`. A nested enum constructor
+    /// with a different expected type must NOT reuse this slot.
+    pub enum_out_type: Option<crate::ast::Type>,
     pub enum_return_context: bool,
     pub enum_out_busy: bool,
     /// 2026-10-21 (B0 nested enum layout): concrete enum instance expected at
@@ -1337,6 +1339,9 @@ pub struct FunctionContext {    // SSA register counters — NEVER rewound (prev
     // Without this, let bindings (e.g. `let f0: Float = b0 * input;`) would
     // return Type::int() because f0 is not in field_index_map.
     pub last_val_types: HashMap<String, Type>,
+    /// 2026-10-27: actual LLVM register widths for values whose Briev type
+    /// maps to a fallback width (notably enum/Result state loads).
+    pub reg_llvm_ty: HashMap<String, String>,
 
     /// 2026-08-06 (Phase 8): closures bound by `let` in this function. A call
     /// to a closure name INLINES the body with the params bound to the arg
@@ -1432,6 +1437,7 @@ impl FunctionContext {
             enum_inline_slots: HashMap::new(),
             enum_construct_slot: None,
             enum_out_slot: None,
+            enum_out_type: None,
             enum_return_context: false,
             enum_out_busy: false,
             expected_enum_type: None,
@@ -1517,6 +1523,7 @@ impl FunctionContext {
             volatile_locals: std::collections::HashSet::new(),
             member_result: None,
             last_val_types: HashMap::new(),
+            reg_llvm_ty: HashMap::new(),
             closure_lets: HashMap::new(),
             rotation_fields: HashSet::new(),
             active_vector_groups: Vec::new(),
@@ -1578,6 +1585,7 @@ impl FunctionContext {
         self.volatile_raw_ptr_params = false;
         self.enum_construct_slot = None;
         self.enum_out_slot = None;
+        self.enum_out_type = None;
         self.enum_return_context = false;
         self.enum_out_busy = false;
         self.expected_enum_type = None;
@@ -1607,6 +1615,7 @@ impl FunctionContext {
         // here isolates the passes.
         self.last_val_temps.clear();
         self.last_val_types.clear();
+        self.reg_llvm_ty.clear();
         // 2026-10-20 (pointer provenance): canonical conversions are keyed by
         // per-function SSA names and state-field cache entries; they must not
         // leak across an emission pass or function.

@@ -1,6 +1,7 @@
 //===----------------------------------------------------------------------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
+// Authored in part by Otto Westerlund (@odecode); adopted with attribution.
 // Browser-host behavioral regression, runnable with Node; no app or live server.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

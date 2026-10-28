@@ -96,11 +96,31 @@ impl Bounds {
 /// other expression is its structural Debug form. Exact structural equality
 /// is what makes the atom check sound.
 fn atom_key(e: &Expr) -> String {
+    if let Some(inner) = struct_field_value(e) {
+        return atom_key(inner);
+    }
     match e {
         Expr::Identifier(n) => n.clone(),
         Expr::Field(base, field) => format!("{}.{}", atom_key(base), field),
         _ => format!("{:?}", e),
     }
+}
+
+/// 2026-10-26: `Type { field: value, ... }.field` denotes `value`. Leaving it
+/// opaque made every struct-literal argument (Socket/ByteBuf/Matrix views)
+/// fail bounds the caller already guarded. Reduction is exact and total.
+fn struct_field_value(e: &Expr) -> Option<&Expr> {
+    let Expr::Field(base, field) = e else {
+        return None;
+    };
+    let Expr::StructLiteral { fields, specs, .. } = base.as_ref() else {
+        return None;
+    };
+    fields
+        .iter()
+        .chain(specs.iter())
+        .find(|(name, _)| name == field)
+        .map(|(_, value)| value)
 }
 
 /// Reduce an expression to `(terms, constant)` — `None` when the expression
@@ -111,6 +131,9 @@ fn linify(e: &Expr) -> Option<(Vec<(String, i128)>, i128)> {
     // an opaque atom and every bound against it is lost.
     if let Some(n) = literal_int(e) {
         return Some((vec![], n as i128));
+    }
+    if let Some(inner) = struct_field_value(e) {
+        return linify(inner);
     }
     match e {
         Expr::Decimal(n) => Some((vec![], *n as i128)),
@@ -365,6 +388,248 @@ fn entail_same_terms(fact: &LinC, goal: &LinC) -> bool {
         (BinaryOpKind::Neq, BinaryOpKind::Neq) => fact.const_ == goal.const_,
         _ => false,
     }
+}
+
+/// 2026-10-26: difference-bound closure. Facts `x - y <= c` compose:
+/// `idx >= begin` + `begin >= 0` proves `idx >= 0`. The same-term linear core
+/// cannot compare different atoms, which forced redundant loop guards.
+const DIFF_CONST: &str = "\u{0}const";
+
+fn lin_to_diff(lc: &LinC) -> Option<(String, String, i128, BinaryOpKind)> {
+    match lc.terms.as_slice() {
+        [(x, 1), (y, -1)] => Some((x.clone(), y.clone(), lc.const_, lc.op)),
+        [(y, -1), (x, 1)] => Some((x.clone(), y.clone(), lc.const_, lc.op)),
+        [(x, 1)] => Some((x.clone(), DIFF_CONST.to_string(), lc.const_, lc.op)),
+        [(x, -1)] => {
+            let flipped = match lc.op {
+                BinaryOpKind::Le => BinaryOpKind::Ge,
+                BinaryOpKind::Lt => BinaryOpKind::Gt,
+                BinaryOpKind::Ge => BinaryOpKind::Le,
+                BinaryOpKind::Gt => BinaryOpKind::Lt,
+                other => other,
+            };
+            Some((x.clone(), DIFF_CONST.to_string(), lc.const_.checked_neg()?, flipped))
+        }
+        _ => None,
+    }
+}
+
+fn diff_edges(lc: &LinC) -> Vec<(String, String, i128)> {
+    let Some((x, y, c, op)) = lin_to_diff(lc) else { return Vec::new(); };
+    let mut out = Vec::new();
+    match op {
+        BinaryOpKind::Le => out.push((y, x, c)),
+        BinaryOpKind::Lt => if let Some(v) = c.checked_sub(1) { out.push((y, x, v)); },
+        BinaryOpKind::Ge => if let Some(v) = c.checked_neg() { out.push((x, y, v)); },
+        BinaryOpKind::Gt => if let Some(v) = c.checked_neg().and_then(|v| v.checked_sub(1)) { out.push((x, y, v)); },
+        BinaryOpKind::Eq => {
+            if let Some(v) = c.checked_neg() {
+                out.push((y.clone(), x.clone(), c));
+                out.push((x, y, v));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn difference_proves(goal: &LinC, facts: &[Expr]) -> bool {
+    let Some((x, y, c, op)) = lin_to_diff(goal) else { return false; };
+    let requirements = match op {
+        BinaryOpKind::Le => vec![(y.clone(), x.clone(), c)],
+        BinaryOpKind::Lt => c.checked_sub(1).map(|v| vec![(y.clone(), x.clone(), v)]).unwrap_or_default(),
+        BinaryOpKind::Ge => c.checked_neg().map(|v| vec![(x.clone(), y.clone(), v)]).unwrap_or_default(),
+        BinaryOpKind::Gt => c.checked_neg().and_then(|v| v.checked_sub(1)).map(|v| vec![(x.clone(), y.clone(), v)]).unwrap_or_default(),
+        BinaryOpKind::Eq => {
+            match (c.checked_neg()) {
+                Some(v) => vec![(y.clone(), x.clone(), c), (x.clone(), y.clone(), v)],
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+    if requirements.is_empty() { return false; }
+    let mut edges: Vec<(String, String, i128)> = Vec::new();
+    for f in facts {
+        let Expr::BinaryOp(op, l, r) = f else { continue };
+        if let Some(lc) = normalize(l, *op, r) {
+            edges.extend(diff_edges(&lc));
+        }
+    }
+    if edges.is_empty() { return false; }
+    let mut nodes: Vec<String> = Vec::new();
+    for (a, b, _) in &edges {
+        if !nodes.contains(a) { nodes.push(a.clone()); }
+        if !nodes.contains(b) { nodes.push(b.clone()); }
+    }
+    for (a, b, _) in &requirements {
+        if !nodes.contains(a) { nodes.push(a.clone()); }
+        if !nodes.contains(b) { nodes.push(b.clone()); }
+    }
+    let n=nodes.len(); let idx: HashMap<&str,usize> = nodes.iter().enumerate().map(|(i,s)|(s.as_str(),i)).collect();
+    let inf=i128::MAX/4;
+    let mut dist=vec![vec![inf;n];n];
+    for i in 0..n { dist[i][i]=0; }
+    for (a,b,w) in edges {
+        let (i,j)=(idx[a.as_str()],idx[b.as_str()]);
+        if w<dist[i][j] { dist[i][j]=w; }
+    }
+    for k in 0..n { for i in 0..n { if dist[i][k]>=inf { continue; } for j in 0..n { if dist[k][j]>=inf {continue;} let v=dist[i][k].saturating_add(dist[k][j]); if v<dist[i][j] {dist[i][j]=v;} } } }
+    requirements.iter().all(|(a,b,w)| {
+        let (i,j)=(idx[a.as_str()],idx[b.as_str()]);
+        dist[i][j] <= *w
+    })
+}
+
+/// 2026-10-26: bounded Fourier-Motzkin feasibility fallback for linear goals
+/// with more than two atoms. Facts are relaxed to integer `<=` constraints;
+/// `Neq` is ignored (conservative). Returns true only when the negated goal is
+/// infeasible — a sound proof, never a guess. The bound caps keep the
+/// combinatorial cost predictable; exceeding it yields "not proven".
+const FM_MAX_VARS: usize = 32;
+const FM_MAX_CONS: usize = 1024;
+
+fn lin_le_constraints(lc: &LinC) -> Vec<(Vec<(String, i128)>, i128)> {
+    let terms = lc.terms.clone();
+    let c = lc.const_;
+    let neg = |t: &Vec<(String, i128)>, k: i128| -> Option<Vec<(String, i128)>> {
+        t.iter().map(|(a, v)| Some((a.clone(), v.checked_mul(k)?))).collect()
+    };
+    match lc.op {
+        BinaryOpKind::Le => vec![(terms, c)],
+        BinaryOpKind::Lt => c.checked_sub(1).map(|v| vec![(terms, v)]).unwrap_or_default(),
+        BinaryOpKind::Ge => c.checked_neg().map(|v| vec![(neg(&terms, -1).unwrap_or_default(), v)]).unwrap_or_default(),
+        BinaryOpKind::Gt => c.checked_neg().and_then(|v| v.checked_sub(1)).map(|v| vec![(neg(&terms, -1).unwrap_or_default(), v)]).unwrap_or_default(),
+        BinaryOpKind::Eq => {
+            c.checked_neg().map(|v| vec![(terms.clone(), c), (neg(&terms, -1).unwrap_or_default(), v)]).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn goal_negation_constraints(g: &LinC) -> Option<Vec<(Vec<(String, i128)>, i128)>> {
+    let terms = g.terms.clone();
+    let c = g.const_;
+    let neg = |k: i128| -> Option<Vec<(String, i128)>> {
+        terms.iter().map(|(a, v)| Some((a.clone(), v.checked_mul(k)?))).collect()
+    };
+    let out = match g.op {
+        BinaryOpKind::Le => vec![(neg(-1)?, c.checked_neg()?.checked_sub(1)?)],
+        BinaryOpKind::Lt => vec![(neg(-1)?, c.checked_neg()?)],
+        BinaryOpKind::Ge => vec![(terms.clone(), c.checked_sub(1)?)],
+        BinaryOpKind::Gt => vec![(terms.clone(), c)],
+        BinaryOpKind::Eq => vec![
+            (terms.clone(), c.checked_sub(1)?),
+            (neg(-1)?, c.checked_neg()?.checked_sub(1)?),
+        ],
+        _ => return None,
+    };
+    Some(out)
+}
+
+fn fourier_motzkin_infeasible(mut cons: Vec<(Vec<i128>, i128)>, nvars: usize) -> bool {
+    for v in 0..nvars {
+        let mut pos: Vec<(Vec<i128>, i128)> = Vec::new();
+        let mut negc: Vec<(Vec<i128>, i128)> = Vec::new();
+        let mut zero: Vec<(Vec<i128>, i128)> = Vec::new();
+        for (coeff, rhs) in cons {
+            match coeff.get(v).copied().unwrap_or(0) {
+                0 => zero.push((coeff, rhs)),
+                c if c > 0 => pos.push((coeff, rhs)),
+                _ => negc.push((coeff, rhs)),
+            }
+        }
+        if pos.is_empty() || negc.is_empty() {
+            cons = zero;
+            continue;
+        }
+        let mut next = zero;
+        for (pc, pr) in &pos {
+            for (nc, nr) in &negc {
+                let a = -nc[v];
+                let b = pc[v];
+                let mut coeff = pc.clone();
+                for i in 0..nvars {
+                    coeff[i] = coeff[i].checked_mul(a).unwrap_or(i128::MAX / 4);
+                    coeff[i] = coeff[i].checked_add(nc[i].checked_mul(b).unwrap_or(0)).unwrap_or(i128::MAX / 4);
+                }
+                coeff[v] = 0;
+                let rhs = pr.checked_mul(a).and_then(|x| nr.checked_mul(b).and_then(|y| x.checked_add(y)));
+                let Some(rhs) = rhs else { return false; };
+                next.push((coeff, rhs));
+                if next.len() > FM_MAX_CONS {
+                    return false;
+                }
+            }
+        }
+        cons = next;
+    }
+    cons.iter().any(|(_, rhs)| *rhs < 0)
+}
+
+fn linear_goal_proven(goal: &LinC, facts: &[Expr]) -> bool {
+    if goal.terms.len() > FM_MAX_VARS {
+        return false;
+    }
+    let Some(negated) = goal_negation_constraints(goal) else { return false; };
+    let mut all_terms: Vec<String> = goal.terms.iter().map(|(a, _)| a.clone()).collect();
+    let mut fact_lin: Vec<LinC> = Vec::new();
+    // Keep only facts transitively connected to the goal's atoms. The app's
+    // contexts are large; feeding every fact to Fourier-Motzkin hits the cap
+    // and loses otherwise simple counter/length proofs.
+    let mut relevant: std::collections::HashSet<String> = all_terms.iter().cloned().collect();
+    let mut picked: Vec<bool> = vec![false; facts.len()];
+    loop {
+        let mut changed = false;
+        for (i, f) in facts.iter().enumerate() {
+            if picked[i] { continue; }
+            let Expr::BinaryOp(op, l, r) = f else { continue };
+            let Some(lc) = normalize(l, *op, r) else { continue };
+            if lc.terms.iter().any(|(a, _)| a.contains("Call(")) { continue; }
+            if !lc.terms.iter().any(|(a, _)| relevant.contains(a)) { continue; }
+            picked[i] = true; changed = true;
+            for (a, _) in &lc.terms {
+                if relevant.insert(a.clone()) && !all_terms.contains(a) {
+                    all_terms.push(a.clone());
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    for (i, f) in facts.iter().enumerate() {
+        if !picked[i] { continue; }
+        let Expr::BinaryOp(op, l, r) = f else { continue };
+        let Some(lc) = normalize(l, *op, r) else { continue };
+        if lc.op == BinaryOpKind::Neq { continue; }
+        fact_lin.push(lc);
+    }
+    for (a, _) in &goal.terms {
+        if !all_terms.contains(a) { all_terms.push(a.clone()); }
+    }
+    if all_terms.len() > FM_MAX_VARS { return false; }
+    let idx: HashMap<&str, usize> = all_terms.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let align = |terms: &[(String, i128)]| -> Vec<i128> {
+        let mut v = vec![0i128; all_terms.len()];
+        for (a, k) in terms { if let Some(i) = idx.get(a.as_str()) { v[*i] = *k; } }
+        v
+    };
+    let mut base: Vec<(Vec<i128>, i128)> = Vec::new();
+    for lc in &fact_lin {
+        for (terms, rhs) in lin_le_constraints(lc) {
+            base.push((align(&terms), rhs));
+        }
+    }
+    // A goal is proven only when EVERY branch of its negation is
+    // infeasible. Eq has two branches; returning on the first one was the
+    // source of a false `x <= 5 ⊢ x == 5`.
+    for (terms, rhs) in negated {
+        let mut c = base.clone();
+        c.push((align(&terms), rhs));
+        if !fourier_motzkin_infeasible(c, all_terms.len()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Collect atom bounds from simple one-atom facts. Facts with two atoms
@@ -1048,6 +1313,14 @@ fn prove_conjunct_core(goal: &Expr, facts: &[Expr]) -> Verdict {
         return Verdict::Proven;
     }
 
+    if difference_proves(&g, facts) {
+        return Verdict::Proven;
+    }
+
+    if linear_goal_proven(&g, facts) {
+        return Verdict::Proven;
+    }
+
     if let Some(negated) = negate_canonical(&g) {
         for f in facts {
             let Some((op, l, r)) = (match f {
@@ -1236,7 +1509,14 @@ pub fn fallthrough_facts(cond: &Expr) -> Vec<Expr> {
             }
         }
         _ => match negate_literal(cond) {
-            Some(f) => vec![f],
+            Some(f) => {
+                // 2026-10-26: normalize to conjuncts. `!(A && B)` must yield
+                // two facts; a single opaque And fact was invisible to the
+                // prover and forced redundant compound guards in callers.
+                let mut out = Vec::new();
+                conjuncts(&f, &mut out);
+                out
+            }
             None => Vec::new(),
         },
     }
@@ -1757,6 +2037,25 @@ mod tests {
         assert_eq!(prove_precondition(&goal, &facts), Verdict::Proven);
     }
 
+    /// 2026-10-26: a literal's own field denotes its value. Without this,
+    /// `Socket { fd: fd }.fd` was opaque and a caller's `fd >= -4096` guard
+    /// could not discharge the callee contract.
+    #[test]
+    fn struct_literal_field_reduces_to_value() {
+        let lit = Expr::StructLiteral {
+            type_name: "Socket".into(),
+            fields: vec![("fd".into(), Expr::Identifier("fd".into()))],
+            specs: Vec::new(),
+        };
+        let field = Expr::Field(Box::new(lit), "fd".into());
+        assert_eq!(atom_key(&field), "fd");
+        assert_eq!(
+            linify(&field),
+            Some((vec![("fd".to_string(), 1)], 0)),
+            "literal field must reduce to the field value"
+        );
+    }
+
     #[test]
     fn strict_integer_bound_tightens_by_one() {
         // nd < count => count - nd >= 1, and nd <= count - 1.
@@ -1831,8 +2130,40 @@ mod tests {
     }
 
     #[test]
+    fn difference_bounds_compose_across_atoms() {
+        let facts = vec![e("idx >= begin"), e("begin >= 0")];
+        assert_eq!(prove_precondition(&e("idx >= 0"), &facts), Verdict::Proven);
+        let facts = vec![e("i < end"), e("end <= len")];
+        assert_eq!(prove_precondition(&e("i < len"), &facts), Verdict::Proven);
+    }
+
+    #[test]
+    fn linear_goal_proves_counter_bound() {
+        let facts = vec![
+            e("count <= idx - begin"),
+            e("idx <= end - 1"),
+            e("users.len == end - begin + 1"),
+            e("count == 0"),
+        ];
+        assert_eq!(prove_precondition(&e("count < users.len"), &facts), Verdict::Proven);
+    }
+
+    #[test]
+    fn difference_bounds_do_not_overprove() {
+        let facts = vec![e("idx >= begin"), e("begin >= 0")];
+        assert_eq!(prove_precondition(&e("idx > 0"), &facts), Verdict::Unproven);
+        assert_eq!(prove_precondition(&e("n < 0"), &[e("n == 5")]), Verdict::Refuted);
+    }
+
+    #[test]
     fn guard_fallthrough_skips_and_guard() {
         assert!(fallthrough_facts(&e("a > 0 && b > 0")).is_empty());
+    }
+
+    #[test]
+    fn negated_conjunction_fallthrough_splits_into_facts() {
+        let facts = fallthrough_facts(&e("!(a > 0 && b > 0)"));
+        assert_eq!(facts, vec![e("a > 0"), e("b > 0")]);
     }
 
     #[test]

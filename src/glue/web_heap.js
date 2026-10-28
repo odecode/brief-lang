@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 // 2026-10-21: browser allocations preserve the module's initial stack/globals.
+// Authored by Otto Westerlund (@odecode); adopted with attribution, see
+// docs/contributors/otto-westerlund.md.
 // Coalescing reuses released buffers; all host byte operations validate ranges.
 class WebHeap {
   constructor(memory) {

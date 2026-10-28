@@ -480,14 +480,14 @@ impl GlueWebGenerator {
                 .collect::<String>()
         };
         let host_module_src = self.host_module_src.as_str();
-        let heap_source = include_str!("web_heap.js");
+        let heap_runtime_js = include_str!("web_heap.js");
 
         format!(
             r#"// dom-shim.mjs — Auto-generated GLUE web runtime for {app_name}
 // Reads WASM linear memory at known state offsets.
 
 {host_fns_js}{host_module_src}
-{heap_source}
+{heap_runtime_js}
 export class WasmDomRuntime {{
   // 2026-10-25: repeated snapshots preserve unchanged text nodes and observers.
   _setText(element, value) {{
@@ -508,7 +508,7 @@ export class WasmDomRuntime {{
     this._generationOffset = {generation_offset};
     this._flushBufferOffset = {flush_buffer_offset};
     this._maxFlushEntries = {max_flush_entries};
-    this._heap = createWebHeap(() => this._memory || this._instance?.exports.memory);
+    this._heap = createWebHeap(() => this._memory);
     // 2026-10-08 (Phase 3.1 stranger probe): keep the init promise so
     // createApp can await it — reading `_instance.exports` before init
     // resolved threw "Cannot read properties of null (reading 'exports')".
@@ -542,19 +542,16 @@ export class WasmDomRuntime {{
 
   _buildImports() {{
     return {{
+      ...this._heap,
       __web_flush_state: (updatesPtr, count) => {{
         this._applyFlush(updatesPtr, count);
       }},
-      // 2026-10-25: LLVM can lower copies/fills to libc imports too. Share
-      // the checked allocator with every host memory door; retire only when
-      // the module supplies its own complete allocator ABI.
-      ...this._heap,
+      // Native syscall shim: browser programs do not use file/OS syscalls.
+      // The symbol may remain rooted by the shared prelude; a callable stub
+      // keeps the wasm module instantiable without pretending to implement IO.
+      briev_syscall: (..._args) => 0,
 {imports_js}
     }};
-  }}
-
-  _malloc(size) {{
-    return this._heap.malloc(size);
   }}
 
   _loadStateLayout() {{
@@ -648,7 +645,7 @@ export class WasmDomRuntime {{
     // and return the pointer. Uses Module.malloc or pre-allocated buffer.
     const encoder = new TextEncoder();
     const bytes = encoder.encode(str);
-    const ptr = this._malloc(8 + bytes.length + 1);
+    const ptr = this._heap.malloc(8 + bytes.length + 1);
     const mem = new DataView(this._memory.buffer);
     mem.setBigUint64(ptr, BigInt(bytes.length), true);
     const arr = new Uint8Array(this._memory.buffer);
@@ -658,7 +655,9 @@ export class WasmDomRuntime {{
   }}
 
   _allocateStatic(size) {{
-    return this._malloc(size);
+    // 2026-10-21: host strings share the allocator used by compiled code;
+    // no guessed free address may overlap the module's stack or globals.
+    return this._heap.malloc(size);
   }}
 
   _startRenderLoop() {{
@@ -910,15 +909,16 @@ export async function createApp(wasmBytes) {{
              \x20           const v = itemValue(expr.trim(), item);\n\
              \x20           return String(v === undefined ? item : v);\n\
              \x20         }};\n
-             \x20         const applyItem = (el, item, bind = false) => {{ el.__brievItem = item;\n\
+             \x20         const applyItem = (el, item, bindTriggers) => {{ el.__brievItem = item;\n\
              \x20           for (const ib of itemBindings) {{\n\
              \x20             const target = ib.marker === 0 ? el : el.querySelector('[data-itm=\"' + ib.marker + '\"]');\n\
              \x20             if (!target) continue;\n\
              \x20             if (ib.kind === \"text\") this._setText(target, evalItem(ib.expr, item));\n\
-             \x20             else if (ib.kind === \"class\") {{ for (const [name, expr] of ib.cls) target.classList.toggle(name, Boolean(evalItem(expr, item))); }} else if (ib.kind === \"show\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
+             \x20             else if (ib.kind === \"class\") {{ for (const [name, expr] of (ib.cls || [])) target.classList.toggle(name, Boolean(evalItem(expr, item))); }}\n\
+             \x20             else if (ib.kind === \"show\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
              \x20             else if (ib.kind === \"when\") target.style.display = evalItem(ib.expr, item) ? '' : 'none';\n\
-             \x20             else if (ib.kind === \"trigger\") {{\n\
-             \x20               if (bind) target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
+             \x20             else if (ib.kind === \"trigger\" && bindTriggers) {{\n\
+             \x20               target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
              \x20             }}\n\
              \x20           }}\n\
              \x20         }};\n\
@@ -929,20 +929,22 @@ export async function createApp(wasmBytes) {{
              \x20           const dv = new DataView(this._memory.buffer);\n\
               \x20           const n = Number(dv.getBigInt64(snapPtr, true));\n\
               \x20           const seen = new Set();\n\
-              \x20           let cursor = container.firstElementChild;\n\
               \x20           for (let i = 0; i < n; i++) {{\n\
               \x20             {item_reader}\n\
               \x20             const key = itemKey({key_expr:?}, item);\n\
               \x20             seen.add(key);\n\
               \x20             let el2 = rendered.get(key);\n\
-              \x20             if (!el2) {{\n\
+              \x20             const isNew = !el2;\n\
+              \x20             if (isNew) {{\n\
               \x20               el2 = document.createElement(tagName);\n\
               \x20               el2.innerHTML = templateInner;\n\
-              \x20               applyItem(el2, item, true);\n\
-              \x20               rendered.set(key, el2);\n\
+             \x20               rendered.set(key, el2);\n\
              \x20             }}\n\
-             \x20             applyItem(el2, item); if (el2 !== cursor) container.insertBefore(el2, cursor);\n\
-             \x20             cursor = el2.nextElementSibling;\n\
+             \x20             // Reappend in snapshot order so keyed rows reconcile order.\n\
+             \x20             container.appendChild(el2);\n\
+             \x20             // Existing keyed nodes still need field updates (toggle\n\
+             \x20             // done=true must re-render, not only create).\n\
+             \x20             applyItem(el2, item, isNew);\n\
              \x20           }}\n\
              \x20           for (const [key, el2] of rendered) {{\n\
              \x20             if (!seen.has(key)) {{\n\
@@ -1056,7 +1058,7 @@ export async function createApp(wasmBytes) {{
                 format!(
                     "this._registerViewEffect({handle}, (value) => {{\n\
                      \x20         const el = {el};\n\
-                     \x20         if (el) el.style.display = ({hidden} ? ({cond}) : !({cond})) ? 'none' : '';\n\
+                     \x20         if (el) el.style.display = ({hidden} ? !({cond}) : ({cond})) ? '' : 'none';\n\
                      \x20       }});",
                     hidden = if hidden { "true" } else { "false" },
                     cond = cond
@@ -1175,9 +1177,8 @@ export async function createApp(wasmBytes) {{
                     String::new()
                 } else {
                     let args: Vec<String> = params.iter().map(|(_, v)| v.clone()).collect();
-                    // 2026-10-25: _txn owns the state argument. Static event
-                    // arguments start at position zero; a leading comma makes
-                    // the entire module invalid. Revisit only if that ABI changes.
+                    // _txn owns the state argument; a leading comma made the
+                    // generated module syntactically invalid.
                     args.join(", ")
                 };
                 if *scope == crate::view_compiler::TriggerScope::Window {
@@ -1295,8 +1296,8 @@ export async function createApp(wasmBytes) {{
                      \x20         const templateInner = {template_html:?};\n\
                      \x20         anchor.remove();\n\
                      \x20         const itemBindings = {ibs_js};\n\
-                     \x20         const itemValue = (token, item) => token === {item_name:?} ? item : token === \"true\" ? true : token === \"false\" ? false : Number(token); const evalItem = (expr, item) => {{\n\
-                     \x20           const direct = itemValue(expr.trim(), item); if (!Number.isNaN(direct)) return direct;\n\
+                     \x20         const evalItem = (expr, item) => {{\n\
+                     \x20           if (expr === {item_name:?}) return item;\n\
                      \x20           for (const op of [\"==\", \"!=\", \"<=\", \">=\", \"<\", \">\"]) {{\n\
                      \x20             const i = expr.indexOf(op);\n\
                      \x20             if (i < 0) continue;\n\
@@ -1314,7 +1315,7 @@ export async function createApp(wasmBytes) {{
                      \x20           }}\n\
                      \x20           return Boolean(item);\n\
                      \x20         }};\n\
-                     \x20         const applyItem = (el, item, bind = false) => {{ el.__brievItem = item;\n\
+                     \x20         const applyItem = (el, item, bindTriggers) => {{ el.__brievItem = item;\n\
                      \x20           for (const ib of itemBindings) {{\n\
                      \x20             const target = ib.marker === 0 ? el : el.querySelector('[data-itm=\"' + ib.marker + '\"]');\n\
                      \x20             if (!target) continue;\n\
@@ -1324,8 +1325,8 @@ export async function createApp(wasmBytes) {{
                      \x20               for (const [clsName, clsExpr] of (ib.cls || [])) {{\n\x20                 target.classList.toggle(clsName, evalItem(clsExpr, item));\n\x20               }}\n\
                      \x20             }} else if (ib.kind === \"show\" || ib.kind === \"when\") {{\n\
                      \x20               target.style.display = evalItem(ib.expr, item) ? \"\" : \"none\";\n\
-                     \x20             }} else if (ib.kind === \"trigger\") {{\n\
-                     \x20               if (bind) target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
+                     \x20             }} else if (ib.kind === \"trigger\" && bindTriggers) {{\n\
+                     \x20               target.addEventListener(ib.event, () => this._txn(ib.txn)(...(ib.params.length ? ib.params.map(p => evalItem(p, el.__brievItem)) : [el.__brievItem])));\n\
                      \x20             }}\n\
                      \x20           }}\n\
                      \x20         }};\n\
@@ -1335,20 +1336,20 @@ export async function createApp(wasmBytes) {{
                      \x20           const dv = new DataView(this._memory.buffer);\n\
                      \x20           const n = Math.min({count}, Math.floor(valLen / {elem_size}));\n\
                      \x20           const seen = new Set();\n\
-                     \x20           let cursor = container.firstElementChild;\n\
                      \x20           for (let i = 0; i < n; i++) {{\n\
                      \x20             const item = {slot_reader};\n\
                      \x20             const key = String(item);\n\
                      \x20             seen.add(key);\n\
                      \x20             let el = rendered.get(key);\n\
-                     \x20             if (!el) {{\n\
+                     \x20             const isNew = !el;\n\
+                     \x20             if (isNew) {{\n\
                      \x20               el = document.createElement(tagName);\n\
                      \x20               el.innerHTML = templateInner;\n\
-                     \x20               applyItem(el, item, true);\n\
+                     \x20               container.appendChild(el);\n\
                      \x20               rendered.set(key, el);\n\
                      \x20             }}\n\
-                     \x20             applyItem(el, item); if (el !== cursor) container.insertBefore(el, cursor);\n\
-                     \x20             cursor = el.nextElementSibling;\n\
+                     \x20             // Existing keyed nodes still need field updates.\n\
+                     \x20             applyItem(el, item, isNew);\n\
                      \x20           }}\n\
                      \x20           for (const [key, el] of rendered) {{\n\
                      \x20             if (!seen.has(key)) {{\n\
@@ -1982,7 +1983,7 @@ mod tests {
         assert!(output.dom_shim.contains("document.getElementById(\"counter\")"),
             "text binding must target its element; got:\n{}", output.dom_shim);
         assert!(output.dom_shim.contains("this._setText(el, value)"),
-            "text binding must set textContent; got:\n{}", output.dom_shim);
+            "text binding must set text through the unchanged-text guard; got:\n{}", output.dom_shim);
         assert!(output.dom_shim.contains("addEventListener(\"click\"")
             && output.dom_shim.contains("this._txn(\"increment\")"),
             "trigger binding must wire the event listener; got:\n{}", output.dom_shim);
@@ -2266,7 +2267,7 @@ mod tests {
                         directive: ItemDirective::Trigger {
                             event: "click".to_string(),
                             txn: "select_item".to_string(),
-                            params: Vec::new(),
+                            params: vec!["item".to_string()],
                         },
                     },
                     ItemBinding {
@@ -2309,31 +2310,149 @@ mod tests {
         assert!(shim.contains("getBigInt64(valPtr + i * 8"),
             "each must read i64 slots from WASM:\n{shim}");
         assert!(shim.contains("txn: \"select_item\"")
-            && shim.contains("[el.__brievItem]"),
-            "item trigger must call the txn with the item:\n{shim}");
+            && shim.contains("params: [\"item\"]")
+            && shim.contains("ib.params.length ? ib.params.map"),
+            "item trigger must call the txn with its declared params:\n{shim}");
         assert!(shim.contains("data-itm=\\\""),
             "marker-1 inner elements resolved in the clone:\n{shim}");
-        assert!(shim.contains("let cursor = container.firstElementChild")
-            && shim.contains("container.insertBefore(el, cursor)")
-            && !shim.contains("container.appendChild(el)"),
-            "keyed reconciliation must leave unchanged vector nodes in place:\n{shim}");
+        assert!(shim.contains("applyItem(el, item, isNew);"),
+            "existing keyed rows must refresh fields:\n{shim}");
+        assert!(shim.contains("ib.kind === \"trigger\" && bindTriggers"),
+            "item triggers must bind only on creation:\n{shim}");
     }
 
     #[test]
-    fn trigger_arguments_start_at_the_first_position() {
+    fn test_global_class_targets_the_element_not_a_placeholder() {
+        use crate::view_compiler::{Binding, Directive};
+        let bindings = vec![Binding {
+            element_id: "status".to_string(),
+            directive: Directive::Class {
+                pairs: vec![("active".to_string(), "count == 1".to_string())],
+            },
+        }];
+        let g = GlueWebGenerator::new(
+            Vec::new(), bindings,
+            StateLayout {
+                app_name: "t".into(), generation_offset: 0, flush_buffer_offset: 64,
+                max_flush_entries: 8,
+                fields: vec![FieldLayout {
+                    field_handle: 1, name: "count".into(), offset: 4, size: 4,
+                    element_size: 4, type_tag: TypeTag::Int,
+                }],
+            },
+            HashMap::new(), Vec::new(),
+        );
+        let shim = g.generate().expect("generate should succeed").dom_shim;
+        assert!(shim.contains("document.getElementById(\"status\")"), "{shim}");
+        assert!(!shim.contains("const el = {el};"), "{shim}");
+    }
+
+    #[test]
+    fn test_static_trigger_arguments_have_no_leading_comma() {
         use crate::view_compiler::{Binding, Directive, TriggerScope};
-        let generator = make_empty_generator();
-        for scope in [TriggerScope::Element, TriggerScope::Window] {
-            let binding = Binding {
-                element_id: "button".into(),
-                directive: Directive::Trigger {
-                    event: "click".into(), txn: "choose".into(), scope,
-                    params: vec![("value".into(), "3".into()), ("flag".into(), "true".into())],
-                },
-            };
-            let js = generator.binding_to_js(&binding);
-            assert!(js.contains("this._txn(\"choose\")(3, true)"), "{js}");
-        }
+        let bindings = vec![Binding {
+            element_id: "stars".to_string(),
+            directive: Directive::Trigger {
+                event: "click".to_string(),
+                txn: "select_stars".to_string(),
+                params: vec![("value".to_string(), "1".to_string())],
+                scope: TriggerScope::Element,
+            },
+        }];
+        let g = GlueWebGenerator::new(
+            Vec::new(), bindings,
+            StateLayout { app_name: "t".into(), generation_offset: 0, flush_buffer_offset: 0, max_flush_entries: 0, fields: vec![] },
+            HashMap::new(), Vec::new(),
+        );
+        let shim = g.generate().expect("generate should succeed").dom_shim;
+        assert!(shim.contains("this._txn(\"select_stars\")(1)"), "{shim}");
+        assert!(!shim.contains("this._txn(\"select_stars\")(, 1)"), "{shim}");
+        assert!(shim.contains("_setText(element, value)"), "{shim}");
+    }
+
+    #[test]
+    fn test_b_show_uses_truthy_display_expression() {
+        use crate::view_compiler::{Binding, Directive};
+        let bindings = vec![Binding {
+            element_id: "status".to_string(),
+            directive: Directive::Show { expr: "count > 0".to_string() },
+        }];
+        let g = GlueWebGenerator::new(
+            Vec::new(),
+            bindings,
+            StateLayout {
+                app_name: "show_app".to_string(),
+                generation_offset: 0,
+                flush_buffer_offset: 64,
+                max_flush_entries: 8,
+                fields: vec![FieldLayout {
+                    field_handle: 1,
+                    name: "count".to_string(),
+                    offset: 4,
+                    size: 4,
+                    element_size: 4,
+                    type_tag: TypeTag::Int,
+                }],
+            },
+            HashMap::new(),
+            Vec::new(),
+        );
+        let shim = g.generate().expect("generate should succeed").dom_shim;
+        assert!(
+            shim.contains("? '' : 'none'"),
+            "b-show must show on truth: {shim}"
+        );
+        assert!(
+            !shim.contains("? 'none' : ''"),
+            "b-show must not invert visibility: {shim}"
+        );
+    }
+
+    #[test]
+    fn test_each_string_items_decode_utf8_and_reappend_in_order() {
+        use crate::view_compiler::{Binding, Directive, ItemBinding, ItemDirective};
+        let bindings = vec![Binding {
+            element_id: "lst".to_string(),
+            directive: Directive::Each {
+                iterable: "items".to_string(),
+                item_name: "item".to_string(),
+                template_html: r#"<span data-itm="1">x</span>"#.to_string(),
+                container_id: "lst".to_string(),
+                item_bindings: vec![ItemBinding {
+                    marker: 1,
+                    directive: ItemDirective::Text { signal: "item".to_string() },
+                }],
+                key_expr: "item".to_string(),
+            },
+        }];
+        let g = GlueWebGenerator::new(
+            Vec::new(),
+            bindings,
+            StateLayout {
+                app_name: "each_strings".to_string(),
+                generation_offset: 0,
+                flush_buffer_offset: 64,
+                max_flush_entries: 8,
+                fields: vec![FieldLayout {
+                    field_handle: 1,
+                    name: "items".to_string(),
+                    offset: 4,
+                    size: 16,
+                    element_size: 8,
+                    type_tag: TypeTag::String,
+                }],
+            },
+            HashMap::new(),
+            Vec::new(),
+        )
+        .with_collection_iterables(HashSet::from(["items".to_string()]))
+        .with_collection_string_iterables(HashSet::from(["items".to_string()]));
+        let shim = g.generate().expect("generate should succeed").dom_shim;
+        assert!(shim.contains("new TextDecoder().decode(__bytes)"), "{shim}");
+        assert!(shim.contains("if (token === \"item\") return item;"), "{shim}");
+        assert!(shim.contains("container.appendChild(el2);"), "{shim}");
+        assert!(shim.contains("const isNew = !el2;"), "{shim}");
+        assert!(!shim.contains("String.fromCharCode(...__bytes)"), "{shim}");
     }
 
     #[test]
@@ -2415,10 +2534,12 @@ mod tests {
             vec![frgn],
         );
         let out = g.generate().unwrap();
+        assert!(out.dom_shim.contains("class WebHeap"),
+            "browser heap runtime missing:\n{}", out.dom_shim);
         assert!(out.dom_shim.contains("...this._heap"),
-            "wasm32 malloc import missing:\n{}", out.dom_shim);
-        assert!(out.dom_shim.contains("_malloc(size)"),
-            "checked allocator missing:\n{}", out.dom_shim);
+            "wasm32 heap imports missing:\n{}", out.dom_shim);
+        assert!(out.dom_shim.contains("return this._heap.malloc(size)"),
+            "host static allocation is not heap-owned:\n{}", out.dom_shim);
         assert!(out.dom_shim.contains("document.readyState"),
             "missed readiness-event recovery missing:\n{}", out.dom_shim);
     }

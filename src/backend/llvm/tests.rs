@@ -1332,6 +1332,25 @@ fn record_reg_def(t: &str, def_ty: &mut std::collections::HashMap<String, String
 /// unreachable for lifted programs. The composition (pass + generate) is
 /// what compile_source runs.
 #[test]
+fn proven_guard_is_elided_from_ir() {
+    let src = r#"
+defn f(n: Int) [n >= 0] -> Int {
+    foreach i in 0..n { when !(i >= 0) { trap; }; };
+    term 0;
+};
+"#;
+    let tokens = crate::lexer::tokenize(src).unwrap();
+    let mut p = crate::parser::Parser::new(tokens, src);
+    let mut items = p.parse_program().unwrap();
+    let universe = crate::type_universe::TypeUniverse::new();
+    crate::typechecker::check_program(&mut items, &universe).expect("checks");
+    let mut backend = LlvmBackend::new();
+    let ir = backend.generate(&items, None);
+    assert!(!ir.contains("guard.then"), "proven guard emitted a branch:\n{ir}");
+    assert!(!ir.contains("call void @llvm.trap"), "proven guard emitted a trap:\n{ir}");
+}
+
+#[test]
 fn test_wildcard_lift_reaches_codegen_as_plain_elements() {
     let src = r#"
 let a: Int[4];
@@ -3592,6 +3611,71 @@ fn test_struct_type_registered() {
     assert!(backend.ctx.struct_types.contains_key("Point"),
         "Struct 'Point' should be registered");
     assert_eq!(backend.ctx.struct_types["Point"].len(), 2);
+}
+
+#[test]
+fn nested_obj_size_uses_final_field_layout() {
+    // Outer is declared before Inner, so the initial structural-layout cache
+    // sees Inner absent. The post-registration fixpoint must recompute Outer
+    // from Inner's final size; otherwise allocation is smaller than the field
+    // offsets the emitter uses (the WorkerModelState regression).
+    let tu = crate::type_universe::TypeUniverse::new();
+    let mut backend = LlvmBackend::new().with_type_universe(tu);
+    let int_field = |name: &str| StructField {
+        name: name.to_string(),
+        ty: Type::int(),
+        default: None,
+        visibility: Visibility::Public,
+    };
+    let program = vec![
+        TopLevel::Obj(StructDefinition {
+            name: "Outer".to_string(),
+            type_params: vec![],
+            parent: None,
+            fields: vec![
+                StructField {
+                    name: "inner".to_string(),
+                    ty: Type::Custom("Inner".to_string()),
+                    default: None,
+                    visibility: Visibility::Public,
+                },
+                int_field("tail"),
+            ],
+            transactions: vec![],
+            view_html: None,
+            span: None,
+            modifiers: vec![],
+            variants: vec![],
+        }),
+        TopLevel::Obj(StructDefinition {
+            name: "Inner".to_string(),
+            type_params: vec![],
+            parent: None,
+            fields: vec![int_field("a"), int_field("b"), int_field("c")],
+            transactions: vec![],
+            view_html: None,
+            span: None,
+            modifiers: vec![],
+            variants: vec![],
+        }),
+    ];
+    let _ = backend.generate(&program, None);
+    let universe = backend.ctx.type_universe.as_ref().expect("universe");
+    assert_eq!(
+        universe.types.get("Inner").map(|t| t.bytes),
+        Some(24),
+        "Inner is three Int fields"
+    );
+    assert_eq!(
+        universe.types.get("Outer").map(|t| t.bytes),
+        Some(32),
+        "Outer is Inner (24) + Int (8), not a provisional pointer-sized Inner"
+    );
+    assert_eq!(
+        backend.lookup_field_offset("Outer", "tail"),
+        24,
+        "offset walk must agree with the recomputed size"
+    );
 }
 
 #[test]
@@ -9812,6 +9896,30 @@ fn test_webstack_int_literal_emits_target_width() {
 }
 
 #[test]
+fn test_int_constant_global_and_load_follow_target_width() {
+    // 2026-10-22: const globals used protocol metadata (i64) while wasm32 Int
+    // is i32. Declarations, aliases and reads must all use llvm_type(Int).
+    let src = r#"
+const LIMIT: Int = 7;
+let seen: Int = LIMIT;
+txn run [seen == LIMIT][true] { seen = LIMIT; term; };
+"#;
+    let program = parse_bv_source(src);
+    let mut backend = LlvmBackend::new()
+        .with_webstack(true)
+        .with_int_bits(32)
+        .with_target_triple("wasm32-unknown-wasi")
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let ir = backend.generate(&program, None);
+    assert!(ir.contains("@LIMIT = constant i32 7"),
+        "Int constant global must be i32 on wasm32:\n{ir}");
+    assert!(ir.contains("load i32, ptr @LIMIT"),
+        "Int constant read must be i32 on wasm32:\n{ir}");
+    assert!(!ir.contains("load i64, ptr @LIMIT"),
+        "Int constant read must not hardcode i64:\n{ir}");
+}
+
+#[test]
 fn test_webstack_state_int_slots_are_target_width() {
     // 2026-08-10: flexible Int %State slots are i{int_bits} (i32 on wasm32) —
     // the --int-bits design intent. x86_64 (int_bits=64) is unchanged.
@@ -10321,6 +10429,33 @@ fn test_struct_literal_alloca_deferred_in_loop() {
     let _ = reg;
 }
 
+#[test]
+fn test_dynamic_struct_literal_allocation_stays_in_loop() {
+    // 2026-10-27: hoisting a dynamic struct literal's allocation to the loop
+    // preheader makes every appended struct alias the final iteration. A
+    // parsed `List<Item>` then reads the last title for every element.
+    let tu = crate::type_universe::TypeUniverse::new();
+    let mut backend = LlvmBackend::new().with_type_universe(tu);
+    backend.ctx.struct_types.insert(
+        "Item".to_string(),
+        vec![("id".to_string(), Type::int()), ("title".to_string(), Type::string())],
+    );
+    let mut out = String::new();
+    backend.fun.defer_struct_allocas = true;
+    backend.emit_struct_literal(
+        &mut out, "%v", "Item",
+        &[
+            ("id".to_string(), Expr::Identifier("i".to_string())),
+            ("title".to_string(), Expr::Quoted(b"x".to_vec())),
+        ],
+        "  ",
+    );
+    assert!(out.contains("call ptr @malloc"),
+        "dynamic struct literal must allocate per evaluation; got:\n{out}");
+    assert!(backend.fun.pending_struct_allocas.is_empty(),
+        "dynamic struct literal must not defer its allocation");
+}
+
 // ── typed !range metadata (2026-08-13 fix) ────────────────────────────
 
 /// 2026-08-27 (plan 2026-08-27-cbv-foreign-hardware-and-mmio.md Slice C):
@@ -10785,6 +10920,34 @@ defn make() -> Option {
 /// runs on the AST before arena lowering; without the stateless_body guard
 /// the backend reintroduced %state and clang rejected the module
 /// (arena_churn/digits_of_int — BUGS.md 2026-09-24).
+#[test]
+fn test_boxed_enum_return_through_sret_callee_uses_heap_slot() {
+    let src = r#"
+enum R { Ok(Int), Err(Int) };
+defn inner(x: Int) -> R { term Ok(x); };
+defn passthrough(r: R) -> R { term r; };
+defn outer(x: Int) -> R {
+    when x > 0 { term inner(x); };
+    term passthrough(Err(1));
+};
+let tick: Int = 0;
+node go [tick < 1][tick == 1] { let r: R = outer(1); tick = 1; term; };
+"#;
+    let tokens = crate::lexer::tokenize(src).unwrap();
+    let mut p = crate::parser::Parser::new(tokens, src);
+    let items = p.parse_program().unwrap();
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::backend::register_types::register_typedefs(&items, &mut universe, 64).unwrap();
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    let outer = ir.split("define i64 @outer").nth(1).expect("outer definition");
+    let body = outer.split("\n}").next().unwrap();
+    assert!(
+        body.contains("call ptr @malloc(i64 16)"),
+        "boxed enum return through an sret callee must own a heap slot:\n{body}"
+    );
+}
+
 #[test]
 fn test_stateless_defn_concat_uses_malloc_when_arena_program() {
     let src = "let n: Int = 0;\n\
@@ -12088,4 +12251,30 @@ node run [tick == 0][tick == 1] {
     assert!(ir.contains("inttoptr i32"), "TaskCall args must use i32 pointers:\n{ir}");
     assert!(ir.contains("call i32"), "TaskCall result must be i32:\n{ir}");
     assert!(!ir.contains("call i64 %"), "stale i64 TaskCall remains:\n{ir}");
+}
+
+
+#[test]
+fn defn_may_trap_is_not_willreturn() {
+    let src = r#"
+defn boom(n: Int) -> Int {
+    when n > 0 { trap; };
+    term 0;
+};
+defn caller(n: Int) -> Int { term boom(n); };
+node entry [beginprogram][true] {
+    caller(1);
+    endprogram 5;
+};
+"#;
+    let program = parse_bv_source(src);
+    let mut backend = LlvmBackend::new();
+    let ir = backend.generate(&program, None);
+    for name in ["boom", "caller"] {
+        let line = ir.lines().find(|l| l.contains("define") && l.contains(&format!("@{name}")))
+            .unwrap_or_else(|| panic!("missing @{name}:\n{ir}"));
+        assert!(line.contains("#15"), "may-trap defn must use the non-willreturn group: {line}");
+        assert!(!line.contains("#8"), "may-trap defn must not claim memory(read): {line}");
+    }
+    assert!(ir.contains("call i64 @caller"), "the unused may-trap call must survive: {ir}");
 }

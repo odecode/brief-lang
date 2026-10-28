@@ -21,6 +21,9 @@
 // `println!()` with no arguments prints a newline alone.
 // The old PascalCase `Print!`/`PrintLn!` names are rejected by the
 // typechecker with a rename hint (see src/typechecker/mod.rs).
+//
+// 2026-10-25: exhaustive postorder traversal adopted from Otto Westerlund
+// (@odecode); see docs/contributors/otto-westerlund.md.
 
 use crate::ast::{Expr, StageKind, Statement, TopLevel};
 use crate::plugin::Plugin;
@@ -304,6 +307,19 @@ mod tests {
             });
         }
         assert_eq!(names, ["custom"]);
+    }
+
+    #[test]
+    fn exported_definition_prints_expand() {
+        let mut program = parsed(r#"export defn say() { println!("exported"); };"#);
+        resolve_prints(&mut program).expect("export body expansion");
+        let mut unresolved = 0;
+        for item in &program {
+            crate::ast::visit::walk_toplevel(item, &mut |expression| {
+                if let Expr::PluginIntercept { .. } = expression { unresolved += 1; }
+            });
+        }
+        assert_eq!(unresolved, 0);
     }
 
     #[test]

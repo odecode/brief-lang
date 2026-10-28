@@ -1,6 +1,8 @@
 //===----------------------------------------------------------------------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
+// Authored by Otto Westerlund (@odecode); adopted with attribution, see
+// docs/contributors/otto-westerlund.md.
 // Build tests/fixtures/collection_snapshot.rbv --split, then pass its WASM path.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
