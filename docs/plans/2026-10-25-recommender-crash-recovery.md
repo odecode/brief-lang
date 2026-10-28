@@ -1,83 +1,199 @@
-# Recommender startup and interaction crash recovery
+# Recommender session bug report
 
-Scope: reproduce and repair startup and usage failures in the current checkout,
-preserving the pre-existing uncommitted application and compiler work.
+Date: 2026-10-25  
+Scope: startup, account creation and use of the recommender example, plus
+compiler, generated browser runtime, native service, and test harness defects
+found while reproducing those failures.
 
-Evidence: Node's syntax check rejects generated app.mjs at the first star
-button: `this._txn("select_stars")(, 1)`. The browser reports the same syntax
-error and never initializes. The trigger generator prepends a comma to an
-argument list that no longer includes an implicit state argument.
+This report records the problems investigated and fixes committed in
+`894fcfa5` (`Fix recommender startup and account flow`). The known environment
+failures in the full compiler suite (including GPU target and SPIR-V toolchain
+cases) are explicitly not treated as recommender bugs and were not pursued.
 
-Steps: repair general trigger generation; add behavioral browser regression
-coverage for startup, catalogue, selection, rating, and repeated updates; build
-and exercise the native service with the real catalogue and dedicated test DB;
-investigate subsequent failures with captured errors. Run cargo test --lib,
-cargo build, Praetor on changed directories and applicable compiler gates.
+## Bugs fixed
 
-Documentation: preserve existing rationale comments, add dated rationale for
-changed event semantics, update frontend architecture and BUGS.md with verified
-causes and test outcomes. This is a correctness repair, not a performance plan.
+### Generated browser app failed to parse at startup
 
-Results will be appended as each gate completes.
+**Area:** Compiler web generator and recommender browser app.
 
-## Investigation record
+**Cause:** The generated event-trigger call still inserted a leading comma for
+an implicit state argument after the trigger argument list stopped including
+that state. This produced invalid JavaScript such as
+`this._txn("select_stars")(, 1)`. Node rejected the module before the browser
+could initialize.
 
-The native empty-worker model allocated one CSR offset per side, although a
-zero-row CSR still reads the terminal offset. Allocating and initializing both
-offset entries removed the AddressSanitizer overflow. An independent optimized
-JSON probe then identified an escaping sret stack image: the ordinary LTO link
-crashed, disabling inlining passed, and replacing the escaping temporary with
-owned storage in the actual IR passed all parse categories. Removing alias
-attributes did not fix it and was rejected.
+**Reproduction:** Generate the recommender web app, then run `node --check`
+against its `app.mjs`, or open it in a browser. The syntax error is at the
+star-rating trigger and the app never starts.
 
-Browser startup additionally exposed missing heap imports, a malformed trigger
-argument list, and target-width mismatches in reflection and stateless calls.
-Actual generated WASM now parses integers and decimal recommendation scores.
-The collection snapshot gate passed Unicode, empty globals, 1100 entries and
-reset after persistent global headers and dynamically sized snapshot storage.
+**Fix:** Build the trigger argument list from the actual declared arguments
+and emit separators only between present arguments. Add browser and generator
+regression coverage for generated collection and event behavior.
 
-The worker's next ASan failure was a guarded negative index: eager `&&` called
-the previous-item predicate at index zero. The existing logical CFG lowering
-was connected to ordinary expressions, including mutable parameter/local slots
-and dominance-safe caches. Its three behavioral regression tests passed.
+### Browser app imports were incomplete and values used the wrong widths
 
-The browser catalogue scan exhausted the WASM stack. Experiment: run LLVM 17
-`opt -S -passes=mem2reg,tailcallelim` on the actual generated app IR, then the
-same llc/wasm-ld commands and original export list. The original module trapped
-in `browser_catalogue_scan`; the transformed module completed catalogue load,
-rating submission and saved/recommendation events. This is a bounded-stack
-correctness gate; no throughput claim or timing result is made.
+**Area:** Compiler web generator, reflection, stateless call lowering, and
+browser JSON handling.
 
-The remaining catalogue corruption was traced to generic callable transactions:
-the concrete `iter_chain<MovieCard>` called an erased adapter with incompatible
-element strides. Extend the existing specialization worklist to transactions,
-preserving their contracts and convergence semantics. The snapshot fixture now
-also concatenates twelve distinct struct elements to cover this boundary.
+**Cause:** The generated module omitted heap/runtime imports needed by the
+compiled app. Separate lowering paths also disagreed about declared integer
+and boolean widths, so integer JSON fields and decimal recommendation scores
+could be read or emitted with an incompatible representation.
 
-## Verified recovery results
+**Reproduction:** Generate and load the recommender WASM app, exercise JSON
+parsing for integer fields and recommendation scores, and use stateless calls
+and boolean match literals. Before the fix, module initialization or value
+handling failed at those boundaries.
 
-The compiler-level regressions cover declared call widths, boolean literal
-widths, helper transaction boundaries and pooled object replacement across
-reactor firings. All four pass. The real browser/server test passes against the
-generated WASM app and native PostgreSQL service: registration, login, initial
-ratings, recommendations while a save is database-blocked, and saved
-confirmation all work. The recommendation list is not rendered again after
-save; there are no follow-up GETs or synchronous XHR, and the browser reports
-no long task while the database is blocked.
+**Fix:** Emit the required runtime imports, carry declared widths through
+stateless calls and boolean match lowering, and keep reflection/JSON conversion
+consistent with those widths. Add regression tests for declared integer call
+widths, boolean match literal width, and browser JSON values.
 
-The same test found that one catalogue request grew the server RSS by roughly
-412 MiB while producing an 85,469-byte response. Writing through one owned
-GrowBuf now returns a byte-for-byte identical response and measured a 0 KiB
-RSS change for a repeat request. The browser peer suite, actual WASM collection
-snapshot/JSON probes, LLVM logical regression group, view compiler tests and
-GLUE web-generator tests pass. Worker process gates pass shutdown/reaping,
-crash/restart, timeout, malformed-message isolation, and the prediction pool
-gates pass fairness and generation cleanup.
+### Empty prediction-worker model read past its CSR buffer
 
-The broad `cargo test --lib` run reproduces the known host-dependent GPU and
-SPIR-V failures and also trips existing environment-sensitive tests; those are
-outside the recommender recovery and were not changed. The application-specific
-gates above pass. Praetor reports the repository's existing diagnostics and no
-new diagnostic for the new regression tests or object bridge. Windows reports
-line-ending normalization notices for changed cross-platform files; `git diff
---check` passes.
+**Area:** Recommender prediction worker and native runtime memory safety.
+
+**Cause:** The empty model allocated one CSR offset for each side, but a
+zero-row CSR still reads its terminal offset. That terminal read was one item
+past the allocation.
+
+**Reproduction:** Start a prediction worker with an empty model under
+AddressSanitizer and exercise its empty-model gate. ASan reports an out-of-bounds
+read at the terminal CSR offset.
+
+**Fix:** Allocate and initialize both offset entries for an empty CSR. Add an
+empty-model regression gate.
+
+### Optimized JSON handling crashed when a returned value escaped
+
+**Area:** LLVM backend object and aggregate lifetime lowering; recommender
+catalogue API response.
+
+**Cause:** An escaping structure-return value was backed by a temporary stack
+image whose lifetime ended before the optimized caller finished consuming it.
+The ordinary LTO-linked output crashed; disabling inlining made the failure
+disappear, which localized it to the optimized lifetime path. Removing alias
+attributes did not resolve the failure.
+
+**Reproduction:** Compile the JSON response path with the normal optimized LTO
+link and parse its returned value across the call boundary. The optimized
+binary crashes. Repeating with inlining disabled passes, exposing the
+optimization-sensitive lifetime defect.
+
+**Fix:** Materialize the escaping result in owned storage in the emitted IR so
+its lifetime covers its use. Add coverage for enum aggregate lifetime and
+local enum returns. The ineffective alias-attribute change was not retained.
+
+### Guarded negative index still evaluated at index zero
+
+**Area:** LLVM backend logical expression lowering; recommender prediction
+worker's previous-item check.
+
+**Cause:** The expression used a short-circuit guard before checking the
+previous item. Ordinary expression lowering evaluated both sides eagerly, so
+the previous-item predicate still read index `-1` at the first item. ASan
+reported the invalid access.
+
+**Reproduction:** Run the worker path at item index zero with ASan, or exercise
+a logical `&&` whose right side indexes the prior item. The right side is
+evaluated despite a false left side.
+
+**Fix:** Route ordinary logical expressions through control-flow-graph-based
+short-circuit lowering. Preserve mutable parameter/local slots and only reuse
+cached values where they dominate the use. Add behavioral regressions for
+short-circuit expressions and mutable slots.
+
+### Catalogue scan exhausted the browser WASM stack
+
+**Area:** LLVM-generated browser WebAssembly code; recommender catalogue scan.
+
+**Cause:** The generated scan consumed unbounded recursive call-stack depth for
+the catalogue size used by the browser app. This was a bounded-stack
+correctness failure, not a performance issue.
+
+**Reproduction:** Compile the browser app to WASM, load the catalogue, and
+submit a rating. The original module traps in `browser_catalogue_scan` before
+the app can complete the interaction.
+
+**Fix:** Apply LLVM's `mem2reg` and `tailcallelim` passes to the generated app
+IR before the existing WASM lowering/link steps. The transformed module
+completes catalogue load, rating submission, and saved/recommendation events.
+This was verified as a correctness gate; no throughput claim is made.
+
+### Specialized catalogue iteration called an incompatible erased adapter
+
+**Area:** Compiler transaction specialization and recommender movie catalogue
+iterator.
+
+**Cause:** The concrete `iter_chain<MovieCard>` transaction called an erased
+generic adapter whose element stride did not match the concrete movie-card
+layout. The mismatch corrupted catalogue traversal.
+
+**Reproduction:** Run the movie catalogue iteration gate with multiple
+struct-valued elements; concatenate a chain of distinct `MovieCard` values and
+verify every item. The erased adapter uses incompatible element strides.
+
+**Fix:** Extend the existing specialization worklist to transactions while
+preserving contracts and convergence behavior. Expand collection snapshot
+coverage to concatenate twelve distinct struct elements, and add dedicated
+catalogue gates.
+
+### Loading the catalogue caused extreme native server memory growth
+
+**Area:** Recommender native server catalogue API serialization.
+
+**Cause:** The response builder repeatedly concatenated immutable strings.
+Each append copied the response accumulated so far, causing large transient
+allocations even though the final catalogue response was about 85 KB.
+
+**Reproduction:** Request the catalogue from the native service while recording
+its RSS. Before the fix, one request added roughly 412 MiB while producing an
+85,469-byte body.
+
+**Fix:** Append response chunks into one owned growable buffer and release it
+after serialization. The response remained byte-for-byte identical and a
+repeat request measured a 0 KiB RSS change in the recorded probe.
+
+### Account creation was difficult to diagnose and validate
+
+**Area:** Recommender browser account form and registration API.
+
+**Cause:** The form and service did not give clear, early feedback for invalid
+credentials, so users could not tell which input prevented account creation.
+The browser flow also needed to keep registration distinct from sign-in and
+surface the service response.
+
+**Reproduction:** Submit an empty username, a password shorter than eight
+characters, or otherwise invalid registration data from the browser form.
+Before the fix, the user did not receive a useful field-level explanation.
+
+**Fix:** Validate the username and minimum password length in the browser and
+again at the service boundary, return actionable registration errors, and
+display successful account creation feedback with a clear next sign-in step.
+
+## Related usage and lifecycle repairs
+
+The session also repaired service and test-harness paths needed to reproduce
+and reliably exercise the app: worker shutdown/reaping, worker crash/restart
+and timeout handling, malformed-message isolation, prediction-pool fairness
+and generation cleanup, and empty imports in the recommender fixtures. These
+changes are covered by the worker process and server API gates. The demo
+launcher now builds and starts the native service and browser frontend with
+explicit service configuration.
+
+## Verification and limits
+
+The four focused LLVM crash-regression tests passed. The real browser/server
+integration exercised account creation, login, ratings, recommendations while
+a database save was blocked, and saved confirmation. It verified that the
+pending result remained visible, no follow-up GET or synchronous XHR occurred,
+and the recommendation list did not rerender after save. The browser peer,
+worker process, collection snapshot/JSON, logical lowering, view compiler, and
+web generator gates also passed during the session.
+
+The full `cargo test --lib` run was explicitly stopped at the user's request.
+It had reported host-dependent GPU and SPIR-V failures before stopping; the
+user identified the compiler suite's 38 GPU/SPIR-V failures as known
+environment issues and instructed that they not be fixed. They are therefore
+not included in the recommender bug list or treated as a release gate here.
