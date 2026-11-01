@@ -5,6 +5,7 @@ mod collection_assignment;
 pub mod context;
 pub mod directive;
 pub mod dispatch;
+pub mod enum_lowering;
 pub mod emit_expr;
 pub mod emit_stmt;
 pub mod emit_toplevel;
@@ -16,6 +17,7 @@ mod logical;
 pub mod normalizer;
 pub mod types;
 pub mod strategy;
+pub mod value_lowering;
 pub mod vector_phi;
 
 #[cfg(test)]
@@ -271,6 +273,15 @@ fn collect_called_names_stmt(s: &Statement, out: &mut std::collections::HashSet<
 }
 
 impl LlvmBackend {
+    /// Query the concrete enum value representation selected by the layout
+    /// planner. Groundwork for the enum value model; legacy ABI unchanged.
+    pub(crate) fn enum_value_repr(
+        &self,
+        ty: &crate::ast::Type,
+    ) -> Option<crate::analysis::enum_layout::EnumValueRepr> {
+        self.enum_value_repr_for(ty)
+    }
+
     /// Warn once per plain txn that can never execute: non-reactive,
     /// callable-shaped (no params/outputs), referenced by no call in the
     /// program, AND not live (a live-but-uncalled txn is dispatched
@@ -1452,6 +1463,9 @@ pub struct LlvmBackend {
     // ── Reporting & Diagnostics ────────────────────────────
     pub(crate) report_lines: Vec<String>,
     pub(crate) warnings: Vec<String>,
+    /// D7e: emit the next definition under this LLVM symbol while keeping its
+    /// authored Briev name for plan/ABI lookups.
+    pub(crate) definition_symbol_override: Option<String>,
     pub(crate) remarks: Vec<crate::backend::llvm::directive::OptimizationRemark>,
     llvm_extra_flags: Vec<String>,
     pub(crate) pending_async_await_count: usize,
@@ -1611,6 +1625,7 @@ impl LlvmBackend {
             cell_thread_names: Vec::new(),
             report_lines: Vec::new(),
             warnings: Vec::new(),
+            definition_symbol_override: None,
             remarks: Vec::new(),
             llvm_extra_flags: Vec::new(),
             pending_async_await_count: 0,
@@ -2775,6 +2790,13 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
             }
         }
         self.ctx.dep_graph = analysis.dependency_graph.clone();
+        self.ctx.generalized_destination_ownership =
+            analysis.destination_ownership.generalized.clone();
+        self.ctx.destination_plan_attached = true;
+        self.ctx.stack_object_types = self
+            .ctx
+            .generalized_destination_ownership
+            .stack_object_types_by_owner();
         self.ctx.global_free_after = analysis.global_lifetime.free_after.clone();
         self.ctx.observable_names = analysis.observable_names.clone();
         self.ctx.coll_safe_txns = analysis.coll_safe_txns.clone();
@@ -3212,19 +3234,43 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             }
         }
         self.build_field_index(&reordered_items);
-        // 2026-10-21 (P2-1 ReturnedSmall): classify enum-returning defns from
-        // the structural plan. Only constructor-shaped returns take the hidden
-        // sret slot; everything else keeps the boxed ABI.
-        self.ctx.defn_sret.clear();
-        let enum_plan = crate::analysis::enum_repr::build_enum_representation_plan(&reordered_items);
-        for name in crate::analysis::enum_repr::sret_safe_defns(&reordered_items, &enum_plan) {
-            self.ctx.defn_sret.insert(name);
-        }
         // 2026-10-21 (B1 nested enum layout): concrete instance planner.
         let enum_depth = crate::config_tuning::target_settings_for(&self.ctx.target_triple)
             .max_enum_inline_depth;
         self.ctx.enum_layout_planner =
             Some(crate::analysis::enum_layout::EnumLayoutPlanner::new(&reordered_items, enum_depth));
+        let enum_lowering = self
+            .ctx
+            .enum_layout_planner
+            .as_ref()
+            .map(|layouts| {
+                crate::backend::llvm::enum_lowering::EnumLoweringPlan::build(
+                    &self.ctx.generalized_destination_ownership,
+                    layouts,
+                )
+            })
+            .unwrap_or_default();
+        self.ctx.enum_lowering = enum_lowering;
+        self.ctx.defn_object_sret = self
+            .ctx
+            .enum_layout_planner
+            .as_ref()
+            .map(|layouts| {
+                crate::analysis::object_repr::build_object_representation_plan(
+                    &reordered_items,
+                    layouts,
+                )
+            })
+            .map(|plan| plan.caller_destination_defns.into_iter().collect())
+            .unwrap_or_default();
+        // 2026-10-21 (P2-1 ReturnedSmall): only constructor-shaped, sret-safe
+        // enum results take the hidden slot; the joined plan owns the verdict.
+        self.ctx.defn_sret = self
+            .ctx
+            .enum_lowering
+            .hidden_result_callables()
+            .into_iter()
+            .collect();
         let tail_plan = crate::analysis::tail_recursion::build_tail_recursion_plan(&reordered_items);
         self.ctx.tail_loop =
             crate::analysis::tail_recursion::build_tail_loop_plan(&reordered_items);
@@ -3253,12 +3299,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                 self.ctx.defn_hoisted_sret.insert(d.name.clone(), callees);
             }
         }
-        self.ctx.tail_carrier =
-            crate::analysis::tail_carrier::build_tail_carrier_plan(&reordered_items);
+        // 2026-10-30 (D6): recursive carriers come from the unified
+        // destination plan. SOA reordering does not add or remove recursive
+        // calls; equivalence is pinned by the destination-model test and the
+        // recursive-carrier IR tests.
         if std::env::var_os("BRIEV_DIAG_TAIL").is_some() {
             eprintln!("diag tail: {:?}", tail_plan);
             eprintln!("diag hoisted sret: {:?}", self.ctx.defn_hoisted_sret);
-            eprintln!("diag carriers: {:?}", self.ctx.tail_carrier);
             eprintln!("diag tail loop: {:?}", self.ctx.tail_loop);
         }
 
@@ -4697,8 +4744,19 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                         // Briev defn carry %state.
                         let needs_state = self.ctx.export_needs_state.get(&d.name).copied()
                             .unwrap_or(false);
+                        let internal = self.top_level_export_internal_symbol(d);
+                        self.definition_symbol_override = internal.clone();
                         self.emit_definition(&mut out, d, needs_state);
                         writeln!(out).ok();
+                        if let Some(symbol) = internal {
+                            self.emit_top_level_export_wrapper(
+                                &mut out,
+                                d,
+                                &symbol,
+                                needs_state,
+                            );
+                            writeln!(out).ok();
+                        }
                     }
                 }
                 // 2026-07-29: Emit asm function bodies.
@@ -6452,7 +6510,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             } else {
                 count.name.clone()
             };
-            Self::emit_view_buffer(out, &n_i32);
+            // One header word plus `row_size` projected fields per item.
+            // The old count+1 reservation assumed one word per item and let a
+            // 4-field row overrun the buffer by 3n words (the fake-peer
+            // browser OOB; I11 only survived because spare heap followed).
+            Self::emit_view_buffer(out, &n_i32, row_size.max(1));
             writeln!(out, "  %hdr = alloca i32").ok();
             writeln!(out, "  store i32 0, ptr %hdr").ok();
             writeln!(out, "  br label %hlbl").ok();
@@ -6516,12 +6578,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         self.fun = saved_fun;
     }
 
-    fn emit_view_buffer(out: &mut String, count: &str) {
+    fn emit_view_buffer(out: &mut String, count: &str, words_per_item: usize) {
         writeln!(out, "  %view_valid = icmp sge i32 {count}, 0").ok();
         writeln!(out, "  br i1 %view_valid, label %view_reserve, label %view_invalid").ok();
         writeln!(out, "view_invalid:\n  call void @llvm.trap()\n  unreachable\nview_reserve:").ok();
         writeln!(out, "  %view_count = zext i32 {count} to i64").ok();
-        writeln!(out, "  %view_slots = add i64 %view_count, 1").ok();
+        writeln!(out, "  %view_rows = mul i64 %view_count, {words_per_item}").ok();
+        writeln!(out, "  %view_slots = add i64 %view_rows, 1").ok();
         writeln!(out, "  %view_bytes = mul i64 %view_slots, 8").ok();
         writeln!(out, "  %view_old = load ptr, ptr @__web_view_buf").ok();
         writeln!(out, "  %view_data = call ptr @realloc(ptr %view_old, i64 %view_bytes)").ok();
@@ -6835,14 +6898,23 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         watchdog: Option<&crate::ast::top::WatchdogSpec>,
     ) -> bool {
         let bp = node.bounded_pre.as_ref().unwrap();
-        // 2026-10-21 (canonical Local/effect model): the frontend's
-        // materialization plan is the source of truth for Local fields. Fall
-        // back to the shape only when a caller built shapes without plans.
-        let planned_local: std::collections::HashSet<String> = analysis
-            .materialization
+        // D6: the unified loop-engine plan is the only Local source. A missing
+        // plan means the frontend did not attach the pipeline result, so the
+        // fold cannot make a sound phi/state commitment.
+        let Some(engine) = self
+            .ctx
+            .generalized_destination_ownership
+            .loop_engines
             .get(&node.name)
-            .map(|plan| plan.local_fields().cloned().collect())
-            .unwrap_or_else(|| shape.local_fields.iter().cloned().collect());
+        else {
+            self.warnings.push(format!(
+                "warning: node '{}' has a bounded-loop shape but no loop-engine \
+                 destination plan — phi/state commitment cannot be proven",
+                node.name
+            ));
+            return false;
+        };
+        self.fun.current_loop_engine = Some(engine.clone());
         if std::env::var_os("BRIEV_DIAG_LOOP").is_some() {
             eprintln!(
                 "diag: txn='{}' local={:?} post_hoist_groups={} floats={} temp_mediated={} aggregates={} vector_groups={:?}",
@@ -6966,7 +7038,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             if let Some(batch) = analysis.batch_shapes.get(&node.name) {
                 if batch.counter == bp.var {
                     self.fun.pending_post_hoist = post_hoist.clone();
-                    self.fun.local_fields = planned_local.clone();
                     let carry_env = std::env::var("BRIEV_DIAG_EFFECT_CARRY").ok();
                     let direct_float = shape.carried_float_count > 0
                         && shape.temp_mediated_float_count < shape.carried_float_count;
@@ -7059,7 +7130,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             self.warnings.push(format!("info: txn '{}' dispatched via per-field phi ({}/{} fields written)", node.name, write_count, total_fields));
         }
         self.fun.pending_post_hoist = post_hoist;
-        self.fun.local_fields = planned_local.clone();
         let is_decreasing = bp.direction == crate::analysis::transition_graph::ConvergeDirection::Decreasing;
         self.emit_countable_main(
             out, &node.name, counter_idx, total_idx, total_const_name, bp.bound_literal,

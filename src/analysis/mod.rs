@@ -49,6 +49,8 @@ pub mod frgn_guard;
 pub mod export_abi;
 pub mod needs_state_projection;
 pub mod boundary_ownership;
+pub mod destination_ownership;
+pub mod destination_model;
 pub mod string_concat;
 pub mod boundary_marshalling;
 pub mod slp_isomorphism;
@@ -61,7 +63,6 @@ pub mod layout_optimizer;
 pub mod protocol_graph;
 pub mod swan_song;
 pub mod loop_shape;
-pub mod materialization;
 pub mod density;
 pub mod image_storage;
 pub mod modulo_partition;
@@ -120,6 +121,7 @@ pub fn effective_txns<'a>(items: &'a [crate::ast::TopLevel]) -> Vec<&'a crate::a
     out
 }
 pub mod enum_repr;
+pub mod object_repr;
 pub mod enum_layout;
 pub mod tail_recursion;
 pub mod tail_carrier;

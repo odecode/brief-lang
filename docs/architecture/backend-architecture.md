@@ -11,6 +11,26 @@ bound later field stores. Packed and union layout paths retain their dedicated
 rules. The regression gate uses an intentionally undersized aggregate record
 and verifies both the last field's extent and preservation of explicit padding.
 
+2026-10-30 (destination ownership, authoritative design record:
+`value-destination-ownership-decision-record.md`; execution plan:
+`docs/plans/2026-10-30-generalized-value-destination-ownership.md`): the
+backend is migrating to one frontend-derived `ValueDestinationPlan` for
+enum/object/composite/collection/loop/ABI destinations. Phase R1 landed
+analysis-only semantic value facts in
+`AnalysisResults.destination_ownership`. Lowering must consume that plan
+through the shared `value_lowering.rs` helpers; it must not derive
+destination/lifetime decisions from register names or scattered local maps.
+D3 joins the semantic enum plan with target physical layout in
+`enum_lowering.rs`; enum construction, projection, retention, image width, and
+`defn_sret` read that joined entry, with `EnumLayoutPlanner` as the conservative
+fallback. D4 adds boundary-gated inline object payloads for internal enums and
+proof-gated object caller destinations (`object_repr.rs`); exported enums,
+collections, unsupported call positions, and escaping object results keep the
+boxed layout. D7e keeps the authored public symbol as a thin wrapper and moves
+simple exported bodies behind a deterministic internal symbol; hidden-ABI
+exports remain direct until their wrappers mirror the full parameter surface. Public/runtime ABI
+remains frozen; internal helper ABI plans switch atomically per callable.
+
 2026-10-22: `logical.rs` owns LLVM `&&`/`||` evaluation control flow. Specific
 AST dispatch arms select the lazy path before either binary operand is emitted;
 other binary lowering remains unchanged. Dedicated constant/RHS predecessor
@@ -59,6 +79,8 @@ The backend state is strictly stratified into three lifetimes to prevent state l
 | `vector_phi.rs` | Vector phi group detection and emission |
 | `loop_engine/` | Loop emission strategies (counter.rs, ssa.rs) |
 | `tests.rs` | Backend unit tests |
+| `value_lowering.rs` | Shared destination-ownership lowering helpers: destination writes, copies, materialization, ABI conversions (implementation lane; do not scatter these decisions in emit modules) |
+| `enum_lowering.rs` | Joined semantic-enum/physical-layout plan: variant tags, payload inline flags, image width, value representation, callable enum ABI policy |
 
 ### 1.2.5 Backend Folder Layout + Normalizer Responsibility
 
@@ -731,3 +753,9 @@ and all-arms-terminate behavior retain their existing lowering paths.
 Same-type local assignment replaces the collection handle before InsertAt
 dispatch. Eligibility comes from declared operator metadata and exact types;
 explicit arrow insertion keeps its existing path. See collection_assignment.rs.
+
+2026-10-28: whole-object assignment to a top-level pooled instance publishes the
+returned fields into its row with the initialization helper. The inverse boxing
+path stores native member widths. Local shadowing and dependent/boxed pools
+retain their dedicated paths. The regression uses a member-bearing mixed-field
+object to exercise pool columns rather than an ordinary boxed handle.

@@ -705,19 +705,26 @@ export class WasmDomRuntime {{
 
   _applyFlush(updatesPtr, count) {{
     const mem = new DataView(this._memory.buffer);
+    // 2026-10-29: snapshot every record BEFORE effects run. A b-each effect
+    // can materialize a view and grow wasm memory, detaching this DataView;
+    // reading the next record from it then throws (fake-peer catalogue OOB).
+    const records = new Array(count);
     let off = updatesPtr;
     for (let i = 0; i < count; i++) {{
       const handle = mem.getUint32(off, true); off += 4;
       const valPtr = mem.getUint32(off, true); off += 4;
       const valLen = mem.getUint32(off, true); off += 4;
-      const binding = this._bindingTable[handle];
+      records[i] = {{ handle, valPtr, valLen }};
+    }}
+    for (const record of records) {{
+      const binding = this._bindingTable[record.handle];
       if (binding) {{
         // 2026-08-10: decode by the field's type tag (Int/Float/Bool raw
         // values from the slot; String dereferences the stored pointer).
-        const value = binding.decode ? binding.decode(valPtr, valLen) : null;
+        const value = binding.decode ? binding.decode(record.valPtr, record.valLen) : null;
         // 2026-08-11 (Phase 2a3): pass valPtr/valLen so b-each can read the
         // raw vector slots.
-        binding.applyFn(value, valPtr, valLen);
+        binding.applyFn(value, record.valPtr, record.valLen);
       }}
     }}
   }}
@@ -929,6 +936,8 @@ export async function createApp(wasmBytes) {{
              \x20           const dv = new DataView(this._memory.buffer);\n\
               \x20           const n = Number(dv.getBigInt64(snapPtr, true));\n\
               \x20           const seen = new Set();\n\
+             \x20           // Keyed reconcile: only move rows that are out of order.\n\
+             \x20           let cursor = container.firstChild;\n\
               \x20           for (let i = 0; i < n; i++) {{\n\
               \x20             {item_reader}\n\
               \x20             const key = itemKey({key_expr:?}, item);\n\
@@ -940,8 +949,12 @@ export async function createApp(wasmBytes) {{
               \x20               el2.innerHTML = templateInner;\n\
              \x20               rendered.set(key, el2);\n\
              \x20             }}\n\
-             \x20             // Reappend in snapshot order so keyed rows reconcile order.\n\
-             \x20             container.appendChild(el2);\n\
+             \x20             // Move only when the row is not already at the cursor.\n\
+             \x20             if (el2 === cursor) {{\n\
+             \x20             cursor = cursor.nextSibling;\n\
+             \x20           }} else {{\n\
+             \x20             container.insertBefore(el2, cursor);\n\
+             \x20           }}\n\
              \x20             // Existing keyed nodes still need field updates (toggle\n\
              \x20             // done=true must re-render, not only create).\n\
              \x20             applyItem(el2, item, isNew);\n\
@@ -2450,7 +2463,7 @@ mod tests {
         let shim = g.generate().expect("generate should succeed").dom_shim;
         assert!(shim.contains("new TextDecoder().decode(__bytes)"), "{shim}");
         assert!(shim.contains("if (token === \"item\") return item;"), "{shim}");
-        assert!(shim.contains("container.appendChild(el2);"), "{shim}");
+        assert!(shim.contains("container.insertBefore(el2, cursor);"), "{shim}");
         assert!(shim.contains("const isNew = !el2;"), "{shim}");
         assert!(!shim.contains("String.fromCharCode(...__bytes)"), "{shim}");
     }
@@ -2471,8 +2484,10 @@ mod tests {
             "String decode must dereference the slot pointer; got:\n{shim}");
         assert!(shim.contains("getInt32(Number(valPtr), true)"),
             "Int decode must be emitted; got:\n{shim}");
-        assert!(shim.contains("binding.decode ? binding.decode(valPtr, valLen) : null"),
-            "_applyFlush must use the type-aware decoder; got:\n{shim}");
+        assert!(shim.contains("const records = new Array(count);")
+            && shim.contains("for (const record of records)")
+            && shim.contains("binding.decode ? binding.decode(record.valPtr, record.valLen) : null"),
+            "_applyFlush must snapshot records, then decode type-aware; got:\n{shim}");
         assert!(!shim.contains("valLen > 0\n          ? new TextDecoder()"),
             "blind TextDecoder path must be gone; got:\n{shim}");
     }

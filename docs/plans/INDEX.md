@@ -15,6 +15,25 @@ warns).
 
 **Active stability lane (2026-10-25):** `docs/plans/2026-10-25-stability-v0.1.md` — freeze features; make `cargo test --all` a hard gate, close interpreter/backend parity, declare Tier 1 = x86_64 Linux + wasm32, add a nightly performance baseline, and ship `v0.1.0-preview` then `v0.1.0`. GPU/embedded remain experimental; Otto’s server stays external.
 
+**Active generalized destination implementation (2026-10-31):**
+merged to `main` at `3c2aeaea`. Phases D1–D6 and D7a–D7e landed. Remaining
+work: `docs/plans/2026-10-31-destination-ownership-remaining-work.md`.
+Umbrella: `docs/plans/2026-10-30-generalized-value-destination-ownership.md`.
+ADR: `docs/architecture/value-destination-ownership-decision-record.md`.
+Migration uses generalized value lanes with frozen public/runtime ABI.
+
+**Active destination/ownership reconciliation (2026-10-29):**
+`docs/plans/2026-10-29-destination-ownership-reconciliation.md` — supersedes
+ad-hoc ObjectDestination metadata; reconciles small-sum unboxing, nested
+layout, carrier slots, tail-loop lowering, ownership algebra, boundary
+ownership, and P2-1/P2-2 into one frontend `ValueDestinationPlan`.
+
+**Active enum model (2026-10-29):** `docs/plans/2026-10-29-enum-value-model.md` —
+hybrid ScalarValue/PackedMemory/OwnedBox migration replacing internal enum
+handles; Stage 0 classification/metadata complete, list-alias defect recorded.
+
+**Active release ledger (2026-10-28):** `docs/plans/2026-10-28-v0.1-preview-readiness.md` — execution checklist and exit criteria for PR #1 and `v0.1.0-preview`: baseline snapshot, gate integrity, interpreter parity, Tier 1 platform contract, performance A/B, app acceptance, release engineering.
+
 **Active recommender lane (2026-10-25):** `docs/plans/2026-10-25-recommender-fixes-and-app-adoption.md` — A/C/D compiler/web/WASM bundles landed; casting change rejected; generic txn specialization deferred. App remains external and pinned at `79234665`. Source compiler commit: `894fcfa5`.
 
 **Session report (2026-10-27):** `docs/2026-10-27-session-report.md` — chronological record of app compatibility, compiler hardening, proof elimination, ledger, and remaining browser/hardening work.

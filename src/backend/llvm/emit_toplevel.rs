@@ -1,5 +1,6 @@
 use crate::ast::{BinaryOpKind, Expr, OutputType, Statement, TopLevel, Type};
 use crate::backend::llvm::emit_stmt::emit_statement;
+use crate::backend::llvm::helpers::WordImageCopy;
 use crate::backend::llvm::{float_to_llvm_hex, float64_to_llvm_hex, f32_to_f16_hex, llvm_type_byte_size, protocol_llvm_type, LlvmBackend, TypedRegister};
 use crate::type_universe::{ResolvedType, TypeUniverse};
 use crate::typechecker::defn_section_name;
@@ -1000,6 +1001,15 @@ impl LlvmBackend {
         if self.is_protocol_member(ty, "Float") {
             return false;
         }
+        let llvm_ty = self.llvm_type(ty);
+        matches!(llvm_ty.as_str(), "i64" | "i32" | "i16" | "i8" | "i1" | "ptr")
+            || self.is_boxed_type(ty)
+    }
+
+    /// Whether the parameter's entry binding is already an i64 value (a
+    /// pointer parameter is ptrtoint'd, a boxed parameter is widened, an i64
+    /// parameter is raw). Native sub-i64 parameters stay in their own width.
+    fn tail_loop_binding_is_i64(&self, ty: &Type) -> bool {
         matches!(self.llvm_type(ty).as_str(), "i64" | "ptr") || self.is_boxed_type(ty)
     }
 
@@ -1009,8 +1019,22 @@ impl LlvmBackend {
         // register/stack shape enough to regress ws_frame 1.45x. This first
         // slice is limited to loop-carried nested-enum state, the ownership
         // shape that needed the carrier ABI in the first place.
+        //
+        // 2026-10-27 (wasm stack/TCO): wasm32 has no TCO — a deep self-tail
+        // recursion grows the wasm stack linearly and OOBs at ~1682 items on
+        // the default 64 KiB stack. Native keeps the carrier-only gate to
+        // preserve ws_frame performance; wasm32 lowers every eligible direct
+        // self-tail-recursive defn to an explicit loop.
+        let carrier_eligible = !self
+            .ctx
+            .generalized_destination_ownership
+            .recursive_carrier_obligations(&d.name)
+            .is_empty();
+        let plain_wasm = self.ctx.int_bits == 32 && !d.parameters.is_empty();
+        if !carrier_eligible && !plain_wasm {
+            return false;
+        }
         self.ctx.tail_loop.is_lowerable(&d.name)
-            && self.ctx.tail_carrier.info(&d.name).is_some()
             && d.parameters.iter().all(|(_, ty)| self.tail_loop_i64_binding(ty))
     }
 
@@ -1653,7 +1677,10 @@ impl LlvmBackend {
             if let Some(empty_member) = empty_member {
                 let size = self.struct_type_size(&type_key);
                 let inst = self.fun.gen_reg();
-                writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+                // A collection state field stores this handle in %State. It
+                // must outlive init_state; a stack alloca dangles immediately
+                // (the first scan/page read then traps or reads garbage).
+                writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
                 let addr = self.fun.gen_reg();
                 let hw = format!("i{}", self.ctx.int_bits);
                 writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, addr, inst, hw).ok();
@@ -1710,9 +1737,10 @@ impl LlvmBackend {
             }
         }
         // Allocate the instance storage and pass its address as `self`.
+        // The constructed handle lands in %State, so the storage is heap-owned.
         let size = self.struct_type_size(&type_key);
         let inst = self.fun.gen_reg();
-        writeln!(out, "{}{} = alloca i8, i64 {}", indent, inst, size).ok();
+        writeln!(out, "{}{} = call ptr @malloc(i64 {})", indent, inst, size).ok();
         let addr = self.fun.gen_reg();
         // 2026-08-11 (wasm32 obj-member fix): obj instance handles are
         // i{int_bits} (i32 on wasm32), not hardcoded i64.
@@ -2364,12 +2392,21 @@ impl LlvmBackend {
             let off = self.lookup_field_offset(base, &fname);
             let gep = self.fun.gen_reg();
             writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, gep, box_p, off).ok();
-            let store_val = if load_ty == "i64" {
-                val.clone()
-            } else {
-                self.adapt_to_i64(out, indent, &TypedRegister { name: val.clone(), ty: fty.clone() })
+            // 2026-10-28: boxes use native member widths, as the inverse
+            // pool-publication path does. Word stores overrun packed Bool/Float
+            // members; retire this conversion when pools share boxed storage.
+            let native_ty = self.llvm_type(&fty);
+            let store_val = match () {
+                _ if load_ty == native_ty => val,
+                _ if native_ty == "ptr" => {
+                    let pointer = self.fun.gen_reg();
+                    writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, pointer, load_ty, val).ok();
+                    pointer
+                }
+                _ => self.ensure_typed_value(out, indent, &native_ty, &val,
+                    Some(Type::bits(64)), self.ctx.type_universe.clone().as_ref()),
             };
-            writeln!(out, "{}store i64 {}, ptr {}", indent, store_val, gep).ok();
+            writeln!(out, "{}store {} {}, ptr {}", indent, native_ty, store_val, gep).ok();
         }
         TypedRegister { name: addr, ty: Type::Custom(base.to_string()) }
     }
@@ -3368,15 +3405,15 @@ impl LlvmBackend {
     /// each word is converted back to the member's native type and stored in
     /// that member's column at the instance's row. Nested-array columns are
     /// skipped (a single word cannot materialize them; they stay zero).
-    fn emit_instance_seed_from_value(
+    pub(super) fn emit_instance_seed_from_value(
         &mut self,
         out: &mut String,
         indent: &str,
         name: &str,
         val: &TypedRegister,
-    ) {
+    ) -> bool {
         let Some((mono, _)) = self.ctx.obj_instance_inits.get(name).cloned() else {
-            return;
+            return false;
         };
         let mono = mono.as_str();
         let base = Self::pool_base(mono).to_string();
@@ -3389,7 +3426,7 @@ impl LlvmBackend {
         if self.ctx.dependent_pools.contains_key(&base)
             || self.ctx.boxed_offsets.contains_key(&base)
         {
-            return;
+            return false;
         }
         let fields = self.ctx.struct_types.get(mono).cloned().unwrap_or_default();
         let row = self
@@ -3455,6 +3492,7 @@ impl LlvmBackend {
             };
             writeln!(out, "{}store {} {}, ptr {}", indent, load_ty, store_val, row_p).ok();
         }
+        true
     }
 
     /// Emit a body-form init's seeding statements once, storing the yielded
@@ -3668,12 +3706,48 @@ impl LlvmBackend {
         out
     }
 
-    pub(super) fn emit_definition(&mut self, out: &mut String, d: &crate::ast::Definition, needs_state: bool) {
+    fn definition_ret_abi_ty(&self, d: &crate::ast::Definition) -> String {
+        let has_ret = d.output_type.is_some() || !d.outputs.is_empty();
+        if !has_ret {
+            return "void".to_string();
+        }
+        d.output_type
+            .as_ref()
+            .and_then(|ot| match ot {
+                crate::ast::OutputType::Single(ty) => Some(self.llvm_ret_abi_type(ty)),
+                _ => None,
+            })
+            .unwrap_or_else(|| "i64".to_string())
+    }
+
+    pub(super) fn emit_definition(
+        &mut self,
+        out: &mut String,
+        d: &crate::ast::Definition,
+        needs_state: bool,
+    ) {
+        // A defn is not a state-machine transaction. Leaving the previous
+        // txn's name here made emit_web_flush_batch treat every defn `term`
+        // as a commit: a recursive title lookup flushed all 32 bound fields
+        // per call (32k DOM effect passes in one browser rating click).
+        self.fun.txn_name.clear();
+        self.fun.destination_owner = Some(format!("defn:{}", d.name));
         self.fun.pending_cleanup.clear();
         self.fun.clear_locals();
         self.fun.enum_inline_slots.clear();
         self.fun.sret_call_slots.clear();
         self.fun.enum_out_slot = None;
+        self.fun.object_out_slot = None;
+        let sret_object = self.ctx.defn_object_sret.contains(&d.name);
+        if sret_object {
+            self.fun.object_out_slot = Some("%object_out".to_string());
+            self.fun.object_out_type = d
+                .output_type
+                .as_ref()
+                .and_then(|ot| ot.all_types().into_iter().next());
+        } else {
+            self.fun.object_out_type = None;
+        }
         let sret_enum = self.ctx.defn_sret.contains(&d.name);
         if sret_enum {
             self.fun.enum_out_slot = Some("%enum_out".to_string());
@@ -3701,27 +3775,8 @@ impl LlvmBackend {
         self.fun.is_static_bound = false;
         self.fun.ssa_old_int_regs.clear();
         self.fun.ssa_old_float_regs.clear();
-        // 2026-07-01: Use "i64" for all non-float returns instead of llvm_type().
-        // The body always produces i64 values (via adapt_to_i64) and call.rs expects
-        // i64 at the call site. Using llvm_type() gave "i8*" for String/Bool returns,
-        // creating a type mismatch (ret i64 in a define i8* function) that broke opt/llc.
+        let ll_ret_ty = self.definition_ret_abi_ty(d);
         let has_ret = d.output_type.is_some() || !d.outputs.is_empty();
-        // 2026-07-18: Use the correct LLVM type for the return type instead of
-        // always using "i64". Bool returns need "i8" to match term's ret i8.
-        let ll_ret_ty = if !has_ret {
-            // 2026-09-14 (machine-entry plan): VOID — the old "float" default
-            // paired with the call sites' `call i64` prototype; the mismatch
-            // made LLVM's inliner produce poison operands for the inlined
-            // body (x0-based stores landed in kernel_rv64's context init).
-            "void".to_string()
-        } else {
-            d.output_type.as_ref()
-                .and_then(|ot| match ot {
-                    crate::ast::OutputType::Single(ty) => Some(self.llvm_ret_abi_type(ty)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "i64".to_string())
-        };
         let is_float_fn = ll_ret_ty == "float" || ll_ret_ty == "double";
         self.fun.fn_ret_ty = ll_ret_ty.clone();
         self.fun.returns_i64 = has_ret;
@@ -3734,7 +3789,10 @@ impl LlvmBackend {
         // whichever node fires first (reactor-driven). User declarations named
         // `main` are rejected by name-collision with the runtime `@main`, so no
         // renaming is performed here.
-        let ll_name = d.name.clone();
+        let ll_name = self
+            .definition_symbol_override
+            .take()
+            .unwrap_or_else(|| d.name.clone());
         if self.ctx.is_shared_lib {
             write!(out, "define dso_local {} @{}(", ll_ret_ty, ll_name).ok();
         } else {
@@ -3755,6 +3813,12 @@ impl LlvmBackend {
             }
             write!(out, "ptr noalias nocapture align 8 %enum_out").ok();
         }
+        if sret_object {
+            if needs_state || needs_plain || sret_enum {
+                let _ = write!(out, ", ");
+            }
+            write!(out, "ptr align 8 %object_out").ok();
+        }
         // 2026-10-21 (TCO-safe sret): tail-recursive bodies receive their
         // sret call slots from the non-recursive caller. No per-frame alloca,
         // so LLVM can keep the self-call in tail position.
@@ -3765,7 +3829,7 @@ impl LlvmBackend {
             .cloned()
             .unwrap_or_default();
         for (i, callee) in hoisted_sret.iter().enumerate() {
-            if needs_state || needs_plain || sret_enum || i > 0 {
+            if needs_state || needs_plain || sret_enum || sret_object || i > 0 {
                 let _ = write!(out, ", ");
             }
             let _ = callee;
@@ -3775,18 +3839,16 @@ impl LlvmBackend {
         // inline nested state passed through recursive self-calls.
         let tail_carriers = self
             .ctx
-            .tail_carrier
-            .info(&d.name)
-            .map(|info| info.carriers.clone())
-            .unwrap_or_default();
+            .generalized_destination_ownership
+            .recursive_carrier_obligations(&d.name);
         for (i, carrier) in tail_carriers.iter().enumerate() {
-            if needs_state || needs_plain || sret_enum || !hoisted_sret.is_empty() || i > 0 {
+            if needs_state || needs_plain || sret_enum || sret_object || !hoisted_sret.is_empty() || i > 0 {
                 let _ = write!(out, ", ");
             }
             write!(out, "ptr align 8 %carrier{}", i).ok();
         }
         for (i, (n, t)) in d.parameters.iter().enumerate() {
-            if needs_state || needs_plain || sret_enum || !hoisted_sret.is_empty() || !tail_carriers.is_empty() || i > 0 {
+            if needs_state || needs_plain || sret_enum || sret_object || !hoisted_sret.is_empty() || !tail_carriers.is_empty() || i > 0 {
                 let _ = write!(out, ", ");
             }
             // 2026-07-04: dereferenceable(N) for Ptr<T> parameters.
@@ -4025,38 +4087,64 @@ impl LlvmBackend {
                 let words = self.enum_image_words(Some(ty));
                 let src = self.fun.gen_reg();
                 writeln!(out, "  {} = inttoptr i64 {} to ptr", src, initial).ok();
-                for word in 0..words {
-                    let load = self.fun.gen_reg();
-                    let gep_src = self.fun.gen_reg();
-                    let gep_dst = self.fun.gen_reg();
-                    writeln!(out, "  {} = getelementptr i64, ptr {}, i64 {}", gep_src, src, word).ok();
-                    writeln!(out, "  {} = getelementptr i64, ptr {}, i64 {}", gep_dst, hidden, word).ok();
-                    writeln!(out, "  {} = load i64, ptr {}", load, gep_src).ok();
-                    writeln!(out, "  store i64 {}, ptr {}", load, gep_dst).ok();
-                }
+                self.emit_word_image_copy(out, "  ", WordImageCopy { source: &src, destination: &hidden, words });
                 let handle = self.fun.gen_reg();
                 writeln!(out, "  {} = ptrtoint ptr {} to i64", handle, hidden).ok();
                 self.fun.let_bindings.insert(name.clone(), handle);
             }
             let mut param_slots = Vec::with_capacity(d.parameters.len());
-            for (name, _) in &d.parameters {
+            for (name, ty) in &d.parameters {
                 let slot = self.fun.next_reg_with_prefix("tpsl");
-                let value = self.fun.let_bindings.get(name).cloned().unwrap_or_else(|| "0".to_string());
                 writeln!(out, "  {} = alloca i64, align 8", slot).ok();
+                let binding = self.fun.let_bindings.get(name).cloned().unwrap_or_else(|| "0".to_string());
+                // Mutable params bind to an alloca; load the native value first.
+                let value = if self.fun.native_parameter_slots.contains(&binding) {
+                    let loaded = self.fun.gen_reg();
+                    writeln!(out, "  {} = load {}, ptr {}", loaded, self.llvm_type(ty), binding).ok();
+                    self.adapt_to_i64(out, "  ", &crate::backend::llvm::TypedRegister {
+                        name: loaded,
+                        ty: ty.clone(),
+                    })
+                } else if self.tail_loop_binding_is_i64(ty) {
+                    binding
+                } else {
+                    self.adapt_to_i64(out, "  ", &crate::backend::llvm::TypedRegister {
+                        name: binding,
+                        ty: ty.clone(),
+                    })
+                };
                 writeln!(out, "  store i64 {}, ptr {}", value, slot).ok();
                 param_slots.push((name.clone(), slot));
             }
             self.fun.tail_param_slots = param_slots;
+            // A tail loop has no loop-engine preheader to flush deferred
+            // constant-field allocations into. Emit any queued allocation now
+            // (it dominates the header) and keep body allocations inline.
+            self.flush_pending_struct_allocas(out);
+            self.fun.defer_struct_allocas = false;
             writeln!(out, "  br label %{}", header).ok();
             writeln!(out, "{}:", header).ok();
             self.fun.cur_block = Some(header.clone());
             self.fun.tail_loop_header = Some(header.clone());
             self.fun.tail_loop_fn = Some(d.name.clone());
             self.fun.tail_loop_backedge = false;
-            for (name, slot) in self.fun.tail_param_slots.clone() {
-                let value = self.fun.gen_reg();
-                writeln!(out, "  {} = load i64, ptr {}", value, slot).ok();
-                self.fun.let_bindings.insert(name, value);
+            for ((name, ty), (_, slot)) in d.parameters.iter().zip(self.fun.tail_param_slots.clone()) {
+                let loaded = self.fun.gen_reg();
+                writeln!(out, "  {} = load i64, ptr {}", loaded, slot).ok();
+                let mutable_binding = self.fun.let_bindings.get(name).cloned()
+                    .filter(|b| self.fun.native_parameter_slots.contains(b));
+                let value = if mutable_binding.is_some() || !self.tail_loop_binding_is_i64(ty) {
+                    self.adapt_from_i64(out, "  ", &loaded, ty)
+                } else {
+                    loaded
+                };
+                // Mutable params keep their alloca binding; store the native
+                // value back so body reads see the loop-carried state.
+                if let Some(binding) = mutable_binding {
+                    writeln!(out, "  store {} {}, ptr {}", self.llvm_type(ty), value, binding).ok();
+                    continue;
+                }
+                self.fun.let_bindings.insert(name.clone(), value);
             }
         }
         let body_len = d.body.len();
@@ -4127,32 +4215,16 @@ impl LlvmBackend {
         // (txns, reactor_tick, main, probes all take %state).
         self.fun.stateless_body = false;
         // Phase 4.5: Emit dso_local export wrapper if #export modifier present
-        if let Some(export_name) = Self::get_export_name(&d.modifiers) {
-            writeln!(out, "define dso_local {} @{}(", ll_ret_ty, export_name).ok();
-            if needs_state {
-                write!(out, "{}", self.ctx.state_ptr_param).ok();
-            }
-            for (i, (n, t)) in d.parameters.iter().enumerate() {
-                if needs_state || i > 0 {
-                    write!(out, ", ").ok();
-                }
-                write!(out, "{} %arg{}", self.llvm_type(t), i).ok();
-            }
-            writeln!(out, ") local_unnamed_addr #0 {{").ok();
-            write!(out, "  %res = call {} @{}(", ll_ret_ty, ll_name).ok();
-            if needs_state {
-                write!(out, "ptr %state").ok();
-            }
-            for (i, (n, t)) in d.parameters.iter().enumerate() {
-                if needs_state || i > 0 {
-                    write!(out, ", ").ok();
-                }
-                write!(out, "{} %arg{}", self.llvm_type(t), i).ok();
-            }
-            writeln!(out, ") local_unnamed_addr #0").ok();
-            writeln!(out, "  ret {} %res", ll_ret_ty).ok();
-            writeln!(out, "}}").ok();
-        }
+        self.emit_export_boundary_wrapper(
+            out,
+            ExportWrapperSpec {
+                definition: d,
+                ll_name: &ll_name,
+                ll_ret_ty: &ll_ret_ty,
+                needs_state,
+            },
+        );
+
     }
 
     /// 2026-10-13 (static trait-constrained generics, SPEC §8.6, S6): emit a
@@ -4453,6 +4525,7 @@ pub(crate) fn definition_touches_raw_memory(stmts: &[Statement]) -> bool {
         }
         // 2026-07-27: Set txn_name for per-function arena gating.
         self.fun.txn_name = name.to_string();
+        self.fun.destination_owner = Some(format!("txn:{name}"));
         self.fun.item_post = Some(txn.contract.post_condition.clone());
         self.fun.pending_cleanup.clear();
         // 2026-10-05 (json.bv): the local-binding caches are PER-FUNCTION.
@@ -5754,6 +5827,7 @@ fn probe_ok_checks(
     pub(super) fn emit_callable_txn(&mut self, out: &mut String, txn: &crate::ast::Transaction, name: &str) {
         // 2026-07-27: Set txn_name for per-function arena gating.
         self.fun.txn_name = name.to_string();
+        self.fun.destination_owner = Some(format!("txn:{name}"));
         self.fun.item_post = Some(txn.contract.post_condition.clone());
         self.fun.pending_cleanup.clear();
         self.fun.clear_local_bindings();
@@ -5769,6 +5843,14 @@ fn probe_ok_checks(
         // these; this reset must too.
         self.fun.last_val_temps.clear();
         self.fun.last_val_types.clear();
+        // A tail-lowered defn leaves its loop header/slots/backedge flag on
+        // the shared FunctionState. A callable txn is a new function: stale
+        // state suppressed body definitions and emitted a comparison against
+        // a bound register that was never defined.
+        self.fun.tail_loop_fn = None;
+        self.fun.tail_loop_header = None;
+        self.fun.tail_param_slots.clear();
+        self.fun.tail_loop_backedge = false;
         // 2026-07-18: Detect bounded pre-condition (e.g. x < N) — enables
         // Alloca strategy for stack-allocated temporaries within the loop.
         self.fun.is_static_bound = matches!(&txn.contract.pre_condition,
@@ -6203,6 +6285,7 @@ fn probe_ok_checks(
         // `@briev_begin_<name>` entry flag — set the txn name so
         // `Expr::BeginProgram` resolves it.
         self.fun.txn_name = name.to_string();
+        self.fun.destination_owner = Some(format!("txn:{name}"));
         // 2026-07-04: Use #7 (memory(readonly)) for @pre_* functions.
         // Precondition expressions never write to %State — they only read
         // state fields via GEP+load. readonly tells LLVM the function has
@@ -6266,6 +6349,7 @@ fn probe_ok_checks(
         // `@briev_begin_<name>` entry flag — bind the txn name for the body's
         // precondition check.
         self.fun.txn_name = name.to_string();
+        self.fun.destination_owner = Some(format!("txn:{name}"));
         self.fun.item_post = Some(txn.contract.post_condition.clone());
         let async_name = format!("async_body_{}", name);
         let async_attr = "#0".to_string();
@@ -6464,7 +6548,181 @@ fn sig_number(name: &str) -> i32 {
     }
 }
 
+/// Inputs for one `#export` boundary wrapper.
+struct ExportWrapperSpec<'a> {
+    definition: &'a crate::ast::Definition,
+    ll_name: &'a str,
+    ll_ret_ty: &'a str,
+    needs_state: bool,
+}
+
 impl LlvmBackend {
+    fn emit_export_boundary_wrapper(
+        &mut self,
+        out: &mut String,
+        spec: ExportWrapperSpec<'_>,
+    ) {
+        let d = spec.definition;
+        let Some(export_name) = Self::get_export_name(&d.modifiers) else {
+            return;
+        };
+        let boundary_types =
+            self.export_boundary_parameter_types(&d.name, &d.parameters);
+        writeln!(out, "define dso_local {} @{}(", spec.ll_ret_ty, export_name).ok();
+        if spec.needs_state {
+            write!(out, "{}", self.ctx.state_ptr_param).ok();
+        }
+        for (i, (_, fallback_ty)) in d.parameters.iter().enumerate() {
+            if spec.needs_state || i > 0 {
+                write!(out, ", ").ok();
+            }
+            let ty = boundary_types
+                .as_ref()
+                .and_then(|types| types.get(i))
+                .cloned()
+                .unwrap_or_else(|| self.llvm_type(fallback_ty));
+            write!(out, "{} %arg{}", ty, i).ok();
+        }
+        writeln!(out, ") local_unnamed_addr #0 {{").ok();
+        write!(out, "  %res = call {} @{}(", spec.ll_ret_ty, spec.ll_name).ok();
+        if spec.needs_state {
+            write!(out, "ptr %state").ok();
+        }
+        for (i, (_, fallback_ty)) in d.parameters.iter().enumerate() {
+            if spec.needs_state || i > 0 {
+                write!(out, ", ").ok();
+            }
+            let ty = boundary_types
+                .as_ref()
+                .and_then(|types| types.get(i))
+                .cloned()
+                .unwrap_or_else(|| self.llvm_type(fallback_ty));
+            write!(out, "{} %arg{}", ty, i).ok();
+        }
+        writeln!(out, ")").ok();
+        writeln!(out, "  ret {} %res", spec.ll_ret_ty).ok();
+        writeln!(out, "}}").ok();
+    }
+
+    /// Internal symbol for a top-level `export` whose current hidden ABI is
+    /// exactly the public one. Unsupported shapes keep the direct-symbol path.
+    pub(super) fn top_level_export_internal_symbol(
+        &self,
+        d: &crate::ast::Definition,
+    ) -> Option<String> {
+        if Self::get_export_name(&d.modifiers).is_some() {
+            return None;
+        }
+        if self.ctx.defn_sret.contains(&d.name)
+            || self.ctx.defn_object_sret.contains(&d.name)
+            || self
+                .ctx
+                .defn_hoisted_sret
+                .get(&d.name)
+                .is_some_and(|callees| !callees.is_empty())
+            || !self
+                .ctx
+                .generalized_destination_ownership
+                .recursive_carrier_obligations(&d.name)
+                .is_empty()
+        {
+            return None;
+        }
+        if self.plain_context_active() && self.ctx.defn_takes_plain(&d.name) {
+            return None;
+        }
+        Some(format!("{}__briev_internal", d.name))
+    }
+
+    pub(super) fn emit_top_level_export_wrapper(
+        &mut self,
+        out: &mut String,
+        d: &crate::ast::Definition,
+        internal: &str,
+        needs_state: bool,
+    ) {
+        let ret_ty = self.definition_ret_abi_ty(d);
+        let boundary_types =
+            self.export_boundary_parameter_types(&d.name, &d.parameters);
+        let visibility = if self.ctx.is_shared_lib { "dso_local " } else { "" };
+        write!(out, "define {}{} @{}(", visibility, ret_ty, d.name).ok();
+        self.write_export_wrapper_args(out, d, needs_state, boundary_types.as_deref());
+        writeln!(out, ") local_unnamed_addr #0 {{").ok();
+        if ret_ty == "void" {
+            write!(out, "  call void @{}(", internal).ok();
+        } else {
+            write!(out, "  %res = call {} @{}(", ret_ty, internal).ok();
+        }
+        self.write_export_wrapper_args(out, d, needs_state, boundary_types.as_deref());
+        writeln!(out, ")").ok();
+        if ret_ty == "void" {
+            writeln!(out, "  ret void").ok();
+        } else {
+            writeln!(out, "  ret {} %res", ret_ty).ok();
+        }
+        writeln!(out, "}}").ok();
+    }
+
+    fn write_export_wrapper_args(
+        &self,
+        out: &mut String,
+        d: &crate::ast::Definition,
+        needs_state: bool,
+        boundary_types: Option<&[String]>,
+    ) {
+        if needs_state {
+            write!(out, "{}", self.ctx.state_ptr_param).ok();
+        }
+        for (i, (_, fallback_ty)) in d.parameters.iter().enumerate() {
+            if needs_state || i > 0 {
+                write!(out, ", ").ok();
+            }
+            let ty = boundary_types
+                .and_then(|types| types.get(i))
+                .cloned()
+                .unwrap_or_else(|| self.llvm_type(fallback_ty));
+            write!(out, "{} %arg{}", ty, i).ok();
+        }
+    }
+
+    /// Parameter LLVM types from the frozen export boundary plan. Returns
+    /// `None` when the function has no plan or the plan is not a direct scalar
+    /// handoff, letting the legacy AST-driven wrapper remain the fallback.
+    fn export_boundary_parameter_types(
+        &self,
+        name: &str,
+        parameters: &[(String, crate::ast::Type)],
+    ) -> Option<Vec<String>> {
+        let boundary = self
+            .ctx
+            .generalized_destination_ownership
+            .export_boundary(name)?;
+        let values: Vec<&crate::analysis::destination_model::BoundaryValuePlan> = boundary
+            .values
+            .iter()
+            .filter(|value| {
+                value.role == crate::analysis::destination_model::BoundaryRole::Parameter
+            })
+            .collect();
+        if values.len() != parameters.len() {
+            return None;
+        }
+        values
+            .iter()
+            .zip(parameters)
+            .map(|(value, (_, fallback_ty))| {
+                if !matches!(
+                    value.conversion,
+                    crate::analysis::destination_model::BoundaryConversion::None
+                        | crate::analysis::destination_model::BoundaryConversion::WidthConvert
+                ) {
+                    return None;
+                }
+                Some(self.llvm_type(value.ty.as_ref().unwrap_or(fallback_ty)))
+            })
+            .collect()
+    }
+
     /// Emit a library shim — no main function, only `__briev_init_state`
     /// and dso_local wrappers for #export functions.
     /// 2026-07-19: Emit wrappers for exported functions in shared library.

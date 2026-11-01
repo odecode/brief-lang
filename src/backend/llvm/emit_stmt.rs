@@ -174,34 +174,30 @@ pub(super) fn emit_destroy_register(
     }
 }
 
-/// 2026-08-07 (Phase 7): collect the names assigned inside a `foreach` body —
-/// loop-carried locals need memory slots (the body IR is emitted once).
 fn collect_foreach_assigned(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
-    for s in stmts {
-        match s {
-            Statement::Assign(Expr::Identifier(name), _) => { out.insert(name.clone()); }
-            Statement::ArrowAssign { target: Some(t), .. } => {
-                // 2026-09-08 (audit): arrow-push/extract stores into a local
-                // (`acc <- q`) — the plain-copy path stores to the target via
-                // emit_arrow_store, so a foreach-local target needs an alloca
-                // slot or each iteration reads the stale pre-loop register.
-                if let Expr::Identifier(name) = t.as_ref() {
+    for statement in stmts {
+        match statement {
+            Statement::Assign(Expr::Identifier(name), _) => {
+                out.insert(name.clone());
+            }
+            Statement::ArrowAssign {
+                target: Some(target),
+                ..
+            } => {
+                if let Expr::Identifier(name) = target.as_ref() {
                     out.insert(name.clone());
                 }
             }
-            Statement::Guarded(_, body) => collect_foreach_assigned(body, out),
-            Statement::Block(body) | Statement::SyncBlock(body) => collect_foreach_assigned(body, out),
-            // 2026-09-08 (audit): Mutex/Barrier bodies emit inline per
-            // iteration — assignments inside them must be tracked or the
-            // alloca slot is missing and the iteration re-reads the stale
-            // pre-loop register.
-            Statement::Mutex(body) => collect_foreach_assigned(body, out),
+            Statement::Guarded(_, body)
+            | Statement::Block(body)
+            | Statement::SyncBlock(body)
+            | Statement::Mutex(body)
+            | Statement::Foreach { body, .. } => collect_foreach_assigned(body, out),
             Statement::Match { arms, .. } => {
                 for arm in arms {
                     collect_foreach_assigned(&arm.body, out);
                 }
             }
-            Statement::Foreach { body, .. } => collect_foreach_assigned(body, out),
             _ => {}
         }
     }
@@ -457,6 +453,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             let sret_slot = backend.fun.sret_call_slots.get(name).cloned();
             if let Some(slot) = &sret_slot {
                 backend.fun.sret_call_slot = Some(slot.clone());
+            }
+            if backend.ctx.defn_object_sret.contains(name) {
+                backend.fun.object_sret_call_slot = Some(backend.fun.next_reg_with_prefix("osrt"));
             }
             let saved_expected_enum = backend.fun.expected_enum_type.clone();
             if let Some(t) = ty {
@@ -759,6 +758,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             };
             backend.fun.enum_construct_slot = None;
             backend.fun.sret_call_slot = None;
+            backend.fun.object_sret_call_slot = None;
             backend.fun.expected_enum_type = saved_expected_enum;
             // 2026-08-17 (tuple correctness, plan
             // 2026-08-17-hashmap-storage-tuple-correctness.md): TUPLE
@@ -1050,6 +1050,18 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                             backend.fun.last_val_types.insert(name.clone(), val.ty.clone());
                             return TypedRegister { name: val.name, ty: Type::void() };
                         }
+                    }
+                    // A top-level pooled/unpacked instance (`server`) is a
+                    // set of state columns, not one scalar slot. Assigning a
+                    // returned instance value must split it back into those
+                    // columns; otherwise the assignment is silently dropped
+                    // and the next node firing reads the pre-call snapshot.
+                    if backend.ctx.obj_instance_inits.contains_key(name)
+                        && backend.emit_instance_seed_from_value(out, indent, name, &val)
+                    {
+                        backend.fun.last_val_temps.insert(name.clone(), val.name.clone());
+                        backend.fun.last_val_types.insert(name.clone(), val.ty.clone());
+                        return TypedRegister { name: val.name, ty: Type::void() };
                     }
                     // 2026-07-31 (A5): obj member `self` slot write — a bare
                     // slot name in a member body stores to self+offset.
@@ -1937,6 +1949,8 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             if let Some(val) = val {
                 let saved_enum_ret = backend.fun.enum_return_context;
                 let saved_expected_enum = backend.fun.expected_enum_type.clone();
+                let saved_object_ret = backend.fun.object_return_context;
+                backend.fun.object_return_context = backend.fun.object_out_slot.is_some();
                 let returns_enum = backend.fun.item_return_type.as_ref()
                     .map(|t| backend.ctx.enum_handle_types.contains(type_bare_name(t)))
                     .unwrap_or(false);
@@ -1965,10 +1979,12 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 if backend.fun.tail_loop_backedge {
                     backend.fun.enum_return_context = saved_enum_ret;
                     backend.fun.expected_enum_type = saved_expected_enum;
+                    backend.fun.object_return_context = saved_object_ret;
                     return TypedRegister { name: reg.name, ty: reg.ty };
                 }
                 backend.fun.enum_return_context = saved_enum_ret;
                 backend.fun.expected_enum_type = saved_expected_enum;
+                backend.fun.object_return_context = saved_object_ret;
                 // 2026-08-01 (C3): a boxed Float param returned from a defn
                 // (`term v`) is an i64 handle — unbox through the float cache so
                 // `ret float` receives the actual float, not the handle.
@@ -2029,6 +2045,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // Emit no terminator and leave `terminated` unchanged so the
                     // enclosing body continues.
                 } else if backend.fun.fn_ret_ty != "void" {
+                    // 2026-10-29: retain every enum image at the ABI edge.
+                    // Narrowing the copy to identifier terms restored a real
+                    // server regression: call/match results can also expose
+                    // frame-owned storage. The retain helper still skips an
+                    // exact caller-slot alias, but unknown ownership is copied.
+                    // PERF(ws_frame): known 2.48x baseline regression; the
+                    // by-value/ownership-proved enum ABI is the durable fix.
                     let reg = backend.retain_enum_return(out, indent, &reg);
                     // 2026-07-26: Use actual expression LLVM type, not hardcoded "i64".
                     // Frgn calls may return ptr (for String/Data in C ABI).
@@ -2310,23 +2333,63 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // 2026-08-07 (Phase 7): loop-carried locals — a register-bound let
             // (e.g. `acc`) assigned in the body would read its STALE initial
             // register every iteration (the body IR is emitted once; runtime
-            // re-execution never re-resolves). Pre-declare an alloca slot and
-            // seed it with the current value so the body reads/writes memory.
-            let mut body_assigned = std::collections::HashSet::new();
-            collect_foreach_assigned(body, &mut body_assigned);
-            for name in body_assigned {
-                if let Some(cur) = backend.fun.let_bindings.get(&name).cloned() {
-                    if !backend.fun.let_binding_allocas.contains(&cur) {
-                        let slot = backend.fun.gen_reg();
-                        let llvm_ty = backend.fun.let_binding_types.get(&name)
-                            .map(|t| backend.llvm_type(t))
-                            .unwrap_or_else(|| "i64".to_string());
-                        writeln!(out, "{}{} = alloca {}, align 8", indent, slot, llvm_ty).ok();
-                        writeln!(out, "{}store {} {}, ptr {}", indent, llvm_ty, cur, slot).ok();
-                        backend.fun.let_bindings.insert(name.clone(), slot.clone());
-                        backend.fun.let_binding_allocas.insert(slot.clone());
+            // re-execution never re-resolves). The destination plan owns the
+            // obligation; a proven/conservative named carrier gets a frame
+            // slot. A binding absent from an attached plan stays SSA.
+            let obligations = match backend.foreach_carrier_obligations() {
+                Ok(obligations) => obligations,
+                Err(message) => {
+                    eprintln!(
+                        "internal compiler error: {message}. Recompile; if this persists, \
+                         reduce the program and report it."
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let mut carriers = obligations
+                .into_iter()
+                .map(|(name, obligation)| (name, Some(obligation)))
+                .collect::<Vec<_>>();
+            // Safety net for generated/macro-expanded bodies whose local
+            // binding never reached R1. The plan remains authoritative for
+            // every name it contains; this scan only prevents an assignment
+            // alloca from landing inside the loop body (invalid dominance for
+            // a value read after the loop).
+            let mut fallback = std::collections::HashSet::new();
+            collect_foreach_assigned(body, &mut fallback);
+            let planned: std::collections::HashSet<String> =
+                carriers.iter().map(|(name, _)| name.clone()).collect();
+            for name in fallback {
+                if !planned.contains(&name) {
+                    carriers.push((name, None));
+                }
+            }
+            for (name, obligation) in carriers {
+                let Some(cur) = backend.fun.let_bindings.get(&name).cloned() else {
+                    continue;
+                };
+                if backend.fun.let_binding_allocas.contains(&cur) {
+                    continue;
+                }
+                if let Some(obligation) = &obligation {
+                    if matches!(
+                        obligation.proof,
+                        crate::analysis::destination_model::ProofStatus::Unknown
+                    ) {
+                        backend.warnings.push(format!(
+                            "warning: foreach carrier '{name}' has unknown ownership — \
+                             using a conservative frame slot"
+                        ));
                     }
                 }
+                let slot = backend.fun.gen_reg();
+                let llvm_ty = backend.fun.let_binding_types.get(&name)
+                    .map(|t| backend.llvm_type(t))
+                    .unwrap_or_else(|| "i64".to_string());
+                writeln!(out, "{}{} = alloca {}, align 8", indent, slot, llvm_ty).ok();
+                writeln!(out, "{}store {} {}, ptr {}", indent, llvm_ty, cur, slot).ok();
+                backend.fun.let_bindings.insert(name.clone(), slot.clone());
+                backend.fun.let_binding_allocas.insert(slot.clone());
             }
             // Determine the iteration source (SPEC §11.4 — ranges AND
             // collections are iterable). The loop counter is a memory slot;

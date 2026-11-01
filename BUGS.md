@@ -11422,3 +11422,72 @@ Each remains tracked here and in `tests/cli_args_test.rs` / `tests/c_driver_*.rs
 could panic instead of returning a diagnostic. The lexer loop now returns a
 span-bearing `lex error`; the new proptest pushes 100 garbage inputs through
 the full parse/import/typecheck path and asserts no panic.
+
+## FIXED 2026-10-28: whole-object assignment to pooled state loses returned value
+
+A top-level object with a member is stored in pool columns. Assignment evaluated
+its RHS but did not copy the returned object's fields into those columns. The
+next reactor sweep read the old value; asynchronous authentication replies were
+then discarded because the pending job state had disappeared. The pooled
+publication path was restored on fork main in commit 210c5b9b; this branch adds
+the mixed-width boxing correction and strengthens the regression that exposed
+the lost assignment.
+
+Fix: whole-object replacement uses the initialization publication helper,
+retaining local shadowing and dependent/boxed-pool exclusions. The inverse
+value-context boxing path uses native field widths to avoid overlapping
+Bool/Float fields. Regression: pooled_object_replacement_survives_reactor_firings,
+using a member-bearing object and explicit failure exits at O0/O2. A methodless
+object uses a boxed slot and does not reproduce the missing pool assignment.
+
+## State collection initializer stored a stack header in %State (FIXED 2026-10-28)
+
+A collection state field initialized with `[]` (or any literal handled by
+`emit_init_op_construction`) built its `[data, cap, len]` header with
+`alloca i8` inside `init_state`, then stored that stack address in `%State`.
+After `init_state` returned, the first catalogue scan read the dead frame and
+trapped (`memory access out of bounds` in `browser_catalogue_scan`). Both the
+empty and non-empty construction paths now `malloc` the header. Regression:
+`state_collection_initializer_heap_allocates_header`.
+
+## Callable txn inherited a prior defn's tail-loop state (FIXED 2026-10-28)
+
+`emit_callable_txn` cleared local bindings but not `tail_loop_fn`,
+`tail_loop_header`, `tail_param_slots`, or `tail_loop_backedge`. A
+tail-lowered defn emitted immediately before a callable txn left the backedge
+flag set, so the txn body skipped definitions and compared against a bound
+register that was never emitted (`%t4` i64 vs i32). The callable-txn entry now
+resets the tail-loop state. Regression: `rbv_list_each_wasm`.
+
+
+## Enum-return image copy regressed ws_frame 3.85x (PARTIALLY FIXED 2026-10-28)
+
+`retain_enum_return` copied every enum image into the caller-owned result slot
+on every non-void return and dominated `ws_frame`: 0.0600s vs the locked
+baseline's 0.0156s (3.85x).
+
+Removing the copy outright recovered performance but crashed
+`server_protocol_gate`: a returned local image died with its frame. The current
+fix retains only `term <identifier>` images; call/constructor results are
+already caller-owned, and an exact source==destination slot is not copied.
+
+`server_protocol_gate` initially passed with the narrower rule, but the full
+recommender `server_loop_gate` exposed the flaw: call/match results can also
+return frame-owned images. 2026-10-29 restores retention for every enum return;
+the retain helper still elides an exact caller-slot alias. All cargo/app gates
+pass. `ws_frame` remains a known ~2.5x locked-baseline regression. Follow-up:
+return small enum images by value or consume a lifetime/linearity proof to
+elide the copy.
+
+
+## List<Result> elements alias later enum constructors (OPEN 2026-10-29)
+
+Building a `List<Result<Int,String>>` with four conditional pushes produces
+`LEN=4`, but index 2 changes from `Ok(2)` to an `Err` value. The current enum
+ABI publishes handles to short-lived constructor images; collection growth /
+later constructors can overwrite or misinterpret those handles. Reproducer:
+`tests/tier1/enum_list_lifetime.bv.known-bug`; ignored regression pin:
+`tests/enum_list_lifetime_regression.rs`.
+
+This is part of the enum value model migration: collection elements must own a
+complete value or an explicitly owned box, never a borrowed constructor slot.

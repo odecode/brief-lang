@@ -1,7 +1,100 @@
 # LLVM Backend Memory Management
 
 **Date:** 2026-06-23
-**Status:** Current
+**Last updated:** 2026-10-30
+**Status:** Current, with active destination-ownership migration
+
+## Value destination ownership (2026-10-30)
+
+The compiler is migrating to a generalized destination/ownership model. The
+authoritative decision record is
+`value-destination-ownership-decision-record.md`; the execution plan is
+`docs/plans/2026-10-30-generalized-value-destination-ownership.md`.
+
+Rules added by that record:
+
+- every semantic value has a destination/ownership fact;
+- backend lowering consumes `AnalysisResults.destination_ownership`;
+- unknown ownership boxes/copies;
+- proven non-escaping objects may become SSA/local fields;
+- proven caller destinations may replace hidden result copies;
+- proven loop/recursive values use stable carriers;
+- every representation crossing uses shared lowering helpers;
+- public/runtime ABI remains frozen; internal helper ABI switches atomically
+  per callable;
+- no destination pointer may escape its owner lifetime.
+
+Do not add new ad-hoc destination metadata to `FunctionContext`. Destination
+decisions belong in the plan and shared lowering helpers.
+
+D3 (2026-10-30) joins frontend enum facts with the target-configured
+`EnumLayoutPlanner` in `EnumLoweringPlan`. Enum construction, match/projection,
+value retention, image width, and value representation read the joined entry;
+missing entries fall back to the planner. The backend validates constructor/
+match tag agreement in debug builds. Physical layout remains owned by
+`EnumLayoutPlanner`; the semantic plan never guesses word counts.
+
+D4 (2026-10-30) also allows a small plain object/struct payload (<= 8 words) to
+live inline in an internal enum image. Construction writes the object fields
+directly into the payload or copies its byte image; match binds a pointer to
+that payload. Exported enums, collections, protocol types, and layouts whose
+field width cannot be bounded stay boxed. An emission assertion checks the
+actual object size against the reserved payload width. `ws_frame`'s second
+`WsFrame` allocation is removed by this path.
+
+D4 slice 4 adds `object_repr.rs`. An object-returning defn gets a hidden
+caller-owned image only when every return is a direct object literal and every
+call result is consumed by a non-retaining parameter. The callee writes fields
+into `%object_out`; unsupported call positions keep the boxed ABI. `ws_partial`
+uses this path, removing the last per-frame `WsFrame` allocation.
+
+D5a (2026-10-30) adds destination records for state stores, collection
+inserts, object-field stores, and tuple constructions. D5b lowers an object
+literal to a function-frame image only when every observed value of that
+owner/type is non-escaping. Loop construction and `&object` are explicit
+escapes. Frozen runtime layouts do not change.
+
+D6a (2026-10-30) moves recursive tail carriers into
+`GeneralizedDestinationOwnershipPlan.recursive_carriers`. The backend
+reconstructs its carrier ABI view from that plan; per-tail-arm argument
+classes distinguish an existing carrier from a temporary inline nested image.
+Carrier lowering behavior is unchanged in this slice.
+
+D6b routes stable-carrier seeding/backedge copies and inline enum image copies
+through `emit_word_image_copy`; do not reintroduce scattered word-copy loops.
+
+D6c/D6d/D6e unify loop-engine destinations in `LoopEnginePlan`.
+`LoopShape.field_classes` carries the full write-set classification;
+`LoopShape.local_fields` remains the canonical Local proof. The active engine
+plan lives on `FunctionContext`; version-DAG, countdown, and PerFieldPhi paths
+query it for `Phi`/`StateCarrier`/`LoopInvariant`/`Dead`. The propagated
+local-field name set is retired, and a missing plan is a loud rejection.
+
+D6f replaces the foreach assignment rewalk with `LoopPlan` carrier names and
+records list elements as collection escapes. Heap containers can never retain
+a function-frame object image.
+
+D6g derives foreach carrier obligations: named scalar bindings are stable slots
+with no separate image copy; named aggregates/boxed bindings require a backedge
+copy. Unnamed loop temporaries remain iteration-local and never become carriers.
+
+D5b lifetime correction (2026-10-31): a value stored into an object-literal
+field records an object-field lifetime escape. The child aliases the parent's
+lifetime, so it can never be a function-frame image unless the parent's own
+lifetime proof covers both. This fixes the `HttpRequest` nested in `HttpParse`
+miscompile (`net_stack_helpers`).
+
+D6h lowers from those obligations. An attached plan is authoritative: absent
+bindings stay SSA. Proven/conservative carriers get frame slots; unknown
+ownership gets a conservative slot and warning.
+
+D6i makes destination-plan attachment a required pipeline invariant. Lowering
+rejects an unattached plan with an internal-compiler diagnostic; there is no
+conservative all-bindings fallback.
+
+D6j removes the reconstructed recursive-carrier ABI view. Carrier eligibility,
+hidden slots, seeding, and image copies read proof-approved
+`recursive_carrier_obligations` directly.
 
 ## Principle
 

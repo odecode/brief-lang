@@ -21,6 +21,12 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::LazyLock;
 
+pub(crate) struct WordImageCopy<'a> {
+    pub source: &'a str,
+    pub destination: &'a str,
+    pub words: usize,
+}
+
 impl LlvmBackend {
     // ═══════════════════════════════════════════════════════════════
     // Section 1: Cell Rewriting
@@ -2674,12 +2680,44 @@ impl LlvmBackend {
         Some(slot)
     }
 
+    /// Joined enum layout view. The D3b plan is authoritative when it has a
+    /// concrete entry; the target layout planner remains the conservative
+    /// fallback for types not seen by the frontend pass.
+    pub(crate) fn enum_layout(&self, ty: &crate::ast::Type) -> Option<crate::analysis::enum_layout::EnumLayout> {
+        self.ctx
+            .enum_lowering
+            .layout(ty)
+            .cloned()
+            .or_else(|| {
+                self.ctx
+                    .enum_layout_planner
+                    .as_ref()
+                    .and_then(|planner| planner.layout_for(ty))
+            })
+    }
+
+    pub(crate) fn enum_value_repr_for(
+        &self,
+        ty: &crate::ast::Type,
+    ) -> Option<crate::analysis::enum_layout::EnumValueRepr> {
+        self.ctx
+            .enum_lowering
+            .entry(ty)
+            .map(|entry| entry.representation)
+            .or_else(|| {
+                self.ctx
+                    .enum_layout_planner
+                    .as_ref()
+                    .and_then(|planner| planner.value_repr_for(ty))
+            })
+    }
+
     /// 2026-10-25: an aggregate can outlive the caller-owned temporary image
     /// returned by an enum call. Give stored enum values an independent image;
     /// retain stack-backed calls for local consumers. Retire with an ownership
     /// proof that the source image already outlives the destination aggregate.
     pub(crate) fn own_enum_value(&mut self, out: &mut String, indent: &str, reg: &TypedRegister) -> TypedRegister {
-        let Some(layout) = self.ctx.enum_layout_planner.as_ref().and_then(|p| p.layout_for(&reg.ty)) else {
+        let Some(layout) = self.enum_layout(&reg.ty) else {
             return reg.clone();
         };
         let bytes = layout.image_words * 8;
@@ -2698,29 +2736,41 @@ impl LlvmBackend {
     /// 2026-10-25: returning a local enum must transfer its image to the
     /// caller-owned result slot before the local frame dies. Constructors may
     /// already use that slot; loading the full image first also permits aliasing.
-    /// Retire only when enum values are returned directly by value.
+    /// 2026-10-28: an exact source==destination handle is already caller-owned;
+    /// copying it again dominated ws_frame by 3.85x.
     pub(crate) fn retain_enum_return(&mut self, out: &mut String, indent: &str, reg: &TypedRegister) -> TypedRegister {
         let Some(destination) = self.fun.enum_out_slot.clone() else { return reg.clone(); };
         let words = self.enum_image_words(self.fun.item_return_type.as_ref());
         let handle = self.adapt_to_i64(out, indent, reg);
+        let source_is_destination = self.fun.gen_reg();
+        let destination_handle = self.fun.gen_reg();
+        writeln!(out, "{indent}{destination_handle} = ptrtoint ptr {destination} to i64").ok();
+        writeln!(out, "{indent}{source_is_destination} = icmp eq i64 {handle}, {destination_handle}").ok();
+        let same_block = self.fun.next_label("ret_same");
+        let copy_block = self.fun.next_label("ret_copy");
+        let done_block = self.fun.next_label("ret_done");
+        writeln!(out, "{indent}br i1 {source_is_destination}, label %{same_block}, label %{copy_block}").ok();
+        writeln!(out, "{indent}{same_block}:").ok();
+        writeln!(out, "{indent}  br label %{done_block}").ok();
+        writeln!(out, "{indent}{copy_block}:").ok();
         let source = self.fun.gen_reg();
         writeln!(out, "{indent}{source} = inttoptr i64 {handle} to ptr").ok();
         let mut values = Vec::with_capacity(words);
         for word in 0..words {
             let address = self.fun.gen_reg();
             let value = self.fun.gen_reg();
-            writeln!(out, "{indent}{address} = getelementptr i64, ptr {source}, i64 {word}").ok();
-            writeln!(out, "{indent}{value} = load i64, ptr {address}").ok();
+            writeln!(out, "{indent}  {address} = getelementptr i64, ptr {source}, i64 {word}").ok();
+            writeln!(out, "{indent}  {value} = load i64, ptr {address}").ok();
             values.push(value);
         }
         for (word, value) in values.iter().enumerate() {
             let address = self.fun.gen_reg();
-            writeln!(out, "{indent}{address} = getelementptr i64, ptr {destination}, i64 {word}").ok();
-            writeln!(out, "{indent}store i64 {value}, ptr {address}").ok();
+            writeln!(out, "{indent}  {address} = getelementptr i64, ptr {destination}, i64 {word}").ok();
+            writeln!(out, "{indent}  store i64 {value}, ptr {address}").ok();
         }
+        writeln!(out, "{indent}  br label %{done_block}").ok();
+        writeln!(out, "{indent}{done_block}:").ok();
         let result = self.fun.gen_reg();
-        // 2026-10-25: the caller-owned result slot is a target-width handle
-        // (i32 on wasm32), not the i64 word used inside the image.
         let hw = format!("i{}", self.ctx.int_bits);
         writeln!(out, "{indent}{result} = ptrtoint ptr {destination} to {hw}").ok();
         TypedRegister { name: result, ty: reg.ty.clone() }
@@ -2730,15 +2780,106 @@ impl LlvmBackend {
     /// concrete enum type. Unknown/non-enum types use the legacy 2-word
     /// `{tag,payload}` floor.
     pub(crate) fn enum_image_words(&self, ty: Option<&crate::ast::Type>) -> usize {
-        ty.and_then(|t| {
+        ty.and_then(|t| self.enum_layout(t))
+            .map(|l| l.image_words)
+            .unwrap_or(2)
+            .max(2)
+    }
+
+    /// Proof-derived foreach slot obligations. The destination plan is a
+    /// required pipeline input; an absent owner means this callable had no
+    /// loop-carried bindings. A binding absent from the attached plan is
+    /// iteration-local and must stay SSA.
+    pub(crate) fn foreach_carrier_obligations(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<
+            String,
+            crate::analysis::destination_model::ForeachCarrierObligation,
+        >,
+        &'static str,
+    > {
+        if !self.ctx.destination_plan_attached {
+            return Err(
+                "the compiler did not attach destination ownership before loop lowering",
+            );
+        }
+        let Some(owner) = self.fun.destination_owner.as_deref() else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        Ok(
             self.ctx
-                .enum_layout_planner
-                .as_ref()
-                .and_then(|p| p.layout_for(t))
-        })
-        .map(|l| l.image_words)
-        .unwrap_or(2)
-        .max(2)
+                .generalized_destination_ownership
+                .foreach_carrier_obligations(owner),
+        )
+    }
+
+    pub(crate) fn current_loop_field(
+        &self,
+        field: &str,
+    ) -> Option<crate::analysis::destination_model::LoopFieldRepresentation> {
+        self.fun
+            .current_loop_engine
+            .as_ref()
+            .and_then(|engine| engine.fields.get(field))
+            .map(|plan| plan.representation)
+    }
+
+    pub(crate) fn loop_field_is_phi(&self, field: &str) -> bool {
+        matches!(
+            self.current_loop_field(field),
+            Some(
+                crate::analysis::destination_model::LoopFieldRepresentation::Phi
+                    | crate::analysis::destination_model::LoopFieldRepresentation::StateCarrier,
+            )
+        )
+    }
+
+    /// Shared word-image copy for stable carriers and inline enum images.
+    /// Source and destination are already-resolved LLVM pointers.
+    pub(crate) fn emit_word_image_copy(
+        &mut self,
+        out: &mut String,
+        indent: &str,
+        image: WordImageCopy<'_>,
+    ) {
+        let WordImageCopy {
+            source,
+            destination,
+            words,
+        } = image;
+        for word in 0..words {
+            let value = self.fun.gen_reg();
+            let src_gep = self.fun.gen_reg();
+            let dst_gep = self.fun.gen_reg();
+            writeln!(out, "{indent}{src_gep} = getelementptr i64, ptr {source}, i64 {word}").ok();
+            writeln!(out, "{indent}{dst_gep} = getelementptr i64, ptr {destination}, i64 {word}").ok();
+            writeln!(out, "{indent}{value} = load i64, ptr {src_gep}").ok();
+            writeln!(out, "{indent}store i64 {value}, ptr {dst_gep}").ok();
+        }
+    }
+
+    /// True when this owner/type group has no observed escape, so the literal
+    /// may live in the current function frame.
+    pub(crate) fn object_literal_can_stack(&self, type_name: &str) -> bool {
+        let Some(owner) = self.fun.destination_owner.as_deref() else {
+            return false;
+        };
+        self.ctx
+            .stack_object_types
+            .get(owner)
+            .is_some_and(|types| types.contains(type_name))
+    }
+
+    /// Exact byte image for an object-returning defn's declared result.
+    pub(crate) fn object_image_bytes_for_defn(&self, name: &str) -> u64 {
+        self.ctx
+            .defn_return_types
+            .get(name)
+            .and_then(|types| types.first())
+            .and_then(|ty| ty.universe_key())
+            .map(|name| self.struct_type_size(name))
+            .unwrap_or(0)
     }
 
     /// Image width for an enum-returning defn's declared return type.
