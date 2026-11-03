@@ -13,12 +13,13 @@
 # Usage:
 #   bash benchmarks/ll_determinism_check.sh           # full corpus
 #   bash benchmarks/ll_determinism_check.sh --quick   # 2 programs (per-commit)
+# Set BRIEVC to validate a specific compiler binary instead of target/release.
 #
 # Exit 0 = all deterministic. Exit 1 = drift, named.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BV=./target/release/brievc
+BV=${BRIEVC:-./target/release/brievc}
 RT=lib/runtime/briev_rt.c
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

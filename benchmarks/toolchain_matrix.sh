@@ -11,10 +11,11 @@
 # version-qualified from here on).
 #
 # Usage: bash benchmarks/toolchain_matrix.sh
+# Set BRIEVC to validate a specific compiler binary instead of target/release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BV=./target/release/brievc
+BV=${BRIEVC:-./target/release/brievc}
 RT=lib/runtime/briev_rt.c
 TMP=$(mktemp -d)
 
@@ -33,7 +34,7 @@ declare -A NEEDS_SIM=( [multinode]=1 [giantnode]=1 )
 if [ ! -f u.data ]; then
     echo "note: u.data missing — multinode/giantnode runs need it; skipping those rows" >&2
 fi
-if [ ! -f simlist.txt ]; then
+if [ -f u.data ] && [ ! -f simlist.txt ]; then
     awk 'BEGIN{for(i=0;i<943;i++){s="";for(j=0;j<1682;j++){s=s (j?" ":"") ((i*31+j*17)%997);}print s}}' > simlist.txt
     SYNTHESIZED_SIM=1
     echo "note: synthesized a stand-in simlist.txt" >&2
@@ -63,6 +64,7 @@ if [ ${#CLANGS[@]} -eq 0 ]; then
 fi
 
 printf "%-18s %-22s %s\n" "CLANG" "VERSION" "VERDICTS"
+failed=0
 for c in "${CLANGS[@]}"; do
     ver=$("$c" --version | head -1 | sed 's/clang version \([0-9.]*\).*/\1/')
     cells=""
@@ -71,11 +73,13 @@ for c in "${CLANGS[@]}"; do
         out="$TMP/${name}.$ver.ll"
         if ! "$BV" build "$src" --llvm --out "$TMP/$name.$ver" --stdlib-path lib > /dev/null 2>&1; then
             cells="$cells $name=COMPILE-FAIL"
+            failed=1
             continue
         fi
         ll="$TMP/$name.$ver/$(basename "${src%.bv}").ll"
         if ! "$c" -O3 -march=native -ffast-math "$ll" "$RT" -ldl -o "$TMP/$name.$ver.bin" > /dev/null 2>&1; then
             cells="$cells $name=CLANG-FAIL"
+            failed=1
             continue
         fi
         run_env=()
@@ -83,12 +87,14 @@ for c in "${CLANGS[@]}"; do
             cells="$cells $name=SKIP(no-input)"
             continue
         fi
-        if timeout 30 "$TMP/$name.$ver.bin" > "$TMP/$name.$ver.out" 2>/dev/null; then
+        if timeout 30 "$TMP/$name.$ver.bin" > "$TMP/$name.$ver.out" 2>/dev/null \
+            && [ -s "$TMP/$name.$ver.out" ]; then
             # Verdict = ran + produced output; byte-parity across toolchains
             # is checked by the caller diffing the .out files (same name).
             cells="$cells $name=OK"
         else
             cells="$cells $name=RUN-FAIL"
+            failed=1
         fi
     done
     printf "%-18s %-22s %s\n" "$c" "$ver" "$cells"
@@ -99,15 +105,19 @@ echo ""
 for name in "${NAMES[@]}"; do
     first=""
     mismatch=0
+    count=0
     for f in "$TMP/$name."*.out; do
         [ -f "$f" ] || continue
+        count=$((count + 1))
         if [ -z "$first" ]; then
             first="$f"
             continue
         fi
         cmp -s "$first" "$f" || { mismatch=1; break; }
     done
-    count=$(ls "$TMP/$name."*.out 2>/dev/null | wc -l)
+    # 2026-11-03: absent dataset rows intentionally have no output files.
+    # Count the matched files above; ls exits nonzero for an unmatched glob
+    # under pipefail and incorrectly turns an explicit SKIP into gate failure.
     if [ "$count" -ge 2 ]; then
         if [ "$mismatch" = 0 ]; then
             echo "parity: $name identical across $count toolchains"
@@ -117,3 +127,5 @@ for name in "${NAMES[@]}"; do
         fi
     fi
 done
+
+exit "$failed"
