@@ -23,9 +23,13 @@ fn time_clock_monotonic_and_sleep_measures_real() {
         &bv,
         r#"
 import "std/os/time.bv";
+import { is_err, unwrap_err } from "std/result.bv";
 
 let done: Bool = false;
 node main [done == false][done == true] {
+    let invalid: Result<Int,Int> = clock_ns_res(2147483647);
+    when !is_err(invalid) { endprogram 1; };
+    when unwrap_err(invalid) >= 0 { endprogram 2; };
     let t0: Int = now_ns();
     let slept: Int = sleep_ms(30);
     let t1: Int = now_ns();
