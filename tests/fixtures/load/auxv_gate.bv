@@ -1,0 +1,33 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/os/auxv.bv";
+import "std/net/http.bv";
+
+let done: Bool = false;
+node main [!done][done] {
+    let raw: ByteBuf = buf_new(64);
+    foreach index in 0..64 { Store#(raw.ptr+index,0,1); };
+    Store#(raw.ptr,6,8);
+    Store#(raw.ptr+8,16384,8);
+    Store#(raw.ptr+16,17,8);
+    Store#(raw.ptr+24,250,8);
+    raw.len = 64;
+    let data: String = buf_slice_string(raw,0,64);
+    when unwrap(auxv_value(data,6)) != 16384 || unwrap(auxv_value(data,17)) != 250 { endprogram 1; };
+    when unwrap_err(auxv_value(data,99)) != -2 { endprogram 2; };
+    when unwrap_err(auxv_value(data,0)) != -22 { endprogram 3; };
+    when unwrap_err(auxv_value(buf_slice_string(raw,0,17),6)) != -22 { endprogram 4; };
+    when unwrap_err(auxv_value(buf_slice_string(raw,0,32),6)) != -22 { endprogram 5; };
+    Store#(raw.ptr+32,6,8);
+    when unwrap_err(auxv_value(buf_slice_string(raw,0,64),6)) != -22 { endprogram 6; };
+    Store#(raw.ptr+32,0,8);
+    Store#(raw.ptr+8,-1,8);
+    when unwrap_err(auxv_value(buf_slice_string(raw,0,64),6)) != -34 { endprogram 7; };
+    let live: ProcessUnits = unwrap(process_units());
+    when live.page_bytes <= 0 || live.ticks_per_second <= 0 { endprogram 8; };
+    buf_free(raw);
+    println!("auxv_units_malformed_missing_range_and_live_ok");
+    done = true;
+    endprogram;
+};

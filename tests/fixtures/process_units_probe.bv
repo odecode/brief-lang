@@ -1,0 +1,20 @@
+//===----------------------------------------------------------------------===//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//===----------------------------------------------------------------------===//
+import "std/os/auxv.bv";
+import "std/os/time.bv";
+
+defn print_units(units: ProcessUnits) -> Void {
+    when sleep_ms(1) < 0 { trap; };
+    println!(units.page_bytes);
+    println!(units.ticks_per_second);
+};
+let done: Bool = false;
+node main [!done][done] {
+    let queried: Result<ProcessUnits,Int> = process_units();
+    when is_err(queried) { endprogram 1; };
+    let units: ProcessUnits = unwrap(queried);
+    print_units(units);
+    done = true;
+    endprogram;
+};

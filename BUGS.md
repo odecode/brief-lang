@@ -11568,3 +11568,14 @@ value carrier. Member array addressing now uses the same typed array GEP as
 construction, including row strides. Pointer boxing explicitly preserves
 32-bit address bits when widened to a 64-bit boxed slot. Validation pending
 for this expanded change; no performance result is claimed.
+
+## 2026-11-03: returned enum destination falsely promised nocapture
+
+The process collector's unit query returned 4096/100 at O0 but corrupted
+positive values at O3/LTO. Its enum return carries the caller-owned output
+address back as an integer, contradicting nocapture on that parameter.
+Actual-IR experiments isolated the annotation: removing only enum_out
+nocapture restored values; removing noalias or broadening memory effects did
+not. The signature emitter now omits that unsound promise. The native probe
+compares Briev results against independent getconf values. Full verification
+is in progress; see docs/plans/2026-11-03-enum-result-capture.md.
