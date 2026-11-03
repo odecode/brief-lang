@@ -341,6 +341,13 @@ fn guard_cond_i1(backend: &mut LlvmBackend, out: &mut String, indent: &str, cond
 /// of THIS body without returning from the reactor); callable txns branch to
 /// the post gate; per-txn void functions and members return.
 fn emit_bare_term_stop(backend: &mut LlvmBackend, out: &mut String, indent: &str) {
+    // 2026-11-03: an inline member owns a local exit, never the caller's
+    // return or deferred cleanup. Retire with unified inline return lowering.
+    if let Some(exit) = &backend.fun.inline_member_exit {
+        writeln!(out, "{indent}br label %{exit}").ok();
+        backend.fun.terminated = true;
+        return;
+    }
     if backend.ctx.webstack_enabled {
         emit_web_flush_batch(backend, out, indent);
     }
@@ -1297,6 +1304,14 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         return TypedRegister { name: val.name, ty: Type::void() };
                     }
                     let obj_reg = backend.emit_expr(out, obj, indent);
+                    if super::collection_assignment::emit_collection_index_store(
+                        backend, out, indent,
+                        super::collection_assignment::IndexStore {
+                            receiver: &obj_reg, index: idx, value: &val,
+                        },
+                    ) {
+                        return TypedRegister { name: val.name, ty: Type::void() };
+                    }
                     // 2026-08-07 (Phase 7): a multi-dim ROW VIEW store —
                     // `m[i][j] = v`: the outer obj is `Index(m, i)`, whose
                     // register is a ptr into the aggregate (typed Vector with
@@ -1314,7 +1329,10 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                                 indent, elem, agg_ty, obj_reg.name, gep_idx
                             )
                             .ok();
-                            let inner_llvm = backend.llvm_type(inner);
+                            let inner_llvm = backend.array_element_llvm_type(inner);
+                            if backend.emit_non_scalar_store(out, indent, (&elem, inner, &inner_llvm), &val) {
+                                return TypedRegister { name: val.name, ty: Type::void() };
+                            }
                             let universe = backend.ctx.type_universe.clone();
                             let store_val = backend.ensure_typed_value(
                                 out,
@@ -1571,6 +1589,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // over-read 4-byte wasm pointers and desynchronized the
                     // List data field from its read path.
                     let llvm_ty = backend.llvm_type(&field_ty);
+                    if backend.emit_non_scalar_store(out, indent, (&gep, &field_ty, &llvm_ty), &val) {
+                        return TypedRegister { name: val.name, ty: Type::void() };
+                    }
                     if matches!(field_ty, Type::Ptr(_)) {
                         let handle = backend.pointer_handle_of(out, indent, &val);
                         let ptr = backend.pointer_from_handle(out, indent, &handle);
@@ -1940,12 +1961,17 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // {handle, value_ptr, value_len} record, then __web_flush_state is
             // called with the buffer + count. The JS shim applies the DOM
             // mutations synchronously before the transaction completes.
-            if backend.ctx.webstack_enabled {
-                emit_web_flush_batch(backend, out, indent);
+            // 2026-11-03: an inline return is not the caller's completion.
+            // Preserve caller cleanup until its own exit; retire with unified
+            // value/void inline return lowering.
+            if backend.fun.inline_member_exit.is_none() {
+                if backend.ctx.webstack_enabled {
+                    emit_web_flush_batch(backend, out, indent);
+                }
+                // 2026-08-09 (Phase 10): run deferred cleanup before the firing
+                // exits (term is a successful completion).
+                backend.flush_defer_cleanup(out, indent);
             }
-            // 2026-08-09 (Phase 10): run deferred cleanup before the firing
-            // exits (term is a successful completion).
-            backend.flush_defer_cleanup(out, indent);
             if let Some(val) = val {
                 let saved_enum_ret = backend.fun.enum_return_context;
                 let saved_expected_enum = backend.fun.expected_enum_type.clone();
@@ -2948,15 +2974,16 @@ fn emit_self_slot_array_store(
         return false;
     }
     let offset = backend.lookup_field_offset(&self_type, sname);
-    let elem_size = crate::backend::llvm::types::type_size(inner.as_ref(), backend.ctx.type_universe.clone().as_ref());
-    let elem_llvm = backend.llvm_type(&inner);
+    let array_ty = backend.vector_array_llvm_type(&Type::Vector(inner.clone(), dims))
+        .unwrap_or_else(|| "i64".into());
+    let elem_llvm = backend.array_element_llvm_type(&inner);
     let idx_reg = backend.emit_expr(out, idx, indent);
-    let scaled = backend.fun.gen_reg();
-    writeln!(out, "{}{} = mul i64 {}, {}", indent, scaled, idx_reg.name, elem_size).ok();
-    let total = backend.fun.gen_reg();
-    writeln!(out, "{}{} = add i64 {}, {}", indent, total, offset, scaled).ok();
+    let gep_idx = backend.gep_index(out, indent, &idx_reg);
+    let base = backend.fun.gen_reg();
+    writeln!(out, "{indent}{base} = getelementptr i8, ptr {self_ptr}, i64 {offset}").ok();
     let gep = backend.fun.gen_reg();
-    writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, gep, self_ptr, total).ok();
+    writeln!(out, "{indent}{gep} = getelementptr {array_ty}, ptr {base}, i64 0, i64 {gep_idx}").ok();
+    if backend.emit_non_scalar_store(out, indent, (&gep, &inner, &elem_llvm), val) { return true; }
     let universe = backend.ctx.type_universe.clone();
     let store_val = backend.ensure_typed_value(out, indent, &elem_llvm, &val.name, Some(val.ty.clone()), universe.as_ref());
     writeln!(out, "{}store {} {}, ptr {}", indent, elem_llvm, store_val, gep).ok();
@@ -2975,7 +3002,11 @@ pub(super) fn emit_array_state_store(
     val: &TypedRegister,
 ) -> bool {
     let Expr::Identifier(name) = obj else { return false; };
+    if backend.fun.let_bindings.contains_key(name) || backend.fun.self_prefix.is_some()
+        || backend.fun.self_binding.is_some() { return false; }
     let Some(&fidx) = backend.ctx.field_index_map.get(name) else { return false; };
+    let Some(Type::Vector(inner, dims)) = backend.ctx.field_briev_types.get(fidx).cloned() else { return false; };
+    if dims.len() != 1 { return false; }
     let field_ty = backend.ctx.field_types[fidx].clone();
     if !field_ty.starts_with('[') {
         return false;
@@ -2992,10 +3023,8 @@ pub(super) fn emit_array_state_store(
         indent, elem, field_ty, base, gep_idx
     )
     .ok();
-    let elem_llvm = field_ty
-        .rsplit_once('x')
-        .map(|(_, t)| t.trim().trim_end_matches(']').to_string())
-        .unwrap_or_else(|| "i64".to_string());
+    let elem_llvm = backend.array_element_llvm_type(&inner);
+    if backend.emit_non_scalar_store(out, indent, (&elem, &inner, &elem_llvm), val) { return true; }
     let universe = backend.ctx.type_universe.clone();
     let store_val = backend.ensure_typed_value(
         out,

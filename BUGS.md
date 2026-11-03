@@ -11491,3 +11491,80 @@ later constructors can overwrite or misinterpret those handles. Reproducer:
 
 This is part of the enum value model migration: collection elements must own a
 complete value or an explicitly owned box, never a borrowed constructor slot.
+
+## 2026-11-03: native monotonic clock failure violated return contract
+
+Found while building the Briev-native recommender load harness. os/time.bv
+loaded clock_gettime output before checking errno and returned -1 from now_ns,
+whose contract requires nonnegative time. Added checked clock_ns_res, checked
+allocation and representable nanosecond range, and retained now_ns's contract
+with a trap on failure. Sleep now documents interruption accurately and uses
+centralized syscall constants. Reproduction: tests/fixtures/load/clock_gate.bv;
+invalid clock ID must return Err, successful sleep must advance monotonic time.
+Validation: standalone native gate passes; full library suite pending.
+
+## 2026-11-03: indexed collection field stores silently omitted
+
+Reproducer: tests/fixtures/load/collection_index_store_gate.bv. Histogram gate
+records count=100 but all ten bins remain zero; p50 returns maximum 99 instead
+of bucket bound 49. Generated histogram_record evaluates bins[bucket]+1 and
+loads the collection receiver but emits no store. emit_stmt.rs Index assignment
+handles arrays and Ptr values only; collection receivers fall through silently.
+Read-side Index dispatches At. This is a compiler/language closure defect, not
+a reason to replace the benchmark's indexed updates with raw memory.
+Status: reproducer and IR diagnosis, fix in progress. Source-matched release
+validation still pending. New collection write lowering must follow declared
+capabilities, preserve exactly-once evaluation and include nested field targets.
+
+## 2026-11-03: bare inline-member term escaped its caller
+
+SetAt's ordinary void member body exposed a second defect: emit_bare_term_stop
+emitted ret void inside histogram_record (which returns i64), or branched to
+the enclosing reactor abort. Fix in progress scopes a member-local exit and
+suppresses caller cleanup at that boundary. Keep the member's term; removing
+it would conceal the compiler gap. Regression update calls the writer from a
+nonvoid helper and checks execution continues to its return value.
+
+## 2026-11-03: nested inline aggregate field loses address carrier
+
+The fixed-size user collection regression produced a by-value LLVM aggregate
+from a field, then inttoptr i64 on that aggregate for its SetAt member call.
+General inline aggregate field projection must retain the field storage
+address, as vector fields already do. Added shared inline_field_handle for
+pooled, boxed and ordinary field reads, using the resolved LLVM layout rather
+than a Briev type name. Native fixed-collection regression validation pending.
+
+## 2026-11-03: inline member arguments skipped scalar ABI conversion
+
+inline_member_term_gate forwards a Bool parameter through a nonvoid helper
+into a member. The caller carries Bool in an i64 box; the member previously
+bound it as i8 without conversion, producing invalid trunc i8 on an i64 value.
+Member parameter binding now uses the existing coerce_register_value helper.
+The native guarded-return fixture passes with both true and false branches.
+
+Inline aggregate closure also needs construction and whole-field assignment
+to copy the aggregate image from its address carrier, not store the address as
+the aggregate itself. emit_inline_field_store centralizes this boundary.
+
+2026-11-03 validation checkpoint for load prerequisites: checked timing,
+histogram bins/merge, indexed write effects, bounds and inline-member returns
+pass their native gates. The library suite passes 3,437 tests with the user-
+delegated conformance sweep excluded. Subsequent storage expansion below is
+still under validation and is not covered by that earlier passing checkpoint.
+
+## 2026-11-03: fixed collection storage confused callable and inline layouts
+
+`fixed_collection_elements_gate.bv` adds record, object, pointer and string
+elements plus partial initialization. Record construction emitted integer
+address carriers into `ptr` slots; member reads used the record's full byte
+stride while construction used pointer stride. Member writes then repeated
+the pointer/carrier mismatch. Storage layout must be shared by construction,
+read and write; a callable ABI type does not describe inline containment.
+
+The shared non-scalar store handles complete images and physical pointers;
+array element storage preserves inline static records, identity handles and
+the existing word-sized pointer ABI. Array reads preserve the corresponding
+value carrier. Member array addressing now uses the same typed array GEP as
+construction, including row strides. Pointer boxing explicitly preserves
+32-bit address bits when widened to a 64-bit boxed slot. Validation pending
+for this expanded change; no performance result is claimed.
