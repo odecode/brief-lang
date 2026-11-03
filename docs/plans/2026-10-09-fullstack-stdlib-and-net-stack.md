@@ -316,3 +316,16 @@ and punctuation text before directives. The human runs Cargo tests/rebuild per
 WORKFLOW.md; the existing WSL `brievc` binary predates this Rust edit. I09 keeps
 static template punctuation ASCII until the rebuilt compiler verifies Unicode
 output.
+
+## 2026-11-03 — load-harness compiler fix submissions
+
+The load work's native compiler fixes were carved from upstream main 373e548e
+and submitted independently: #57 discarded enum payload allocations
+(b8da475b), #58 enum result capture contract (a62c5282), and #59 indexed
+collection writes/storage (8859ae9b). See the fullstack task map and untracked
+root PR body documents for links, controlled A/B evidence and exact validation.
+No stdlib or application workaround is included. The collection branch adapts
+to upstream's centralized enum query and retains newer browser publication
+rules. Native gates and clean-branch library suites pass; the long conformance
+sweep is delegated to upstream CI. Broad returned-value lifetime closure and
+interpreter indexed-write parity remain open rather than being claimed fixed.
