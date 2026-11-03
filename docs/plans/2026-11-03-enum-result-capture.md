@@ -30,3 +30,12 @@ Validation: focused regression, library suite excluding delegated conformance,
 build, native load fixtures, determinism and toolchain gate. Update architecture
 capture documentation and BUGS.md; preserve prior rationale and unrelated work.
 Reference: https://releases.llvm.org/17.0.1/docs/LangRef.html#parameter-attributes
+
+Validated: the focused optimized OS-value integration passes; 3,438 library
+tests pass (delegated conformance excluded); build completes without warnings;
+all 11 native load fixtures and all app load gates pass. Full seven-case IR
+determinism is green. Clang 17 matrix runs recommender successfully; two
+dataset-dependent rows are explicitly skipped because u.data is absent.
+The collector's schema and failed-read checks pass after the fix. A separate
+5,000-sample preflight found lifetime leaks, tracked separately; the capture
+fix does not establish bounded-memory collection.

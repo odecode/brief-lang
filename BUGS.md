@@ -11579,3 +11579,11 @@ nocapture restored values; removing noalias or broadening memory effects did
 not. The signature emitter now omits that unsound promise. The native probe
 compares Briev results against independent getconf values. Full verification
 is in progress; see docs/plans/2026-11-03-enum-result-capture.md.
+
+## 2026-11-03 — discarded enum payload copies (fixed)
+
+Tag-only matches such as `Present(_)` materialized an owned inline payload
+without binding it, leaking the unreachable copy. Binding lowering now skips
+all-wildcard payloads (including zero payloads), retaining tag checks and named
+binding behavior. Native allocation-count regression passes at O0/O3. Broader
+local returned-value reclamation remains open in the collector lifetime plan.
