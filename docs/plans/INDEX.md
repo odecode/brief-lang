@@ -15,9 +15,100 @@ warns).
 
 **Active stability lane (2026-10-25):** `docs/plans/2026-10-25-stability-v0.1.md` — freeze features; make `cargo test --all` a hard gate, close interpreter/backend parity, declare Tier 1 = x86_64 Linux + wasm32, add a nightly performance baseline, and ship `v0.1.0-preview` then `v0.1.0`. GPU/embedded remain experimental; Otto’s server stays external.
 
-**Active generalized destination implementation (2026-10-31):**
-merged to `main` at `3c2aeaea`. Phases D1–D6 and D7a–D7e landed. Remaining
-work: `docs/plans/2026-10-31-destination-ownership-remaining-work.md`.
+**ws_frame safe fast path (2026-11-03, Step 1 DONE — objective revised):**
+`docs/plans/2026-11-03-ws-frame-fast-path-execution.md` — execution plan,
+Steps 0–3: I11 gate-relaxation root cause → attribution A/B → Proof 1
+image-ownership threading → Proof 3 boundary three-condition proof
+→ Proof 2 `ws_partial` caller-destination. **Verdict:** the "2x vs baseline"
+regression is a phantom — the locked baseline `42279aaf` is numerically
+**wrong** (dead-frame UB; `PASSES=1` checksum `7441` vs C's `103005804`;
+segfaults on payload-heavy frames), while the current tree is correct and at
+**C parity** (C 78.65 M / 20.4 ms vs current 85.22 M / 23.0 ms). Proof 1 is
+re-scoped to the ≤ ~2.6 ms current-vs-C residual; Proof 2/3 are correctness
+work, off the `ws_frame` path. Measured data:
+`benchmarks/results/2026-11-03-ws-frame-attribution.md`; evidence/proofs:
+`docs/plans/2026-11-03-ws-frame-safe-fast-path.md`; benchmark flaw in
+`BUGS.md` (even `PASSES` hides checksum errors). **Step 0 DONE:** I11
+root-caused — enum images escape to state without `own_enum_value`
+(`emit_stmt.rs` state-store paths); a defn-local sret image stored to node
+state. A defn-local sret image stored to node state dangles after the defn
+returns. Confirmed by IR A/B (`/tmp/opencode/repro/defn_store.bv`: garbage
+under relaxation, `42` after owning). Not layout divergence. Fix = Proof 3
+condition 2 (own at every escape sink); the boundary gate stays mandatory
+until then. See `BUGS.md`.
+
+**Enum boundary-gate removal (2026-11-03, ACTIVE):**
+`docs/plans/2026-11-03-enum-boundary-gate-removal.md` — finish Proof 3 so the
+blanket gate becomes `conditions1∧2∧3` (layout agreement ∧ escape ownership ∧
+no external raw-byte consumer; `Unknown ⇒ box`). Phases: A analysis
+(transitive enum-handle containment + txn-local/persistent lifetime facts) →
+B reclamation (txn arena for txn-local, destination threading / managed slot
+for persistent state) → C emission at tuple/closure/aggregate/collection/state
+sinks → D gate replacement (export/FFI-only boundary) → E verification
+(minimal escape repros, ASan/UAR, LSan, net_stack O0–O3, determinism, Kani,
+runtime A/B). State-store sink already fixed (`c4a5f4a1`); rest of Proof 3 is
+this workstream.
+
+**Arena runtime parity + allocation folding (2026-11-03, ACTIVE):**
+`docs/plans/2026-11-03-arena-runtime-parity-and-folding.md` — two goals:
+(R) runtime parity/better than the C arena on an observable workload —
+register-resident bump/end (local cursor, SROA-promoted), cold grow, scope
+reset; (O) keep proof-driven dead-allocation folding via the escape facts
+(restores the ~18ms fold where semantics allow). Evidence: current arena is
+~1.4x C (338 vs 240ms @50M); the baseline's 18ms was a legal fold.
+
+**Arena enablement (2026-11-03, ACTIVE):**
+`docs/plans/2026-11-03-arena-enablement.md` — make `Alloc#` actually select a
+safe arena. Root cause: two analysis passes stamp conflicting `Alloc#` ids.
+Fix reuses the existing loop convention (dedicated latch/end blocks +
+captured final block) at the two hardcoded sites, then fixes the arena
+subsystem (Direct-SSA init, brk-aware fini, grow preserves the bump) and
+re-enables selection behind an IR gate. Prerequisite for per-worker arenas.
+
+**Lifetime and reclamation — north star (2026-11-03, ACTIVE):**
+`docs/plans/2026-11-03-lifetime-and-reclamation.md` (+ decision-record Part
+XIII, D27–D33). The long-term ownership/health model: lifetime is a proof in
+the destination plan (`Frame`/`TxnBody`/`StateField`/`LoopCarrier`/`Program`/
+`External`); allocation follows lifetime (construction-time strategy via the
+`Alloc#` escape DAG); reclamation follows lifetime (txn arena, owned state
+slots, boxed/leak for Unknown); immutable images with copy-on-escape or
+destination threading. No GC, no pervasive refcount, no new syntax. Phases
+0–7: correctness net (closure-let gap) → **execution substrate (parallel
+`async` via `SysCall#(SYS_clone)`+futex, per-worker arenas in worker-indexed
+slots, real `sync<group>` join, capability-gated cooperative fallback)** →
+`Lifetime`/`Sendable` facts + per-worker allocation strategy → construction-time
+strategy → state slots → observability (`memcheck`) → optional sound refcount →
+enum boundary-gate removal. Decisions: parallel by default where threads exist;
+shared `%State` safe for fields via the gate's XOR-disjoint proof; async output
+interleaving contract-unspecified. This is the durable plan the enum gate-removal
+workstream executes; the two share Phase 0.
+
+**Typed HIR H3–H5 execution (2026-11-04, ACTIVE):**
+`docs/plans/2026-11-04-typed-hir-h3-h5-execution.md` — port every analysis to
+HIR (needs_state/needs_plain → defn_liveness → storage_class/boundary_ownership
+→ loop_shape/tail_recursion → task/collection → generic txn), each with corpus
+parity; then backend consumes HIR family-by-family behind byte-identical IR
+A/B; finally retire AST paths. No behavior change per slice.
+
+**Typed HIR (2026-11-02, active):**
+`docs/plans/2026-11-02-typed-hir.md` — parser AST remains; typed normalized HIR
+becomes the semantic source for analyses and lowering.
+
+**Language stabilization (2026-11-02, active):**
+`docs/plans/2026-11-02-language-stabilization.md` — re-triage OPEN core bugs,
+fix enum/collection ownership and reference-interpreter parity, then unquarantine
+the full test lane.
+
+**Canonical enum payload + selective inline (2026-11-01, closed 2026-11-02):**
+`docs/plans/2026-11-01-canonical-enum-payload-and-selective-inline.md` —
+D4b enabled with PR49/50/51 owned extraction; callable-boundary gate mandatory;
+copy elision removed after a controlled regression. Next performance work is
+region-local enum/object scalar replacement.
+
+**Generalized destination implementation (2026-10-31, merged 2026-11-02):**
+`main` at `4dfa4e85` plus integration closeout. Phases D1–D7 landed; D8 cleanup
+complete. Historical execution queue:
+`docs/plans/2026-10-31-destination-ownership-remaining-work.md`.
 Umbrella: `docs/plans/2026-10-30-generalized-value-destination-ownership.md`.
 ADR: `docs/architecture/value-destination-ownership-decision-record.md`.
 Migration uses generalized value lanes with frozen public/runtime ABI.

@@ -22,9 +22,29 @@ fn type_bare_name(ty: &Type) -> &str {
 
 fn is_enum_handle_type(backend: &LlvmBackend, ty: &Type) -> bool {
     match ty {
-        Type::Custom(n) | Type::Applied(n, _) => backend.ctx.enum_handle_types.contains(n),
+        Type::Custom(n) | Type::Applied(n, _) => backend.is_enum_type_name(n),
         _ => false,
     }
+}
+
+/// 2026-11-03 (Proof 3 condition 2, I11 root cause): an enum value published
+/// into longer-lived storage (node/global state) must own its image before the
+/// store. The image may be a stack slot in the producing callable's frame,
+/// which dies before the state is read — a use-after-return. `own_enum_value`
+/// heap-copies the image and is a no-op for non-enum slot types.
+fn own_enum_for_state(
+    backend: &mut LlvmBackend,
+    out: &mut String,
+    indent: &str,
+    slot_ty: &Type,
+    val: &TypedRegister,
+) -> TypedRegister {
+    if !is_enum_handle_type(backend, slot_ty) {
+        return val.clone();
+    }
+    let mut owned = val.clone();
+    owned.ty = slot_ty.clone();
+    backend.own_enum_value(out, indent, &owned)
 }
 
 /// Emit LLVM IR for a statement. Returns the last expression's register.
@@ -76,7 +96,7 @@ pub(super) fn emit_web_flush_batch(backend: &mut LlvmBackend, out: &mut String, 
     // state-machine transaction. A stateless body has no %state parameter, so
     // flushing there emits undefined IR. Only real txn/reactive drivers set
     // txn_name and are eligible.
-    if txn_name.is_empty() || backend.fun.stateless_body {
+    if txn_name.is_empty() || backend.fun.stateless_body || backend.fun.in_inline_member {
         return;
     }
     // 2026-08-10: the write_set is frontend analysis — sorted by field index
@@ -170,35 +190,6 @@ pub(super) fn emit_destroy_register(
             // unknown strategy) — the consume destroy is a no-op. Frees only
             // what the allocator explicitly recorded; never free a scalar's
             // value as a pointer.
-        }
-    }
-}
-
-fn collect_foreach_assigned(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
-    for statement in stmts {
-        match statement {
-            Statement::Assign(Expr::Identifier(name), _) => {
-                out.insert(name.clone());
-            }
-            Statement::ArrowAssign {
-                target: Some(target),
-                ..
-            } => {
-                if let Expr::Identifier(name) = target.as_ref() {
-                    out.insert(name.clone());
-                }
-            }
-            Statement::Guarded(_, body)
-            | Statement::Block(body)
-            | Statement::SyncBlock(body)
-            | Statement::Mutex(body)
-            | Statement::Foreach { body, .. } => collect_foreach_assigned(body, out),
-            Statement::Match { arms, .. } => {
-                for arm in arms {
-                    collect_foreach_assigned(&arm.body, out);
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -466,7 +457,7 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             }
             let saved_expected_enum = backend.fun.expected_enum_type.clone();
             if let Some(t) = ty {
-                if backend.ctx.enum_handle_types.contains(type_bare_name(t)) {
+                if backend.is_enum_type_name(type_bare_name(t)) {
                     backend.fun.expected_enum_type = Some(t.clone());
                 }
             }
@@ -519,6 +510,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     for (j, var) in free_vars.iter().enumerate() {
                         let cap = backend
                             .emit_expr(out, &crate::ast::Expr::Identifier(var.clone()), indent);
+                        // 2026-11-03 (Proof 3 condition 2): a captured enum must
+                        // own its image; the closure (heap env) can outlive the
+                        // frame that produced the captured image. The `let g =
+                        // x => …` path constructs its own env here, separate
+                        // from the Expr::Lambda arm — both must own. No-op for
+                        // non-enum captures.
+                        let cap = backend.own_enum_value(out, indent, &cap);
                         let slot = backend.fun.gen_reg();
                         writeln!(
                             out,
@@ -1044,6 +1042,13 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                                 writeln!(out, "{}{} = getelementptr {}, ptr {}, i64 0, i64 {}", indent, gep, col_ty, base, row_reg).ok();
                                 gep
                             };
+                            // 2026-11-03 (Proof 3 condition 2): a pooled column
+                            // outlives the producing frame — own enum images.
+                            let slot_briev_ty = backend.ctx.field_briev_types.get(idx).cloned();
+                            let val = match slot_briev_ty.as_ref() {
+                                Some(ty) => own_enum_for_state(backend, out, indent, ty, &val),
+                                None => val,
+                            };
                             // Mirror the standard top-level field store: use the
                             // slot's actual LLVM type and box Ptr/float values.
                             let val_ty = backend.llvm_type(&val.ty);
@@ -1120,6 +1125,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                                 backend.fun.last_val_types.insert(name.clone(), val.ty.clone());
                                 return TypedRegister { name: val.name, ty: Type::void() };
                             }
+                            // 2026-11-03 (Proof 3 condition 2): an instance slot
+                            // outlives the producing frame — own enum images.
+                            let val = own_enum_for_state(backend, out, indent, &slot_ty, &val);
                             // 2026-08-01 (D3): a Ptr-typed self-slot stores the
                             // HANDLE at i{int_bits} (the value is already
                             // ptrtoint'd) — not `ptr`, matching the self-slot
@@ -1149,7 +1157,10 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     // `stdout_buf = Alloc#(...)` seed in the first plain run;
                     // R1 in the protocol's risk register).
                     if backend.ctx.plain_lets.contains(name) {
-                        backend.emit_state_store_i64(out, indent, name, &val.name.clone());
+                        // 2026-11-03 (Proof 3 condition 2): plain globals are
+                        // longer-lived than the producing frame — own the image.
+                        let owned = own_enum_for_state(backend, out, indent, &val.ty.clone(), &val);
+                        backend.emit_state_store_i64(out, indent, name, &owned.name.clone());
                         backend.fun.last_val_temps.insert(name.clone(), val.name.clone());
                         backend.fun.last_val_types.insert(name.clone(), val.ty.clone());
                         return TypedRegister { name: val.name, ty: Type::void() };
@@ -1181,6 +1192,9 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         // stored (`store i64 %ptr`) — an LLVM type error on
                         // String state fields (node_bridge.save, main's
                         // flat-dotted branch).
+                        // 2026-11-03 (Proof 3 condition 2): a state slot outlives
+                        // the producing frame — an enum image must be owned first.
+                        let val = own_enum_for_state(backend, out, indent, &field_briev_ty, &val);
                         let fidx = *backend.ctx.field_index_map.get(name).unwrap();
                         let fty = backend.ctx.field_types.get(fidx).cloned().unwrap_or_else(|| "i64".to_string());
                         let store_val = backend.ensure_typed_value(
@@ -1885,7 +1899,23 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                         } else {
                             None
                         };
-                        let pushed = push_val.as_ref().unwrap_or(&val);
+                        // 2026-11-02 (enum value model): a pushed enum is an
+                        // OWNING collection element. Call results may point at
+                        // a caller-owned `%esrt` stack image; copy it to owned
+                        // storage before publishing the handle into the list.
+                        let owned_enum = if elem_ty
+                            .as_ref()
+                            .is_some_and(|et| is_enum_handle_type(backend, et))
+                        {
+                            let mut enum_val = val.clone();
+                            if let Some(et) = &elem_ty {
+                                enum_val.ty = et.clone();
+                            }
+                            backend.own_enum_value(out, indent, &enum_val)
+                        } else {
+                            val.clone()
+                        };
+                        let pushed = push_val.as_ref().unwrap_or(&owned_enum);
                         if emit_strategy_member_call(backend, out, indent, t, &op_def, Some(&pushed.name)).is_none() {
                             emit_strategy_fn_call(backend, out, indent, t, &op_def, Some(&pushed.name));
                         }
@@ -1961,15 +1991,15 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // {handle, value_ptr, value_len} record, then __web_flush_state is
             // called with the buffer + count. The JS shim applies the DOM
             // mutations synchronously before the transaction completes.
-            // 2026-11-03: an inline return is not the caller's completion.
-            // Preserve caller cleanup until its own exit; retire with unified
-            // value/void inline return lowering.
-            if backend.fun.inline_member_exit.is_none() {
-                if backend.ctx.webstack_enabled {
-                    emit_web_flush_batch(backend, out, indent);
-                }
-                // 2026-08-09 (Phase 10): run deferred cleanup before the firing
-                // exits (term is a successful completion).
+            // 2026-11-01: value terms finish here; bare terms finish only
+            // when their post holds, through emit_bare_term_stop. Publishing
+            // or cleaning up here for a bare term duplicates its commit and
+            // exposes partial state when its post is still false.
+            // Keep deferred cleanup at the same successful firing boundary.
+            // 2026-11-03: a member return also preserves caller cleanup.
+            // Retire this guard with unified inline return lowering.
+            if val.is_some() && backend.fun.inline_member_exit.is_none() {
+                emit_web_flush_batch(backend, out, indent);
                 backend.flush_defer_cleanup(out, indent);
             }
             if let Some(val) = val {
@@ -1978,11 +2008,11 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                 let saved_object_ret = backend.fun.object_return_context;
                 backend.fun.object_return_context = backend.fun.object_out_slot.is_some();
                 let returns_enum = backend.fun.item_return_type.as_ref()
-                    .map(|t| backend.ctx.enum_handle_types.contains(type_bare_name(t)))
+                    .map(|t| backend.is_enum_type_name(type_bare_name(t)))
                     .unwrap_or(false);
                 backend.fun.enum_return_context = backend.fun.enum_out_slot.is_some() || returns_enum;
                 if let Some(t) = backend.fun.item_return_type.clone() {
-                    if backend.ctx.enum_handle_types.contains(type_bare_name(&t)) {
+                    if backend.is_enum_type_name(type_bare_name(&t)) {
                         backend.fun.expected_enum_type = Some(t);
                     }
                 }
@@ -2263,6 +2293,11 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
             // Reset so the false-path (guard condition not met) continues
             // emitting the rest of the body after guard.endN.
             backend.fun.terminated = false;
+            // 2026-11-02: a recursive term in the true branch may emit a
+            // tail-loop backedge. The false branch still reaches later terms;
+            // it must not inherit that backedge and drop their return values.
+            // Retire when each CFG edge carries its own termination state.
+            backend.fun.tail_loop_backedge = false;
             // 2026-08-15 (coll grow-on-full): record the block the emitter is
             // now writing into. The countdown loop's latch phis key their body
             // predecessor on `fun.cur_block` (the FINAL block of the emitted
@@ -2372,24 +2407,10 @@ pub fn emit_statement(backend: &mut LlvmBackend, out: &mut String, stmt: &Statem
                     std::process::exit(1);
                 }
             };
-            let mut carriers = obligations
+            let carriers = obligations
                 .into_iter()
                 .map(|(name, obligation)| (name, Some(obligation)))
                 .collect::<Vec<_>>();
-            // Safety net for generated/macro-expanded bodies whose local
-            // binding never reached R1. The plan remains authoritative for
-            // every name it contains; this scan only prevents an assignment
-            // alloca from landing inside the loop body (invalid dominance for
-            // a value read after the loop).
-            let mut fallback = std::collections::HashSet::new();
-            collect_foreach_assigned(body, &mut fallback);
-            let planned: std::collections::HashSet<String> =
-                carriers.iter().map(|(name, _)| name.clone()).collect();
-            for name in fallback {
-                if !planned.contains(&name) {
-                    carriers.push((name, None));
-                }
-            }
             for (name, obligation) in carriers {
                 let Some(cur) = backend.fun.let_bindings.get(&name).cloned() else {
                     continue;
@@ -3024,7 +3045,10 @@ pub(super) fn emit_array_state_store(
     )
     .ok();
     let elem_llvm = backend.array_element_llvm_type(&inner);
-    if backend.emit_non_scalar_store(out, indent, (&elem, &inner, &elem_llvm), val) { return true; }
+    // 2026-11-03 (Proof 3 condition 2): an array state element outlives the
+    // producing frame — own enum images before storing.
+    let val = own_enum_for_state(backend, out, indent, &val.ty.clone(), val);
+    if backend.emit_non_scalar_store(out, indent, (&elem, &inner, &elem_llvm), &val) { return true; }
     let universe = backend.ctx.type_universe.clone();
     let store_val = backend.ensure_typed_value(
         out,
@@ -3262,6 +3286,16 @@ fn emit_state_store_self_slot(
         writeln!(out, "{}{} = getelementptr {}, ptr {}, i64 0, i64 {}", indent, gep, col_ty, base, row_reg).ok();
         (gep, "i64".to_string())
     };
+    // 2026-11-03 (Proof 3 condition 2): a pooled state column outlives the
+    // producing frame — own enum images before storing.
+    let owned_val;
+    let val: &TypedRegister = match backend.ctx.field_briev_types.get(idx).cloned() {
+        Some(ty) => {
+            owned_val = own_enum_for_state(backend, out, indent, &ty, val);
+            &owned_val
+        }
+        None => val,
+    };
     if backend.llvm_type(&val.ty) == elem_ty {
         writeln!(out, "{}store {} {}, ptr {}", indent, elem_ty, val.name, gep).ok();
     } else {
@@ -3293,6 +3327,13 @@ fn emit_arrow_store_local(
     if backend.ctx.field_index_map.contains_key(name) {
         let fidx = *backend.ctx.field_index_map.get(name).unwrap();
         let fty = backend.ctx.field_types.get(fidx).cloned().unwrap_or_else(|| "i64".to_string());
+        // 2026-11-03 (Proof 3 condition 2): a state field outlives the
+        // producing frame — own enum images before storing.
+        let slot_briev_ty = backend.ctx.field_briev_types.get(fidx).cloned();
+        let val = match slot_briev_ty.as_ref() {
+            Some(ty) => own_enum_for_state(backend, out, indent, ty, val),
+            None => val.clone(),
+        };
         let store_val = backend.ensure_typed_value(
             out, indent, &fty, &val.name, Some(val.ty.clone()),
             backend.ctx.type_universe.clone().as_ref(),

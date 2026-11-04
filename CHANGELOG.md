@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — stabilization (2026-11-02)
+
+### Fixes
+
+- `CStr` boundary values preserve the raw pointer (`CStr -> Data -> Int`); the
+  C/C++/Python/Node/Go bridge and needs-state gates now pass.
+- Entry-plugin done flags run after a terminal bare `term;`; CLI entry no longer
+  livelocks.
+- Precompute effect detection uses the exhaustive AST visitor and treats any
+  call as observable; folded loops no longer drop `Print#` output.
+- `CancelRequested#`/`ClearCancel#` admitted by the LLVM normalizer.
+- Multi-struct `iter_chain<T>` concatenation pinned as a generic-callable-txn
+  gate.
+- Packaged release layouts resolve `lib/` beside `brievc`; extracted-package
+  native hello now compiles and runs.
+
+### Gate state
+
+- `cargo test --all`: PASS with zero ignored tests.
+- Full runtime suite: every row MATCH.
+- Controlled baseline A/B: all rows within tolerance except `ws_frame`, whose
+  pinned baseline speed depends on an invalid dead-callee-frame pointer.
+
+### Known limitations
+
+- `ws_frame` needs an explicit baseline exception or a deliberate re-lock.
+- I11 real browser/server gate passes against the merged app (`d913cbe`) with
+  PostgreSQL 18.6, MovieLens 100K, and Playwright Chromium.
+- GPU/electronics/silicon/SPIR-V surfaces remain experimental.
+
 ## v0.1.0-preview — 2026-10-28
 
 ### Highlights

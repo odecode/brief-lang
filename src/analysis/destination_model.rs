@@ -12,10 +12,7 @@
 // `DestinationOwnershipPlan`; no other code depends on it.
 
 use crate::ast::{EnumVariant, TopLevel, Type};
-use crate::analysis::tail_carrier::{
-    build_tail_carrier_plan, CarrierArgClass as LegacyCarrierArgClass,
-    CarrierInfo, CarrierParam as LegacyCarrierParam,
-};
+use crate::analysis::tail_carrier::build_recursive_carriers;
 use crate::analysis::destination_ownership::{
     CallableKind, DestinationClass as LegacyDestinationClass,
     DestinationOwnershipPlan, EscapeKind, ParamObligation, ResultDestination,
@@ -567,6 +564,8 @@ pub struct EnumDefinitionPlan {
     pub name: String,
     pub type_params: Vec<String>,
     pub variants: Vec<EnumVariantPlan>,
+    /// Source declaration order used for deterministic constructor tag lookup.
+    pub declaration_order: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -940,84 +939,24 @@ pub fn build(items: &[TopLevel], legacy: &DestinationOwnershipPlan) -> Generaliz
     insert_legacy_value_facts(legacy, &mut plan.values);
     plan.sinks = build_sink_plans(legacy);
     plan.tuples = build_tuple_plans(legacy);
-    plan.recursive_carriers = build_recursive_carriers(items, legacy);
+    plan.recursive_carriers = build_recursive_carriers(items);
     populate_hidden_tail_carriers(&mut plan.callables, &plan.recursive_carriers);
     plan
 }
 
-fn build_recursive_carriers(
-    items: &[TopLevel],
-    legacy: &DestinationOwnershipPlan,
-) -> BTreeMap<CallableId, RecursiveCarrierPlan> {
-    let legacy_plan = build_tail_carrier_plan(items);
+fn facts_for_summary<'a>(
+    legacy: &'a DestinationOwnershipPlan,
+    name: &str,
+) -> Option<&'a crate::analysis::destination_ownership::CallableDestinationFacts> {
+    let owners = [
+        format!("defn:{name}"),
+        format!("txn:{name}"),
+        format!("ctxn:{name}"),
+    ];
     legacy
-        .callables
-        .iter()
-        .filter_map(|(name, summary)| {
-            let info = legacy_plan.info(name)?;
-            let callable = callable_id(name, summary.kind);
-            let plan = recursive_carrier_plan(&callable, info);
-            Some((callable, plan))
-        })
-        .collect()
-}
-
-fn recursive_carrier_plan(
-    callable: &CallableId,
-    info: &CarrierInfo,
-) -> RecursiveCarrierPlan {
-    let carriers = info
-        .carriers
-        .iter()
-        .map(|carrier| recursive_carrier_value(callable, carrier))
-        .collect();
-    RecursiveCarrierPlan {
-        callable: callable.clone(),
-        carriers,
-        proof: ProofStatus::Proven {
-            reasons: BTreeSet::from([ProofReason::StableCarrierLifetime]),
-        },
-    }
-}
-
-fn recursive_carrier_value(
-    callable: &CallableId,
-    carrier: &LegacyCarrierParam,
-) -> RecursiveCarrierValue {
-    let arg_classes = carrier
-        .arg_classes
-        .iter()
-        .map(|class| match class {
-            LegacyCarrierArgClass::InlineNested => RecursiveCarrierArgClass::InlineNested,
-            LegacyCarrierArgClass::ExistingCarrier => RecursiveCarrierArgClass::ExistingCarrier,
-            LegacyCarrierArgClass::Unsupported => RecursiveCarrierArgClass::Unsupported,
-        })
-        .collect();
-    RecursiveCarrierValue {
-        parameter: semantic_value(
-            callable,
-            SemanticValueKind::Parameter,
-            &format!("param/{}/{}", carrier.param_index, carrier.param_index),
-            0,
-        ),
-        param_index: carrier.param_index,
-        param_name: carrier.param_name.clone(),
-        result_local: carrier.result_local.clone(),
-        sret_callee: carrier.sret_callee.clone(),
-        arg_classes,
-        carrier: DestinationId {
-            owner: callable.name.clone(),
-            path: format!("recursive/{}/{}", carrier.param_index, carrier.param_name),
-        },
-        class: GeneralDestinationClass::StableCarrier,
-        requires_backedge_copy: carrier
-            .arg_classes
-            .iter()
-            .any(|class| *class == LegacyCarrierArgClass::InlineNested),
-        proof: ProofStatus::Proven {
-            reasons: BTreeSet::from([ProofReason::StableCarrierLifetime]),
-        },
-    }
+        .callables_by_owner
+        .values()
+        .find(|facts| owners.iter().any(|owner| owner == &facts.owner))
 }
 
 fn populate_hidden_tail_carriers(
@@ -1405,17 +1344,19 @@ fn object_type_name(ty: &Type) -> Option<&str> {
 fn build_enum_definitions(items: &[TopLevel]) -> BTreeMap<String, EnumDefinitionPlan> {
     items
         .iter()
-        .filter_map(enum_definition)
+        .enumerate()
+        .filter_map(|(order, item)| enum_definition(item, order))
         .map(|plan| (plan.name.clone(), plan))
         .collect()
 }
 
-fn enum_definition(item: &TopLevel) -> Option<EnumDefinitionPlan> {
+fn enum_definition(item: &TopLevel, declaration_order: usize) -> Option<EnumDefinitionPlan> {
     match item {
         TopLevel::Enum(e) => Some(EnumDefinitionPlan {
             name: e.name.clone(),
             type_params: e.type_params.iter().map(|p| p.name.clone()).collect(),
             variants: e.variants.iter().map(enum_variant_plan).collect(),
+            declaration_order,
         }),
         TopLevel::TypeDef(td) => {
             let variants: Vec<EnumVariantPlan> = td
@@ -1437,9 +1378,10 @@ fn enum_definition(item: &TopLevel) -> Option<EnumDefinitionPlan> {
                 name: td.name.clone(),
                 type_params: td.type_params.iter().map(|p| p.name.clone()).collect(),
                 variants,
+                declaration_order,
             })
         }
-        TopLevel::Export(export) => enum_definition(export.inner.as_ref()),
+        TopLevel::Export(export) => enum_definition(export.inner.as_ref(), declaration_order),
         _ => None,
     }
 }
@@ -2455,6 +2397,29 @@ defn drain(n: Int, q: List<Int>) -> Int {
         );
     }
 
+        #[test]
+    fn every_foreign_binding_has_a_lookupable_boundary() {
+        let (_, plan) = analyze_items(
+            r#"
+frgn one(x: Int) -> Int from "libc";
+frgn two(s: String) from "libc";
+"#,
+        );
+        let foreign: Vec<_> = plan
+            .boundaries
+            .values()
+            .filter(|boundary| boundary.kind == BoundaryKind::ForeignCall)
+            .collect();
+        assert_eq!(foreign.len(), 2);
+        for boundary in &foreign {
+            assert!(
+                plan.foreign_boundary(&boundary.boundary.owner).is_some(),
+                "missing foreign boundary lookup for {}",
+                boundary.boundary.owner
+            );
+        }
+    }
+
     #[test]
     fn foreign_binding_creates_import_boundary_values() {
         let (_, plan) = analyze_items(
@@ -2659,6 +2624,130 @@ defn caller(x: Int) -> Int {
     }
 
     #[test]
+    fn tuple_element_aliases_tuple_lifetime() {
+        let (_, plan) = analyze_items(
+            r#"
+obj P { x: Int; };
+defn make(x: Int) -> (P, Int) {
+    term (P { x: x }, x);
+};
+"#,
+        );
+        let child = plan
+            .object_values
+            .values()
+            .find(|value| value.object == "P")
+            .expect("tuple child object");
+        assert!(child.requires_materialization);
+        assert!(child.escapes.contains(&EscapeKind::TupleLifetime));
+        assert!(!plan
+            .stack_object_types_by_owner()
+            .get("defn:make")
+            .is_some_and(|types| types.contains("P")));
+    }
+
+    #[test]
+    fn collection_element_aliases_collection_lifetime() {
+        let (_, plan) = analyze_items(
+            r#"
+obj P { x: Int; };
+defn make(x: Int) -> List<P> {
+    term [P { x: x }];
+};
+"#,
+        );
+        let child = plan
+            .object_values
+            .values()
+            .find(|value| value.object == "P")
+            .expect("collection child object");
+        assert!(child.requires_materialization);
+        assert!(child.escapes.contains(&EscapeKind::CollectionLifetime));
+        assert!(!plan
+            .stack_object_types_by_owner()
+            .get("defn:make")
+            .is_some_and(|types| types.contains("P")));
+    }
+
+    #[test]
+    fn object_address_escape_blocks_frame_image() {
+        let (_, plan) = analyze_items(
+            r#"
+obj P { x: Int; };
+defn address(x: Int) -> Int {
+    let p: P = P { x: x };
+    let raw: Int = &p;
+    term raw;
+};
+"#,
+        );
+        let escaped = plan
+            .object_values
+            .values()
+            .find(|value| {
+                value.object == "P"
+                    && value.escapes.contains(&EscapeKind::AddressLifetime)
+            })
+            .expect("addressed object");
+        assert!(escaped.requires_materialization);
+        assert!(!plan
+            .stack_object_types_by_owner()
+            .get("defn:address")
+            .is_some_and(|types| types.contains("P")));
+    }
+
+    #[test]
+    fn loop_assigned_parent_field_child_stays_heap_backed() {
+        let (_, plan) = analyze_items(
+            r#"
+obj Child { x: Int; };
+obj Parent { child: Child; };
+defn make(n: Int) -> Parent {
+    let p: Parent = Parent { child: Child { x: 0 } };
+    foreach i in 0..n {
+        p = Parent { child: Child { x: i } };
+    };
+    term p;
+};
+"#,
+        );
+        let child = plan
+            .object_values
+            .values()
+            .find(|value| value.object == "Child" && value.escapes.contains(&EscapeKind::ObjectLifetime))
+            .expect("loop-assigned field child");
+        assert!(child.requires_materialization);
+        assert!(!plan
+            .stack_object_types_by_owner()
+            .get("defn:make")
+            .is_some_and(|types| types.contains("Child")));
+    }
+
+    #[test]
+    fn object_literal_field_aliases_parent_lifetime() {
+        let (_, plan) = analyze_items(
+            r#"
+obj Child { x: Int; };
+obj Parent { child: Child; };
+defn make(x: Int) -> Parent {
+    term Parent { child: Child { x: x } };
+};
+"#,
+        );
+        let child = plan
+            .object_values
+            .values()
+            .find(|value| value.object == "Child")
+            .expect("child object");
+        assert!(child.requires_materialization);
+        assert!(child.escapes.contains(&EscapeKind::ObjectLifetime));
+        assert!(!plan
+            .stack_object_types_by_owner()
+            .get("defn:make")
+            .is_some_and(|types| types.contains("Child")));
+    }
+
+    #[test]
     fn stack_object_types_require_all_aliases_non_escaping() {
         let (_, local) = analyze_items(
             r#"
@@ -2784,67 +2873,6 @@ defn loop(n: Int, state: S, sum: Int) -> Int {
         let callable_plan = &plan.callables[callable];
         assert_eq!(callable_plan.hidden_abi.tail_carriers, 1);
 
-        let items = {
-            let tokens = crate::lexer::tokenize(src).expect("tokenize");
-            let mut parser = crate::parser::Parser::new(tokens, src);
-            parser.parse_program().expect("parse")
-        };
-        let unified = crate::analysis::tail_carrier::build_tail_carrier_plan(&items)
-            .info("loop")
-            .expect("legacy carrier")
-            .carriers
-            .clone();
-        assert_eq!(plan.recursive_carrier_obligations("loop").len(), unified.len());
-        for (obligation, carrier) in plan
-            .recursive_carrier_obligations("loop")
-            .into_iter()
-            .zip(unified)
-        {
-            assert_eq!(obligation.param_index, carrier.param_index);
-            assert_eq!(obligation.param_name, carrier.param_name);
-            assert_eq!(obligation.result_local, carrier.result_local);
-            assert_eq!(obligation.sret_callee, carrier.sret_callee);
-            assert_eq!(obligation.arg_classes.len(), carrier.arg_classes.len());
-        }
-    }
-
-    #[test]
-    fn loop_engine_plans_join_shape_and_storage() {
-        let src = r#"
-let count: Int = 0;
-let acc: Int = 0;
-let scratch: Int = 0;
-node run [count < 4][count == 4] {
-    acc = acc + count;
-    scratch = count * 2;
-    count = count + 1;
-};
-"#;
-        let tokens = crate::lexer::tokenize(src).expect("tokenize");
-        let mut parser = crate::parser::Parser::new(tokens, src);
-        let items = parser.parse_program().expect("parse");
-        let graph = crate::analysis::transition_graph::ReactorTransitionGraph::build(
-            &items,
-            &None,
-            &vec![],
-        );
-        let shapes = crate::analysis::loop_shape::build_loop_shapes(&graph, &items, 4);
-
-        let mut rebuilt = crate::analysis::destination_ownership::analyze(&items).generalized;
-        crate::analysis::destination_model::attach_loop_engine_plans(
-            &mut rebuilt,
-            &shapes,
-        );
-        let engine = rebuilt.loop_engines.get("run").expect("loop engine");
-        assert_eq!(engine.counter, "count");
-        assert!(engine
-            .fields
-            .values()
-            .any(|field| field.representation == LoopFieldRepresentation::StateCarrier));
-        assert_eq!(
-            engine.fields.get("scratch").map(|field| field.representation),
-            Some(LoopFieldRepresentation::Dead)
-        );
     }
 
     #[test]

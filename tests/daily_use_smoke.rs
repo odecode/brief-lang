@@ -24,6 +24,16 @@ fn has(cmd: &str) -> bool {
     Command::new(cmd).arg("--version").output().is_ok()
 }
 
+/// Text of the function containing `sig` (from its `define` to the closing
+/// brace). Used to scope IR assertions (e.g. no @free in the arena-owning
+/// function) without rejecting legitimate frees in the print helpers.
+fn function_text<'a>(ir: &'a str, sig: &str) -> &'a str {
+    let start = ir.find(sig).and_then(|p| ir[..p].rfind("define ")).unwrap_or(0);
+    let rest = &ir[start..];
+    let end = rest.find("\n}").map(|e| e + 2).unwrap_or(rest.len());
+    &rest[..end]
+}
+
 /// Program surface = the fixture declares a `node`/`txn` entry (comment
 /// lines stripped so a mention in prose does not misclassify).
 fn is_library_surface(src: &str) -> bool {
@@ -38,11 +48,30 @@ fn is_library_surface(src: &str) -> bool {
     code.contains("export defn") && !code.contains("node ") && !code.contains("txn ")
 }
 
+#[derive(Clone, Copy)]
+enum LinkProfile {
+    Harness,
+    Asan,
+    /// ASan with inlining disabled: exposes stack-image use-after-return that
+    /// -O1 inlining can mask (the escaping image is otherwise hoisted into a
+    /// longer-lived frame and survives by accident).
+    AsanNoInline,
+}
+
 /// Build + link + run one program-surface fixture. Returns stdout and asserts
 /// every stage; `env` pairs are set on the run (not the build). `slot` makes
 /// the out dir unique per caller — cargo runs tests in parallel, and two
 /// callers sharing one exe path race (one hits "Text file busy").
 fn build_link_run(name: &str, slot: &str, env: &[(&str, &str)]) -> String {
+    build_link_run_profile(name, slot, env, LinkProfile::Harness)
+}
+
+fn build_link_run_profile(
+    name: &str,
+    slot: &str,
+    env: &[(&str, &str)],
+    profile: LinkProfile,
+) -> String {
     let brievc = env!("CARGO_BIN_EXE_brievc");
     let out_dir = Path::new(PROJECT_ROOT)
         .join("target/briev_daily_use_smoke")
@@ -73,20 +102,44 @@ fn build_link_run(name: &str, slot: &str, env: &[(&str, &str)]) -> String {
 
     let ll = out_dir.join(format!("{name}.ll"));
     let exe = out_dir.join(name);
-    let link = Command::new("clang")
-        .args([
-            "-O3",
-            "-flto",
-            "-march=native",
-            "-ffast-math",
-            "-fdata-sections",
-            "-ffunction-sections",
-            "-Wl,--gc-sections",
-            &ll.to_string_lossy(),
-            &format!("{PROJECT_ROOT}/lib/runtime/briev_rt.c"),
-            "-o",
-            &exe.to_string_lossy(),
-        ])
+    let mut link = Command::new("clang");
+    match profile {
+        LinkProfile::Harness => {
+            link.args([
+                "-O3",
+                "-flto",
+                "-march=native",
+                "-ffast-math",
+                "-fdata-sections",
+                "-ffunction-sections",
+                "-Wl,--gc-sections",
+            ]);
+        }
+        LinkProfile::Asan => {
+            link.args([
+                "-O1",
+                "-g",
+                "-fsanitize=address",
+                "-fno-omit-frame-pointer",
+                "-march=native",
+            ]);
+        }
+        LinkProfile::AsanNoInline => {
+            link.args([
+                "-O0",
+                "-g",
+                "-fsanitize=address",
+                "-fno-omit-frame-pointer",
+                "-fno-inline",
+                "-march=native",
+            ]);
+        }
+    }
+    let link = link
+        .arg(&ll)
+        .arg(format!("{PROJECT_ROOT}/lib/runtime/briev_rt.c"))
+        .arg("-o")
+        .arg(&exe)
         .output()
         .unwrap_or_else(|e| panic!("{name}: failed to spawn clang: {e}"));
     assert!(
@@ -290,7 +343,156 @@ fn net_stack_helpers_golden_output() {
     );
 }
 
-/// 2026-10-20 (pointer provenance): a raw `Ptr<T>` read in one defn and a
+/// P0 regression: an object literal field aliases its parent's lifetime.
+/// `HttpRequest` is nested in a returned `HttpParse`; D5b must not place the
+/// child in a function-frame image after the parent crosses the return edge.
+#[test]
+fn net_stack_helpers_asan_stack_lifetime() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run_profile(
+        "net_stack_helpers",
+        "asan",
+        &[("ASAN_OPTIONS", "detect_stack_use_after_return=1")],
+        LinkProfile::Asan,
+    );
+    assert_eq!(
+        out, "aGVsbG8=|s3pPLMBiTxaQ9kYGzzhZRbK+xOo=|OK",
+        "net-stack ASan lifetime run drifted: {out:?}"
+    );
+}
+
+/// Proof 3 condition 2 (2026-11-03): a tuple element that is an enum is stored
+/// as a handle in the heap tuple image. The tuple escapes into a list and later
+/// firings read it, so the element must own its image; otherwise the handle
+/// points at the producing frame. `churn` reuses that stack region. Without the
+/// owning fix this SEGVs at -O0 -fno-inline under ASan.
+#[test]
+fn enum_tuple_escape_asan_no_inline() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run_profile(
+        "enum_tuple_escape",
+        "asan_noinline",
+        &[("ASAN_OPTIONS", "detect_stack_use_after_return=1")],
+        LinkProfile::AsanNoInline,
+    );
+    assert_eq!(out, "tuple_enum=true\n", "tuple-enum escape drifted: {out:?}");
+}
+
+/// Arena enablement (2026-11-03): a folded loop with `Alloc#` must select the
+/// bump arena (not @malloc) and sum correctly. Guards the two-pass id
+/// clobbering, the inlined-main arena lifecycle (lazy init), and brk-aware
+/// teardown (no @free on a brk pointer).
+#[test]
+fn arena_folded_loop_uses_arena() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("arena_folded_loop", "arena", &[]);
+    assert_eq!(out, "499500\n", "arena sum drifted: {out:?}");
+    let out_dir = Path::new(PROJECT_ROOT)
+        .join("target/briev_daily_use_smoke/arena_folded_loop__arena");
+    let ir = std::fs::read_to_string(out_dir.join("arena_folded_loop.ll"))
+        .expect("read emitted IR");
+    assert!(
+        ir.contains("aacheck_"),
+        "default Alloc# did not select the bump arena"
+    );
+    let main = function_text(&ir, "@main(");
+    assert!(
+        !main.contains("call void @free"),
+        "brk-backed arena must not be @free'd in the arena-owning function:\n{main}"
+    );
+}
+
+/// Arena scope-lifetime reset (2026-11-03): the safe body resets the arena at
+/// the iteration boundary (`emit_arena_reset` → `arbp` register); the
+/// live-across-iteration body must NOT (the pointer escapes to an outer
+/// state variable), and must still produce the correct sum via the
+/// grow-preserving path.
+#[test]
+fn arena_scope_reset_gate() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let b = [("BOUND", "5000001")];
+    let safe_out = build_link_run("arena_scope_reset", "safe", &b);
+    assert_eq!(safe_out, "12499997500000\n", "safe arena sum drifted: {safe_out:?}");
+    let rejected_out = build_link_run("arena_scope_reset_rejected", "rejected", &b);
+    assert_eq!(rejected_out, "12499997500000\n", "rejected-path sum drifted: {rejected_out:?}");
+    let dir = |name: &str, slot: &str| {
+        Path::new(PROJECT_ROOT)
+            .join("target/briev_daily_use_smoke")
+            .join(format!("{name}__{slot}"))
+            .join(format!("{name}.ll"))
+    };
+    let safe_ir = std::fs::read_to_string(dir("arena_scope_reset", "safe")).expect("safe ir");
+    assert!(safe_ir.contains("arbp"), "safe loop must emit an arena scope reset");
+    let rej_ir = std::fs::read_to_string(dir("arena_scope_reset_rejected", "rejected")).expect("rej ir");
+    assert!(
+        !rej_ir.contains("arbp"),
+        "escaping allocation must NOT get an arena scope reset"
+    );
+}
+
+/// Arena Free# through a cast (2026-11-03): `Free#(a as Ptr<T>)` on an arena-
+/// backed Alloc# must be a no-op (no @free on a brk pointer). The cast emits a
+/// new register, so the allocation strategy must be propagated through it.
+#[test]
+fn arena_free_through_cast_is_noop() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("arena_free_cast", "freecast", &[]);
+    assert_eq!(out, "7", "arena_free_cast output drifted: {out:?}");
+    let out_dir = Path::new(PROJECT_ROOT)
+        .join("target/briev_daily_use_smoke/arena_free_cast__freecast");
+    let ir = std::fs::read_to_string(out_dir.join("arena_free_cast.ll"))
+        .expect("read emitted IR");
+    let main = function_text(&ir, "@main(");
+    assert!(
+        !main.contains("call void @free"),
+        "Free# on an arena allocation must not emit @free in the arena function:\n{main}"
+    );
+}
+
+/// P0 regression: generated/macro-expanded foreach bindings must keep their
+/// alloca in the loop preheader, never in a conditional body. The fixture's
+/// HashMap probe previously produced invalid dominance IR here.
+#[test]
+fn generated_foreach_binding_keeps_entry_slot() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("test_hashmap_rehash", "foreach-dominance", &[]);
+    assert!(
+        out.contains("10") && out.contains("80"),
+        "hashmap rehash output missing expected values: {out:?}"
+    );
+}
+
+/// P3 regression: a tuple element aliases the tuple lifetime. The object
+/// child must stay heap-backed across the return edge.
+#[test]
+fn tuple_object_alias_golden_output() {
+    if !has("clang") {
+        eprintln!("SKIP: clang not available");
+        return;
+    }
+    let out = build_link_run("tuple_object_alias", "golden", &[]);
+    assert_eq!(out, "41\n42\n", "tuple object lifetime drifted: {out:?}");
+}
+
+/// 2026-10-20 (pointer provenance): a raw `Ptr<T>` read in one defn and a/// 2026-10-20 (pointer provenance): a raw `Ptr<T>` read in one defn and a
 /// write in a sibling defn must not be reordered by LTO. The first iteration
 /// reads the zero slot; every later iteration reads the previous store. This
 /// pins the behavioral side of the #13 effect-summary fix; #8 on either defn
@@ -453,6 +655,17 @@ fn enum_local_return_golden_output() {
 fn result_object_gate_golden_output() {
     let out = build_link_run("result_object_gate", "golden", &[]);
     assert_eq!(out, "object_unwraps=true\n", "Result object unwrap golden drifted: {out:?}");
+}
+
+/// 2026-11-02 (stability Phase 2): the deferred generic-callable-txn gate.
+/// Two distinct object lists concatenate through `iter_chain<T>`, whose
+/// callable txn `iter_chain_loop<T>` must keep each list's element type.
+/// A partial specialization port previously made `Count#` see Int; this
+/// concrete multi-struct gate pins the working path.
+#[test]
+fn iter_chain_multi_struct_golden_output() {
+    let out = build_link_run("iter_chain_multi", "iter_chain_multi", &[]);
+    assert_eq!(out, "4\n2\n", "multi-struct iter_chain output");
 }
 
 #[test]

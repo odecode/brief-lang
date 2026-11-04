@@ -33,6 +33,248 @@ docs/2026-08-27-session-report.md).
 
 # Bugs
 
+## `Alloc#` never selects the arena (arena subsystem effectively dead) — FIXED 2026-11-03 (selection)
+
+**Symptom:** `benchmarks/arena_churn.bv` (`let a: Int = Alloc#(64) as Int;` in a
+reactive node) lowers to `call ptr @malloc`, never the bump arena: no
+`aacheck_`/`aagrow_` labels are emitted. Even the explicit override
+`Alloc#(64, Arena)` lowers to `@malloc`. The benchmark's stated intent ("Alloc#s
+64 bytes from the per-txn arena") is not met; it measures malloc.
+
+**Evidence (IR inspection, 2026-11-03):**
+- `arena_churn.ll`: `%t35_p = call ptr @malloc(i64 ...)`, `aacheck_` count 0,
+  while arena init (`brk`) is present — so the arena is initialized but unused.
+- `emit_alloc` (`src/backend/llvm/intrinsics.rs`) consults
+  `analysis_alloc_strategies` and **returns inside that match before** the
+  `if args.len() >= 2` explicit-strategy check — contradicting its own comment
+  ("explicit user override takes priority over analysis"). An analysis-assigned
+  strategy therefore shadows `Alloc#(size, Arena)`.
+- `src/analysis/allocation.rs` never constructs a `DagNode::Call`
+  (the `Call` escape arm at ~:203 is dead), and the `Alloc#` producer is linked
+  to its binding only when the initializer is a bare `Expr::Call("Alloc#")`;
+  `Alloc#(...) as T` is a `Cast`, so the producer is not linked and escape
+  analysis is inconsistent. The exact path that resolves the default
+  `Alloc#(64)` to `Malloc` must be pinned by instrumentation.
+
+**Impact:** per-worker arenas (lifetime plan Phase 1) and the arena strategy
+deliver no value until the arena is actually selected; `arena_churn` cannot
+monitor the arena; `Alloc#`'s "max efficient default" (Rule 2) is not met.
+
+**Fix candidates:** (a) move the explicit strategy-arg check before the
+analysis lookup; (b) construct `DagNode::Call` with correct per-intrinsic
+escape semantics (address vs value; `Store#`/`Load#`/`Copy#` do not retain the
+address); (c) see through casts when linking an `Alloc#` producer to its
+binding; (d) add IR tests asserting `arena_churn` uses `aacheck_`/the arena.
+
+**Root-cause detail (2026-11-03 investigation):** `analyze_alloc_strategies`
+and `analyze_arena_need` both run the DAG and both stamp `Expr::Call(Alloc#)`
+ids onto the AST, with different counters (global vs per-function). The second
+pass (`analyze_arena_need`) overwrites codegen's ids, so codegen looks up the
+wrong strategy and selects `Malloc`. Instrumentation confirmed
+`strategy=Some(Malloc)` for the in-txn allocation whose analysis default was
+`Arena`. Fixing only this (make `analyze_arena_need` not stamp) makes the
+arena get selected — and then exposes four further latent defects, so the
+arena must be fixed as one pass, not one at a time:
+1. **Direct-SSA main never initializes the arena** (`emit_ssa_main` inlines
+   txn bodies without `emit_arena_init`), so an arena alloc grows from a zero
+   base and calls `brk(0+size)` → bogus pointer/segfault.
+2. **`emit_arena_fini` calls `@free` on a `brk`-backed base** — invalid free
+   (the region was never malloc'd). Needs a brk-aware teardown (shrink the
+   break or no-op).
+3. **Arena grow resets the bump to base**, overwriting live arena data rather
+   than extending in place.
+4. **Enabling arena allocation in a folded countdown loop produces invalid IR**
+   ("PHI node entries do not match predecessors"): the arena alloc's
+   check/grow/ok blocks change the actual predecessor, but the countdown phi
+   still names its precomputed body label. This is the blocker that stops a
+   naive enable: arena allocation emits control flow that the loop's phi
+   predecessor bookkeeping does not account for.
+
+**Defect-4 resolution (2026-11-03): reuse the existing wheel.** The loop
+emitters already solve this with dedicated latch/end blocks and by capturing
+the actual final block from `cur_block` (`body_final`/`guard_pred`,
+`counter.rs:986`/`:1074`). Only two sites hardcode the body label: the
+version-DAG header phis (`:1442`/`:1473`, bodies branch to `header_label` from
+their final block at `:1571`/`:1611`) and the merge phi at `:2061`. Fix: add
+`*.latch_end`/`*.present_end` trampolines to the version-DAG and use the
+captured final block in the merge phi. **Rejected:** an out-of-line
+`@__briev_arena_alloc` helper (option B) — a second mechanism for a problem
+the convention already solves, plus a call per allocation. Keep allocation
+inline; add an `AllocStrategy` call variant later only if measured.
+Plan: `docs/plans/2026-11-03-arena-enablement.md`.
+
+**Status:** RESOLVED (selection) 2026-11-03 (`2fad776c`): ids are stamped by
+one pass, the version-DAG uses dedicated end trampolines + captured final
+blocks (IR-safe inline CF), lazy init covers every inlined-body main, and
+fini is brk-aware. `arena_folded_loop` uses `aacheck_` bumps and sums
+correctly; `arena_churn` computes the exact sum with the arena.
+
+**Follow-up (active):** runtime parity + folding —
+`docs/plans/2026-11-03-arena-runtime-parity-and-folding.md`. The arena is
+~1.4x the C arena (338 vs 240ms @50M) due to per-allocation `%state`
+round-trips; the baseline's ~18ms was a legal proof-driven fold. R:
+register-resident bump/end + cold grow (parity). O: dead-allocation
+elimination to keep the fold (restores ~18ms where semantics allow).
+
+## Enum image escapes to state without owning (I11 root cause) — PARTIALLY FIXED 2026-11-03 (state/tuple/closure sinks; boundary gate stays)
+
+**Symptom (root cause of the D4b/I11 `malloc(): invalid next size`):** the
+state-store paths in `src/backend/llvm/emit_stmt.rs` (`Assign` → pooled /
+self / flat-dotted / `field_index_map` → `emit_state_store_i64`) publish an
+enum handle **without calling `own_enum_value`**. An enum image returned by a
+call is an `alloca` in the producing callable's frame (the sret slot); a
+non-txn defn that stores such a value into global/node state leaves the state
+slot pointing into its own **dead frame**. Under the whole-enum boundary gate
+the object payload is boxed (heap), so the dead-frame read usually still
+yields a valid pointer and the bug stays latent. With inline object payloads
+(gate relaxed) the object bytes are inline in the dead frame, so the garbage
+handle produces `malloc(): invalid next size` when later freed/copied.
+
+**Repro (2026-11-03):** `/tmp/opencode/repro/defn_store.bv` —
+`defn build_and_store() { let local: Box = make_box(42); saved = local; ... }`
+then a later firing reads `saved`.
+
+- Relaxed gate, `-O0 -fno-inline -fsanitize=address`: prints garbage
+  `94680470082656`.
+- Gate ON: prints `42` (latent UAF, not proven safe).
+- Hand-inserting `malloc+memcpy` (an `own_enum_value` equivalent) before the
+  relaxed state store makes it print `42` — root cause confirmed.
+
+**IR evidence:** `build_and_store` emits `%esrt = alloca i64, 3;
+%t = call i64 @make_box(ptr %esrt); store i64 %t, ptr %state.saved` — no
+`own_enum_value` between the call and the state store.
+
+**Not layout divergence:** minimal shapes are layout-consistent; the
+`enum_lowering` validators enforce agreement. The divergence hypothesis is
+unconfirmed for these shapes.
+
+**Fix:** implement Proof 3 condition 2 — materialize enum images to owned
+storage at every sink that can outlive the producing frame: state stores
+(confirmed gap), call arguments to retaining callees, closure captures,
+cross-node publication, and returns; otherwise prove the producing frame
+outlives the sink. Until then the whole-enum boundary gate stays mandatory.
+
+**Progress 2026-11-03:** corrected sinks — **state stores** (`Assign`
+pooled / self-slot / plain-let / `field_index_map` /
+`emit_state_store_self_slot` / `emit_array_state_store` / arrow store via
+`own_enum_for_state`), **tuple elements**
+(`emit_tuple_materialize`), and **both closure-env sites**
+(`Expr::Lambda` in `emit_expr.rs` and the `let g = x -> …` arm in
+`emit_stmt.rs`). Regressions: `enum_state_store_owns_image_before_publishing`,
+`tuple_element_enum_is_owned_before_storing`,
+`closure_let_capture_enum_is_owned`, `enum_tuple_escape_asan_no_inline`.
+Validated under relaxation: `defn_store.bv` prints `42` (was garbage);
+`state_enum`/`alias_enum`/`nested_enum` correct. Call-argument retention
+resolves at the callee's sink (now owning); cross-node publication is the
+state-store sink. **Remaining:** unknown/FFI aggregate sources; **known cost:**
+owned images are malloc'd and not yet reclaimed (owned-value reclamation is
+the lifetime plan, `docs/plans/2026-11-03-lifetime-and-reclamation.md`). The
+boundary gate stays until condition 3 (Phase 7) lands.
+
+**Status:** PARTIALLY FIXED 2026-11-03 (state-store sink); gate removal awaits
+the remaining sinks. Plan: `docs/plans/2026-11-03-ws-frame-fast-path-execution.md`.
+
+## ws_frame benchmark hides checksum errors (even PASSES) — OPEN 2026-11-03
+
+**Symptom:** `benchmarks/ws_frame.bv` accumulates its payload checksum with
+`acc = acc ^ sum` once per tick, and `PASSES` is a compile-time constant. With
+the shipped `PASSES=4` (even), every frame is decoded and XOR-folded four
+times, so `acc ^ s ^ s ^ s ^ s = 0` for **any** implementation — correct or
+broken. The printed first field is therefore always `0`, and the benchmark's
+output-equality gate cannot detect a wrong checksum.
+
+**Evidence (2026-11-03):** rebuilding the identical source at `PASSES=1` shows
+the C reference and the current compiler both print `acc=103005804`, while the
+locked baseline compiler `42279aaf` prints `acc=7441` (wrong) and segfaults on
+a payload-heavy variant. At `PASSES=4` all three print `0016384` and appear
+identical. Full data: `benchmarks/results/2026-11-03-ws-frame-attribution.md`.
+
+**Impact:** performance comparisons against the locked baseline for this
+benchmark are misleading — the baseline's speed is the speed of a truncated
+(buggy) checksum, not a faster correct implementation.
+
+**Fix options (do not silently weaken the benchmark):**
+(a) use an odd `PASSES` (e.g. 3) so `acc = s1^s2^s3 ≠ 0` is
+correctness-sensitive; or (b) replace the XOR accumulator with a sum. Either
+changes the benchmark geometry/results and must be recorded as a dated
+results entry and coordinated with `BASELINE.lock`. Until fixed, any
+`ws_frame` correctness check must run a separate odd-`PASSES` build.
+
+**Status:** OPEN — needs owner decision on (a) vs (b) since it moves the
+benchmark's historical numbers.
+
+## D4b inline enum-object payload miscompiles at -O1 -- FIXED 2026-11-02
+
+**Symptom:** with `OBJECT_PAYLOAD_INLINE_ENABLED = true`, the O1 build of
+`tests/tier1/net_stack_helpers.bv` fails on the third websocket decode
+(`ws_message(two, 0)` inside the `when first...` branch). Depending on
+surrounding statements it either returns a non-`WS_COMPLETE` frame or
+segfaults in `ws_message_complete`; O0/O2/O3 pass.
+
+**Isolation:**
+- D4c hidden object returns were separately disabled: O1 still fails, so this
+  is D4b itself.
+- GDB on the non-crashing instrumented run shows the third frame pointer's
+  payload/header fields garbage; first two frames are correct.
+- Zero-initializing the reserved enum payload area fixed the first two frames
+  (so padding poison is part of the problem) but not the third.
+- ASan with `detect_stack_use_after_return=1` reports no OOB; the failure is
+  optimizer-sensitive undef/lifetime behavior, not a plain overflow.
+- Adding marker stores changes the failure between wrong-result and SIGSEGV,
+  confirming UB rather than deterministic layout math.
+
+**Current mitigation:** `OBJECT_PAYLOAD_INLINE_ENABLED = false`; object payloads
+stay boxed. D4c only accepts non-enum consumers while this is off.
+
+**Follow-up 2026-11-01:** the O1 crash was traced to a tail call in
+`ws_message` passing a frame pointer into its own stack enum image; `notail`
+fixed `net_stack_helpers` at O0–O3. A second independent bug was found: a stale
+`expected_enum_type` (`AdmissionError`) was applied to a constructor from
+another enum (`OperationJob`), selecting the wrong layout. That stale-owner bug
+is fixed and covered by
+`stale_expected_enum_does_not_override_constructor_owner` (it is a correctness
+fix even with D4b off).
+
+Further probe: exact object sizes must be consulted only for entries in the
+planner's object table. An unconditional exact-size lookup treated `List` as an
+inline object and corrupts JSON encoding. Even with that gated, D4b still makes
+the recommender worker report “Worker frame is incomplete; retain the bytes and
+continue reading” (no heap abort, but wrong frame data). This points to a
+remaining escaping match-binding/object-image lifetime gap, not layout width.
+
+**Probe 2026-11-01 (match-binding views):** inline object bindings were kept as
+views only when every use in the arm was a direct call argument; other uses were
+copied to a heap image. With notail + exact sizes + this copy:
+- net_stack: O0–O3 pass.
+- I11 server starts and workers handshake, then later aborts with
+  `malloc(): invalid next size (unsorted)`; browser save-confirmation times out.
+So the syntactic direct-call rule is unsound: a direct callee can retain the
+pointer through state. D4b still needs a parameter-escape summary or full
+materialization at every match binding.
+
+**Resolution 2026-11-02:** contributor PR49 (resolved `TypeUniverse` object
+capacity), PR50 (declared field constructor context), and PR51 (owned extraction
+of inline object payloads) are integrated. The callable-signature boundary gate
+remains required: relaxing it (allowing inline object payloads for internally
+returned enums now that extraction copies) still corrupts I11 with
+`malloc(): invalid next size`. Only wholly callable-local enums may inline. PR51 copies every match-bound inline
+object into owned storage, so the borrowed enum-image pointer class is gone;
+`notail`/selective view machinery is no longer required for correctness. D4b is
+enabled. Validation: net_stack O0–O3, ASan, I11, 3443 lib tests, 32 daily tests,
+determinism, and full runtime all pass. A subsequent copy-elision probe
+(parameter-summary-gated view instead of owned copy) passed correctness but
+regressed controlled `ws_frame` from 1.02x C to 1.13x C, so PR51's unconditional
+owned extraction remains active.
+
+**Historical probe 2026-11-02 (parameter-summary materialization):** with `notail`, exact
+object sizes, and non-retaining parameter summaries, net_stack O0–O3 pass. I11
+still aborts with `malloc(): invalid next size`: the enum value can escape
+without a match binding, carrying the inline object pointer through the enum
+handle. Match-binding materialization alone is insufficient. D4b needs the
+whole-enum non-escape condition before enabling. A first whole-enum gate now
+keeps boxed payloads for any enum crossing a callable parameter/result
+signature; only wholly local enums remain inline-eligible.
+
 ## wasm32 generic list view state and Float/JSON conversion -- PARTIALLY FIXED 2026-10-27
 
 **Generic repro (no recommender names):**
@@ -161,7 +403,7 @@ character that was not alphanumeric/underscore, so `-` ended the event name.
 **Fix:** allow `-` in the event suffix and add
 `b_window_event_name_preserves_hyphens`.
 
-## `JsonValue` Object nested in `Array` loses its payload across a function return -- OPEN 2026-10-26
+## `JsonValue` Object nested in `Array` loses its payload across a function return -- FIXED 2026-11-02
 
 **Symptom:** a constructed protocol payload
 `Object([("operations", Array([Object([...])]))])` stringifies correctly, but
@@ -174,10 +416,10 @@ the app's `operation_store_gate` (`receipt_reply=false` before the workaround).
 Direct Object-in-list-at-top-level works; the corruption appears when the
 Array is itself a field of an Object returned through a call.
 
-**Current workaround:** the app serializes the receipt payload and reparses it
-at the wire boundary (`persistence_worker_receipt_payload`), which restores the
-canonical representation. Do not treat this as the fix: the copy path must be
-repaired so constructed nested arrays behave like parsed ones.
+**Fixed 2026-11-02:** with the app workaround removed, the
+`operation_store_gate` passes (`receipt_reply=true`, `receipt_retention=true`).
+The owned enum/collection extraction and push fixes preserve the nested object
+payload. The app workaround can be deleted.
 
 ## `clang -O3 -flto` segfaults on the recommender active-profile gate -- FIXED 2026-10-26
 
@@ -9039,19 +9281,10 @@ undefined `err_char`; single-wrap the Array/Object frames; list append via
 6. (Consequence) `lib/std/json.bv` header + migration; not yet reachable.
 
 **OPEN:**
-- **`list_concat` intrinsic binding has no lowering.** The typechecker
-  resolves `List<T> + List<T>` to `OpBinding::Intrinsic("list_concat")`
-  (SPEC §2615) but nothing implements it — the backend falls through to
-  integer add, so `[1,2] + [3]` yields count 1. json.bv migrated to
-  `list <- elem`. Fix: a lowering (or a stdlib `list_concat` the binding
-  dispatches to).
-- **Char cast lane mis-typed.** `let c: Char = char_at(...); c as Int`
-  emits `trunc i64 <i32 reg> to i32` (invalid IR). Instrumented: the
-  cast sees `src_ty = Custom("Data")`, not `Custom("Char")` — the Char
-  binding/return resolves to the Data protocol variant, so the path
-  `Data→Char→Int` truncs a native i32. `char_at` is therefore unusable
-  from Briev code until the Char protocol's default variant / native
-  width is consistent. Blocks json.bv end-to-end.
+- **`list_concat` intrinsic binding has no lowering. — FIXED 2026-11-02.**
+  `[1,2] + [3]` now produces `len=3` and values `1,2,3` (probe).
+- **Char cast lane mis-typed. — VERIFIED FIXED 2026-11-02.** JSON
+  parse/stringify gates and the interpreter Char/cast tests pass.
 
 ## json.bv round 2 — callable `txn` convergence is linear (blocks json runtime) + 6 more codegen fixes 2026-10-05 [LEDGER 2026-10-06: RESOLVED]
 
@@ -10816,7 +11049,7 @@ had it.
 (-O3 -flto -ffast-math). Full harness 79/79 MATCH, zero MISMATCH;
 3185 lib tests green; determinism clean.
 
-## 2026-10-20 — interpreter: callable Briev txns are not executed (OPEN)
+## 2026-10-20 — interpreter: callable Briev txns are not executed (FIXED 2026-11-02)
 
 **Symptom:** a `txn` invoked as a FUNCTION (callable txn) does not execute in
 the interpreter; the calling node reaches equilibrium without `endprogram`.
@@ -10830,11 +11063,11 @@ delegates to a callable txn (PR #26's `base64_encode` → `b64_loop`). The
 COMPILED backend executes it correctly (canonical Base64 vectors pass through
 the pipeline — tests/tier1/net_stack_helpers.bv). Rule-5 divergence.
 
-**Next step:** teach the interpreter's call resolution to execute a
-body-carrying `Transaction` like a `defn` (bind params, run body, return
-`term`), matching the backend's callable-txn support.
+**Fixed 2026-11-02:** `tests/interpreter_callable_txn.rs` passes 22/22,
+including `b64_loop`, raw-address→String, 7000-byte `ws_encode`, and callable
+txns. The interpreter now executes body-carrying transactions like `defn`s.
 
-## 2026-10-20 — interpreter: raw-address→String door unsupported (OPEN)
+## 2026-10-20 — interpreter: raw-address→String door unsupported (FIXED 2026-11-02)
 
 **Symptom:** `(addr as Data) as String` (constructing a Briev String at a raw
 heap address with a `[len][bytes]` header) yields a non-Int, non-String
@@ -10938,7 +11171,7 @@ writes key bytes 0..3 when MASK is set and then copies the payload.
 Regression pin: the `scenario_rt` encode round-trip in
 `tests/ws_frame_codec_parity.rs` (7-bit + 16-bit forms, masked and plain).
 
-## 2026-10-20 — interpreter: large ws_encode payload fails in the reactor path (OPEN)
+## 2026-10-20 — interpreter: large ws_encode payload fails in the reactor path (FIXED 2026-11-02)
 
 **Symptom:** encoding a 7000-byte payload through a node body fails with
 `HeapError("Load# read failed")` at addr 0; the IDENTICAL body executed
@@ -11346,13 +11579,17 @@ callback to an IntToPtr representation cast. Applied wholesale, `test_bit_to_str
 and `test_bit_to_string_encoding_door` fail: Bit→String no longer materializes
 the `[len][bytes]` header. Keep the current encoding lane; adapt the app instead.
 
-## Generic callable transaction specialization deferred (OPEN 2026-10-25)
+## Generic callable transaction specialization (VERIFIED 2026-11-02)
 
-A partial port of `generic_txns` plus txn specialization worklist made a concrete
-`iter_chain` probe lose its list type (`Count#`/`.^Length` saw `Int`). The
-compiler regressed before the app catalogue gate could run. Deferred until the
-frontend type substitution and txn worklist are ported together and gated by a
-multi-struct catalogue concatenation fixture.
+A partial port of `generic_txns` plus a txn specialization worklist made a
+concrete `iter_chain` probe lose its list type (`Count#`/`.^Length` saw `Int`).
+That partial port stays out.
+
+The required gate now passes on the existing path:
+`tests/tier1/iter_chain_multi.bv` concatenates `List<A>` and `List<B>` through
+`iter_chain<T>`/`iter_chain_loop<T>` and prints `4` and `2`;
+`daily_use_smoke::iter_chain_multi_struct_golden_output` pins it. No
+specialization rewrite is needed for this shape.
 
 
 ## Portable cast path emits i32 Int64 constants (FIXED 2026-10-25)
@@ -11391,30 +11628,48 @@ stores and Bool coercion used i32, producing `store i32 %ac3` / `trunc i32` on
 i64 registers. Stores now use the declared field type and coercions use the
 physical width. Regression: `bool_param_struct_wasm.rbv`.
 
-## C-driven bridge and CLI entry tests quarantined for v0.1 (OPEN 2026-10-25)
+## C-driven bridge and CLI entry tests (RESOLVED 2026-11-02)
 
 The first full `cargo test --all` stabilization run found failures outside the
-Tier 1 compiler path. They are quarantined, not deleted; the non-blocking CI
-lane still executes them.
+Tier 1 compiler path. All are fixed and unignored; none remain quarantined.
 
-| Test | Observed |
-|---|---|
-| `boundary_types_roundtrip` | `greet` empty, `join` null from a C caller |
-| `cpp_roundtrip` | driver exits non-zero after C boundary check |
-| `host_cancellation_stops_briev_loop` | `CancelRequested#` unsupported by LLVM normalizer |
-| `needs_state_pass_matches_reference` | Briev pass returns 0, Rust reference 31 for `node_bridge.bv` |
-| `python_node_cross_language_bridge` | Node save/persist returns empty |
-| `python_native_extension_roundtrip` | `greet("world")` returns empty |
-| `go_roundtrip` | generated Go bridge references undefined `@cstr_len` |
-| `entry_cmd_greet_quiet` / `entry_cmd_greet_verbose_name` | build/link/run hangs >60s |
+Verification 2026-11-02: `boundary_types_roundtrip`, `c_driver_needs_state`,
+`cpp_roundtrip`, `python_native_extension_roundtrip`, and
+`python_node_cross_language_bridge` are FIXED and unignored. Root cause for the
+bridge family: a `CStr` boundary value is a raw pointer; casting it through
+`String` parsed the allocation header instead of preserving the pointer. The
+examples and the Briev needs_state pass now use `CStr → Data → Int` before
+`cstr_to_briev`/`SysCall#`. CLI entry tests are FIXED and unignored: the
+entry plugin appended its one-shot done flag after the body, but a trailing
+bare `term;` branched away before it; a terminal bare term is now removed so
+the flip executes. C cancellation is FIXED and unignored: `CancelRequested#`
+and `ClearCancel#` had working LLVM arms but were missing from the normalizer
+supported set. Go roundtrip is FIXED and unignored: the `cstr_len` import gap
+closed, and the gate passes with Go 1.22.12 installed. The gate remains
+toolchain-guarded and skips cleanly when Go is absent.
 
-Removal conditions:
-- C string return/ownership fixed or the C bridge explicitly retired;
-- `CancelRequested#` supported or the driver retired;
-- needs-state Briev pass matches Rust on the corpus;
-- Python/Node binding strings round-trip;
-- CLI entry tests complete with a bounded timeout.
-Each remains tracked here and in `tests/cli_args_test.rs` / `tests/c_driver_*.rs`.
+All former removal conditions are met.
+
+## Modulo-rotated main omits the dispatch loop (FIXED 2026-11-02)
+
+`cargo test --all` failed on
+`stdout_flush_tail_test::modulo_switch_main_flushes_sub_cap_output`:
+the program printed `0..3` from two nodes partitioned on `count % 2`, but the
+binary printed nothing.
+
+Root cause: the program was misclassified as fully precomputable. The print
+lowers to `Expression(Block([Expression(Call("Print#", ...))]))`; the old
+precompute effect scan only recognized non-`#` calls and its hand-rolled
+expression walker did not descend into `Expr::Block`. The loop was folded to
+final state values, dropping every print.
+
+Fix: precompute effect detection now uses the exhaustive AST visitor and ANY
+call blocks precomputation. Compile-time folding is an optimization; it must
+never discard an observable call. Regression:
+`analysis::region::tests::print_inside_block_blocks_precomputation`.
+
+Evidence: `cargo test --all` is green; the modulo test reaches the runtime
+dispatch loop and prints `0\n1\n2\n3`.
 
 ## Malformed input panics in library lexing (FIXED 2026-10-25)
 
@@ -11480,14 +11735,99 @@ return small enum images by value or consume a lifetime/linearity proof to
 elide the copy.
 
 
-## List<Result> elements alias later enum constructors (OPEN 2026-10-29)
+## List<Result> elements alias later enum constructors (FIXED 2026-11-02)
 
-Building a `List<Result<Int,String>>` with four conditional pushes produces
-`LEN=4`, but index 2 changes from `Ok(2)` to an `Err` value. The current enum
-ABI publishes handles to short-lived constructor images; collection growth /
-later constructors can overwrite or misinterpret those handles. Reproducer:
-`tests/tier1/enum_list_lifetime.bv.known-bug`; ignored regression pin:
-`tests/enum_list_lifetime_regression.rs`.
+Collection insertion now owns enum values: when the element type is an enum,
+the push path calls `own_enum_value` before publishing the handle. A
+caller-owned `%esrt` stack image from `make_result` is copied to owned storage,
+so later constructors cannot overwrite the element.
+
+Regression: `tests/tier1/enum_list_lifetime.bv` +
+`tests/enum_list_lifetime_regression.rs` (unignored). Output:
+`enum_list_lifetime=true`.
+
+
+## FIXED 2026-11-02: enum-object-layout
+
+Plan enum object capacity from resolved sizes and preserve nested object ABI. Regression: nested_object_enum_payload_fits_on_native_and_wasm_targets.
+
+## FIXED 2026-11-02: enum-field-constructor-context
+
+Scope enum constructor context to the declared struct field type. Regression: enum_field_constructor_uses_its_declared_layout_and_restores_context.
+## FIXED 2026-11-02: enum-object-projection-lifetime
+
+Own inline object payloads extracted from temporary enum images. Regression: extracted_enum_objects_survive_the_enum_result_frame.
+## FIXED 2026-11-02: callable-transaction-emission
+
+Emit callable transaction locals inside entry and preserve unique SSA names. Regression: callable_transaction_local_slots_are_inside_the_function.
+## FIXED 2026-11-02: browser-transaction-publication
+
+Publish browser state only at the enclosing successful transaction boundary. Regression: inline_members_do_not_publish_the_enclosing_browser_transaction.
+
+## Concrete bit casts emit invalid LLVM (FIXED 2026-11-03)
+
+String-to-Bits<N> relabelled a pointer register without ptrtoint, while
+widening integer-to-Bits casts emitted trunc. Emit pointer conversion and
+zero extension as required by actual register widths. Encoding constructors
+use the source width or adapt to the declared i64 argument ABI. Covered by
+bit_encoding_override_receives_canonical_storage_word and the browser
+bit_string_roundtrip_wasm fixture.
+
+## Guarded tail recursion discards a later return (FIXED 2026-11-03)
+
+A recursive term inside a when left tail_loop_backedge set on the false
+continuation, so a later terminal call lost its return and defaulted to zero.
+Reset the flag at the guard merge. Regression:
+guarded_tail_backedge_does_not_swallow_later_return. This caused wasm float
+formatting to display zero for valid recommender prediction scores.
+
+## FIXED 2026-11-03: discarded enum payload allocations
+
+`Present(_)` allocated an owned copy of its inline object payload although no
+binding could use it. `bind_pattern` now leaves all-wildcard payloads untouched
+while retaining variant tag checks. Zero-payload variants likewise need no
+payload read. The allocation-count native regression checks O0 and O3. Named
+payload ownership and general returned-value reclamation are unchanged.
+
+## FIXED 2026-11-03: enum result address incorrectly declared nocapture
+
+The caller-owned enum result address is returned as an integer handle. The
+callee therefore captures it, contrary to its LLVM nocapture parameter
+attribute. O3/LTO could remove stores observed through that returned handle.
+Remove only nocapture, preserving noalias, alignment and the existing ABI.
+Native regression compares returned page/tick values with independent getconf
+queries. Controlled IR A/B rejected changes to noalias and memory effects;
+removing nocapture alone corrected the observed corruption.
+
+## FIXED 2026-11-04: native integer printing retained a string per value
+
+Printing a signed integer constructed an owned decimal string, copied the bytes
+to buffered stdout, and lost its backing allocation. Emit the decimal digits
+directly to the existing byte sink. Keeping the magnitude nonpositive covers
+INT64_MIN without overflow. Native allocator and byte-output gates cover
+repeated writes across a flush and the old allocation-count failure.
+
+## FIXED 2026-11-03: indexed collection writes omitted or misrepresented
+
+`holder.values[1] = 7` evaluated the value but emitted no collection store.
+Index writes now dispatch the declared SetAt capability; coll synthesis derives
+a bounds-checked writer. Its ordinary inline member requires a local return
+continuation, correctly coerced arguments and actual dynamic-arm phi predecessors.
+Fixed collections additionally require shared construction/read/write layouts
+for inline records, pointer handles and omitted initialized elements. Native
+regressions cover these boundaries, exactly-once side effects and bounds.
+Interpreter indexed-write parity remains a separate open execution-engine gap.
+
+## FIXED 2026-11-04: collection writer check rejected non-collection indexed places
+
+PR #59 rejected pin-array wiring, dimensioned GPU storage, and parametric
+vector stores in five existing conformance sources. Classify the receiver
+before requiring SetAt. Keep explicit writer signature checks and reject
+const pointers and nominal records without writable storage. Regression
+coverage includes a renamed shape-bearing type and invalid ordinary places.
+Library mode must register declared types before checking these places, so
+shape metadata is visible in every frontend entry. Unresolved element storage
+is admitted only for a type parameter of the enclosing callable.
 
 This is part of the enum value model migration: collection elements must own a
 complete value or an explicitly owned box, never a borrowed constructor slot.
@@ -11587,3 +11927,10 @@ without binding it, leaking the unreachable copy. Binding lowering now skips
 all-wildcard payloads (including zero payloads), retaining tag checks and named
 binding behavior. Native allocation-count regression passes at O0/O3. Broader
 local returned-value reclamation remains open in the collector lifetime plan.
+
+### 2026-11-04 — wasm allocation and abstract member operand widths
+Malloc# emitted i64 addresses while declaring target-width pointers. Reusing
+the allocation lowering keeps address and remaining-length provenance aligned.
+Inline member coercion also widened unresolved element parameters before
+target-width stores. Preserve the actual operand type for abstract parameters.
+The rbv_list_each_wasm corpus reproduces both failures and now passes.

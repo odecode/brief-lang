@@ -976,6 +976,14 @@ impl LlvmBackend {
                 .cloned().unwrap_or_else(|| "0".to_string());
             self.fun.pending_phi_backedge.insert((*fname).clone(), init_val.clone());
         }
+        // 2026-11-03 (arena scope reset): the previous iteration's arena
+        // allocations are proven dead at this boundary, so rewind the bump to
+        // base — sound reuse, bounded memory, no per-allocation growth.
+        if self.arena_ptr_idx.is_some()
+            && self.arena_scope_reset_safe(&batch.inner_body, &batch.guard_body)
+        {
+            self.emit_arena_reset(out, "  ");
+        }
         let mut empty = Vec::new();
         self.emit_countable_body(out, &batch.inner_body, write_set, &mut empty);
         // Countdown: remaining-- (loop-carried, independent of the counter).
@@ -1374,6 +1382,15 @@ impl LlvmBackend {
         let absent_label = format!(".{}_absent", vd_prefix);
         let latch_label = format!(".{}_latch", vd_prefix);
         let present_label = format!(".{}_present", vd_prefix);
+        // 2026-11-03: dedicated backedge trampolines. The bodies can emit inline
+        // control flow (arena bump/grow, when/match, bounds guards), so their
+        // final block is not necessarily `latch_label`/`present_label`. The
+        // header phi's incoming block must be a block known ahead of time and
+        // reached by exactly one `br` — this mirrors the established `.cdl_`
+        // latch convention and the captured-final-block pattern
+        // (`body_final`/`guard_pred` in emit_countable_main).
+        let latch_end_label = format!(".{}_latch_end", vd_prefix);
+        let present_end_label = format!(".{}_present_end", vd_prefix);
         let end_label = format!(".{}_end", vd_prefix);
 
         self.emit_main_header(out, "#0", true);
@@ -1440,8 +1457,8 @@ impl LlvmBackend {
         let be_p_count = be_present_regs.get(&counter_key)
             .cloned().unwrap_or_else(|| self.fun.next_reg_with_prefix("bp"));
         writeln!(out, "  {} = phi {} [ {}, %{} ], [ {}, %{} ], [ {}, %{} ]",
-            counter_name, counter_ty, init_name, init_pred, be_l_count, latch_label,
-            be_p_count, present_label).ok();
+            counter_name, counter_ty, init_name, init_pred, be_l_count, latch_end_label,
+            be_p_count, present_end_label).ok();
         for fname in &sorted_fields {
             if let Some(cv) = counter_var {
                 if fname.as_str() == cv {
@@ -1471,7 +1488,7 @@ impl LlvmBackend {
                 }
                 _ => {
                     writeln!(out, "  {} = phi {} [ {}, %{} ], [ {}, %{} ], [ {}, %{} ]",
-                        phi_f, phi_ty, init_f, init_pred, be_l, latch_label, be_p, present_label).ok();
+                        phi_f, phi_ty, init_f, init_pred, be_l, latch_end_label, be_p, present_end_label).ok();
                     self.fun.phi_field_regs.insert((*fname).clone(), phi_f);
                 }
             }
@@ -1568,6 +1585,8 @@ impl LlvmBackend {
             }
         }
         // 2026-07-31: Exit check is at the header; the latch just backs to it.
+        writeln!(out, "  br label %{}", latch_end_label).ok();
+        writeln!(out, "{}:", latch_end_label).ok();
         writeln!(out, "  br label %{}", header_label).ok();
 
         // ── Guard-present block: [pre] [guard] [post] ───────────────
@@ -1608,6 +1627,8 @@ impl LlvmBackend {
                 }
             }
         }
+        writeln!(out, "  br label %{}", present_end_label).ok();
+        writeln!(out, "{}:", present_end_label).ok();
         writeln!(out, "  br label %{}", header_label).ok();
 
         // ── End: post-loop prints ───────────────────────────────────
@@ -1665,6 +1686,241 @@ impl LlvmBackend {
 
     /// Load the loop bound into a register: from a state field, a const
     /// name, or 0.
+    /// 2026-11-03 (arena scope reset): is it sound to reset the arena at the
+    /// start of each iteration of this bounded body? True iff every Alloc#
+    /// result is bound to a body-local `let` and used ONLY as an argument to a
+    /// known non-retaining intrinsic (so no pointer can survive the iteration
+    /// via a state field, collection, return, or outer variable), and the
+    /// guard body adds no arena allocation that violates the same rule.
+    fn arena_scope_reset_safe(
+        &self,
+        inner: &[crate::ast::Statement],
+        guard: &[crate::ast::Statement],
+    ) -> bool {
+        let mut inner_vars = Vec::new();
+        Self::collect_alloc_vars(inner, &mut inner_vars);
+        if inner_vars.is_empty() {
+            return false;
+        }
+        // Every Alloc# must be a collected body-local let — otherwise an
+        // unbound allocation would be reset without its uses being checked.
+        let inner_allocs: usize = inner.iter().map(Self::count_allocs_stmt).sum();
+        if inner_allocs != inner_vars.len() {
+            return false;
+        }
+        if !inner_vars.iter().all(|v| Self::stmts_use_var_safely(inner, v)) {
+            return false;
+        }
+        // Guard allocations must obey the same rule (or be absent).
+        let mut guard_vars = Vec::new();
+        Self::collect_alloc_vars(guard, &mut guard_vars);
+        guard_vars.iter().all(|v| Self::stmts_use_var_safely(guard, v))
+    }
+
+    fn expr_has_alloc(e: &crate::ast::Expr) -> bool {
+        use crate::ast::Expr;
+        match e {
+            Expr::Call(n, _, _) if n == "Alloc#" => true,
+            Expr::Call(_, args, _) => args.iter().any(Self::expr_has_alloc),
+            Expr::BinaryOp(_, l, r) => Self::expr_has_alloc(l) || Self::expr_has_alloc(r),
+            Expr::UnaryOp(_, x) | Expr::Cast(x, _) | Expr::IsType(x, _) | Expr::Deref(x)
+            | Expr::AddrOf(x) | Expr::Consume(x) | Expr::Await(x) | Expr::Field(x, _) => {
+                Self::expr_has_alloc(x)
+            }
+            Expr::Index(x, i) => Self::expr_has_alloc(x) || Self::expr_has_alloc(i),
+            Expr::Tuple(xs) | Expr::List(xs) => xs.iter().any(Self::expr_has_alloc),
+            Expr::If(c, t, el) => {
+                Self::expr_has_alloc(c)
+                    || Self::expr_has_alloc(t)
+                    || el.as_ref().map(|x| Self::expr_has_alloc(x)).unwrap_or(false)
+            }
+            Expr::Block(stmts) => stmts.iter().any(Self::stmt_has_alloc),
+            Expr::Match(x, arms) => {
+                Self::expr_has_alloc(x) || arms.iter().any(|a| Self::expr_has_alloc(&a.body))
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_has_alloc(st: &crate::ast::Statement) -> bool {
+        use crate::ast::Statement;
+        match st {
+            Statement::Let { expr: Some(e), .. } => Self::expr_has_alloc(e),
+            Statement::Assign(_, e) => Self::expr_has_alloc(e),
+            Statement::ArrowAssign { value, .. } => Self::expr_has_alloc(value),
+            Statement::Expression(e) | Statement::Term(Some(e)) | Statement::EndProgram(Some(e))
+            | Statement::Tail(e) | Statement::Check(e) => Self::expr_has_alloc(e),
+            Statement::Guarded(c, b) => Self::expr_has_alloc(c) || b.iter().any(Self::stmt_has_alloc),
+            Statement::Block(b) | Statement::Defer(b) | Statement::Mutex(b) | Statement::SyncBlock(b) => {
+                b.iter().any(Self::stmt_has_alloc)
+            }
+            Statement::Foreach { list, body, .. } => {
+                Self::expr_has_alloc(list) || body.iter().any(Self::stmt_has_alloc)
+            }
+            Statement::Match { expr, arms } => {
+                Self::expr_has_alloc(expr)
+                    || arms.iter().any(|a| a.body.iter().any(Self::stmt_has_alloc))
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_alloc_vars(stmts: &[crate::ast::Statement], out: &mut Vec<String>) {
+        for st in stmts {
+            Self::collect_alloc_vars_stmt(st, out);
+        }
+    }
+
+    fn collect_alloc_vars_stmt(st: &crate::ast::Statement, out: &mut Vec<String>) {
+        use crate::ast::Statement;
+        match st {
+            Statement::Let { name, expr: Some(e), .. } if Self::expr_has_alloc(e) => {
+                out.push(name.clone())
+            }
+            Statement::Guarded(_, b) | Statement::Block(b) | Statement::Defer(b)
+            | Statement::Mutex(b) | Statement::SyncBlock(b) => Self::collect_alloc_vars(b, out),
+            Statement::Foreach { body, .. } => Self::collect_alloc_vars(body, out),
+            Statement::Match { arms, .. } => {
+                for a in arms {
+                    Self::collect_alloc_vars(&a.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn count_allocs_expr(e: &crate::ast::Expr) -> usize {
+        use crate::ast::Expr;
+        match e {
+            Expr::Call(n, args, _) => {
+                (if n == "Alloc#" { 1 } else { 0 })
+                    + args.iter().map(Self::count_allocs_expr).sum::<usize>()
+            }
+            Expr::BinaryOp(_, l, r) => Self::count_allocs_expr(l) + Self::count_allocs_expr(r),
+            Expr::UnaryOp(_, x) | Expr::Cast(x, _) | Expr::IsType(x, _) | Expr::Deref(x)
+            | Expr::AddrOf(x) | Expr::Consume(x) | Expr::Await(x) | Expr::Field(x, _) => {
+                Self::count_allocs_expr(x)
+            }
+            Expr::Index(x, i) => Self::count_allocs_expr(x) + Self::count_allocs_expr(i),
+            Expr::Tuple(xs) | Expr::List(xs) => xs.iter().map(Self::count_allocs_expr).sum(),
+            Expr::If(c, t, el) => {
+                Self::count_allocs_expr(c)
+                    + Self::count_allocs_expr(t)
+                    + el.as_ref().map(|x| Self::count_allocs_expr(x)).unwrap_or(0)
+            }
+            Expr::Block(stmts) => stmts.iter().map(Self::count_allocs_stmt).sum(),
+            Expr::Match(x, arms) => {
+                Self::count_allocs_expr(x)
+                    + arms.iter().map(|a| Self::count_allocs_expr(&a.body)).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    fn count_allocs_stmt(st: &crate::ast::Statement) -> usize {
+        use crate::ast::Statement;
+        match st {
+            Statement::Let { expr: Some(e), .. } => Self::count_allocs_expr(e),
+            Statement::Assign(_, e) => Self::count_allocs_expr(e),
+            Statement::ArrowAssign { value, .. } => Self::count_allocs_expr(value),
+            Statement::Expression(e) | Statement::Term(Some(e)) | Statement::EndProgram(Some(e))
+            | Statement::Tail(e) | Statement::Check(e) => Self::count_allocs_expr(e),
+            Statement::Guarded(c, b) => {
+                Self::count_allocs_expr(c) + b.iter().map(Self::count_allocs_stmt).sum::<usize>()
+            }
+            Statement::Block(b) | Statement::Defer(b) | Statement::Mutex(b) | Statement::SyncBlock(b) => {
+                b.iter().map(Self::count_allocs_stmt).sum()
+            }
+            Statement::Foreach { list, body, .. } => {
+                Self::count_allocs_expr(list)
+                    + body.iter().map(Self::count_allocs_stmt).sum::<usize>()
+            }
+            Statement::Match { expr, arms } => {
+                Self::count_allocs_expr(expr)
+                    + arms
+                        .iter()
+                        .map(|a| a.body.iter().map(Self::count_allocs_stmt).sum::<usize>())
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Every occurrence of `v` must be (transitively) inside a whitelisted
+    /// call's argument list.
+    fn expr_uses_var_safely(e: &crate::ast::Expr, v: &str, allowed: bool) -> bool {
+        use crate::ast::Expr;
+        const NON_RETAINING: &[&str] = &[
+            "Store#", "VolatileStore#", "Load#", "VolatileLoad#", "Copy#", "Fill#", "Memset#",
+        ];
+        match e {
+            Expr::Identifier(n) => n != v || allowed,
+            Expr::Call(name, args, _) => {
+                let a = NON_RETAINING.contains(&name.as_str());
+                args.iter().all(|x| Self::expr_uses_var_safely(x, v, a))
+            }
+            Expr::BinaryOp(_, l, r) => {
+                Self::expr_uses_var_safely(l, v, allowed)
+                    && Self::expr_uses_var_safely(r, v, allowed)
+            }
+            Expr::UnaryOp(_, x) | Expr::Cast(x, _) | Expr::IsType(x, _) | Expr::Deref(x)
+            | Expr::AddrOf(x) | Expr::Consume(x) | Expr::Await(x) | Expr::Field(x, _) => {
+                Self::expr_uses_var_safely(x, v, allowed)
+            }
+            Expr::Index(x, i) => {
+                Self::expr_uses_var_safely(x, v, allowed)
+                    && Self::expr_uses_var_safely(i, v, allowed)
+            }
+            Expr::Tuple(xs) | Expr::List(xs) => {
+                xs.iter().all(|x| Self::expr_uses_var_safely(x, v, allowed))
+            }
+            Expr::If(c, t, el) => {
+                Self::expr_uses_var_safely(c, v, allowed)
+                    && Self::expr_uses_var_safely(t, v, allowed)
+                    && el
+                        .as_ref()
+                        .map(|x| Self::expr_uses_var_safely(x, v, allowed))
+                        .unwrap_or(true)
+            }
+            Expr::Block(stmts) => Self::stmts_use_var_safely(stmts, v),
+            _ => true,
+        }
+    }
+
+    fn stmts_use_var_safely(stmts: &[crate::ast::Statement], v: &str) -> bool {
+        use crate::ast::Statement;
+        for st in stmts {
+            let ok = match st {
+                Statement::Let { expr: Some(e), .. } => Self::expr_uses_var_safely(e, v, false),
+                Statement::Assign(_, e) => Self::expr_uses_var_safely(e, v, false),
+                Statement::ArrowAssign { value, .. } => Self::expr_uses_var_safely(value, v, false),
+                Statement::Expression(e) | Statement::Term(Some(e))
+                | Statement::EndProgram(Some(e)) | Statement::Tail(e) | Statement::Check(e) => {
+                    Self::expr_uses_var_safely(e, v, false)
+                }
+                Statement::Guarded(c, b) => {
+                    Self::expr_uses_var_safely(c, v, false) && Self::stmts_use_var_safely(b, v)
+                }
+                Statement::Block(b) | Statement::Defer(b) | Statement::Mutex(b)
+                | Statement::SyncBlock(b) => Self::stmts_use_var_safely(b, v),
+                Statement::Foreach { list, body, .. } => {
+                    Self::expr_uses_var_safely(list, v, false)
+                        && Self::stmts_use_var_safely(body, v)
+                }
+                Statement::Match { expr, arms } => {
+                    Self::expr_uses_var_safely(expr, v, false)
+                        && arms.iter().all(|a| Self::stmts_use_var_safely(&a.body, v))
+                }
+                _ => true,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+
     fn emit_countable_load_bound(
         &mut self,
         out: &mut String,
@@ -2039,7 +2295,20 @@ impl LlvmBackend {
                     self.fun.txn_counter += 1;
                     writeln!(out, "  br i1 {}, label %{}, label %{}", bool_reg, body_label, next_label).ok();
                     writeln!(out, "{}:", body_label).ok();
+                    // 2026-11-03: the merge phi below uses the body's ACTUAL
+                    // final block. Seed cur_block with the body label so a
+                    // body with no inline control flow resolves to `.cmgbN`
+                    // (not the pre-guard block, which was a duplicate
+                    // predecessor); inline CF advances it to the real block.
+                    self.fun.cur_block = Some(body_label.clone());
                     self.emit_countable_body(out, stmts, write_set, hoisted);
+                    // 2026-11-03: the body may have inserted inline control
+                    // flow (arena bump/grow, when/match); the merge phi's
+                    // predecessor is the body's ACTUAL final block, not the
+                    // precomputed `body_label`. Capture it before the `br`
+                    // below (same pattern as body_final/guard_pred).
+                    let body_actual = self.fun.cur_block.clone()
+                        .unwrap_or_else(|| body_label.clone());
                     // Snapshot what the BODY wrote, keyed by field, BEFORE the
                     // merge phis (their inputs come from this block).
                     let mut written: Vec<(String, String)> = Vec::new();
@@ -2059,7 +2328,7 @@ impl LlvmBackend {
                             .unwrap_or_else(|| "0".to_string());
                         let mrg = self.fun.next_reg_with_prefix("cmgm");
                         writeln!(out, "  {} = phi {} [ {}, %{} ], [ {}, %{} ]",
-                            mrg, ty, v, body_label, old_v, pre_guard_block).ok();
+                            mrg, ty, v, body_actual, old_v, pre_guard_block).ok();
                         self.fun.pending_phi_backedge.insert(f.clone(), mrg);
                     }
                     for (f, v) in &self.fun.last_val_temps {

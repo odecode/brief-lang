@@ -1126,7 +1126,7 @@ impl LlvmBackend {
                 return format!("i{}", self.ctx.int_bits);
             }
             // 2026-08-26 (Track B): an enum value is the boxed-image handle.
-            if self.ctx.enum_handle_types.contains(name) {
+            if self.is_enum_type_name(name) {
                 return format!("i{}", self.ctx.int_bits);
             }
             if self.ctx.struct_types.contains_key(name) {
@@ -1141,7 +1141,7 @@ impl LlvmBackend {
                 return format!("i{}", self.ctx.int_bits);
             }
             // 2026-08-26 (Track B): an enum value is the boxed-image handle.
-            if self.ctx.enum_handle_types.contains(name) {
+            if self.is_enum_type_name(name) {
                 return format!("i{}", self.ctx.int_bits);
             }
         }
@@ -5835,6 +5835,10 @@ fn probe_ok_checks(
     }
 
     pub(super) fn emit_callable_txn(&mut self, out: &mut String, txn: &crate::ast::Transaction, name: &str) {
+        // 2026-11-01: entry allocas and body registers share one namespace.
+        // Reset before emitting either; a later reset can reuse entry names.
+        // Retire when function construction owns a dedicated register allocator.
+        self.fun.txn_counter = 0;
         // 2026-07-27: Set txn_name for per-function arena gating.
         self.fun.txn_name = name.to_string();
         self.fun.destination_owner = Some(format!("txn:{name}"));
@@ -5878,7 +5882,9 @@ fn probe_ok_checks(
         // before the parameter slots bind (:pN_s / let_bindings below), so a
         // body let shadows nothing and params win any collision exactly as
         // before. Default opts: this driver's selective clears above stand.
-        self.emit_body_prologue(out, &txn.body, PrologueOpts::default());
+        // 2026-11-01: Emit this prologue inside entry, below; reassigned lets
+        // allocate stack storage and cannot appear between function definitions.
+        // Keep it before parameter binding; retire with a unified function builder.
 
         let has_return = if let Some(ref ot) = txn.output_type {
             match ot {
@@ -5950,6 +5956,7 @@ fn probe_ok_checks(
         // only accesses memory through its pointer arguments.
         writeln!(out, ") local_unnamed_addr #8{} {{", inline_str).ok();
         writeln!(out, "  entry:").ok();
+        self.emit_body_prologue(out, &txn.body, PrologueOpts::default());
 
         // 2026-07-18: Use the function's return type for %result, not always i64.
         // Bool-returning functions need i8 result type to match the define i8 signature.
@@ -6059,7 +6066,6 @@ fn probe_ok_checks(
         self.fun.callable_txn_result = Some("%result".to_string());
         self.fun.callable_txn_post_label = Some("post".to_string());
         self.fun.in_callable_txn = true;
-        self.fun.txn_counter = 0;
         self.fun.terminated = false;
         self.fun.returns_i64 = has_return;
 
@@ -6558,6 +6564,21 @@ fn sig_number(name: &str) -> i32 {
     }
 }
 
+struct ExportWrapperArgs<'a> {
+    definition: &'a crate::ast::Definition,
+    needs_state: bool,
+    boundary_types: Option<&'a [String]>,
+    has_prefix: bool,
+}
+
+struct ExportWrapperCallSpec<'a> {
+    definition: &'a crate::ast::Definition,
+    needs_state: bool,
+    boundary_types: Option<&'a [String]>,
+    hoisted: &'a [String],
+    carriers: &'a [String],
+}
+
 /// Inputs for one `#export` boundary wrapper.
 struct ExportWrapperSpec<'a> {
     definition: &'a crate::ast::Definition,
@@ -6625,16 +6646,6 @@ impl LlvmBackend {
         }
         if self.ctx.defn_sret.contains(&d.name)
             || self.ctx.defn_object_sret.contains(&d.name)
-            || self
-                .ctx
-                .defn_hoisted_sret
-                .get(&d.name)
-                .is_some_and(|callees| !callees.is_empty())
-            || !self
-                .ctx
-                .generalized_destination_ownership
-                .recursive_carrier_obligations(&d.name)
-                .is_empty()
         {
             return None;
         }
@@ -6655,15 +6666,66 @@ impl LlvmBackend {
         let boundary_types =
             self.export_boundary_parameter_types(&d.name, &d.parameters);
         let visibility = if self.ctx.is_shared_lib { "dso_local " } else { "" };
+        let hoisted = self
+            .ctx
+            .defn_hoisted_sret
+            .get(&d.name)
+            .cloned()
+            .unwrap_or_default();
+        let carriers = self
+            .ctx
+            .generalized_destination_ownership
+            .recursive_carrier_obligations(&d.name);
         write!(out, "define {}{} @{}(", visibility, ret_ty, d.name).ok();
-        self.write_export_wrapper_args(out, d, needs_state, boundary_types.as_deref());
+        self.write_export_wrapper_args(
+            out,
+            ExportWrapperArgs {
+                definition: d,
+                needs_state,
+                boundary_types: boundary_types.as_deref(),
+                has_prefix: false,
+            },
+        );
         writeln!(out, ") local_unnamed_addr #0 {{").ok();
+        let hoisted_slots: Vec<String> = hoisted
+            .iter()
+            .enumerate()
+            .map(|(index, callee)| {
+                let slot = format!("%hsrt{index}");
+                let words = self.enum_image_words_for_defn(callee);
+                writeln!(out, "  {slot} = alloca i64, i64 {words}").ok();
+                slot
+            })
+            .collect();
+        let carrier_slots: Vec<String> = carriers
+            .iter()
+            .enumerate()
+            .map(|(index, carrier)| {
+                let slot = format!("%carrier_slot{index}");
+                let words = d
+                    .parameters
+                    .get(carrier.param_index)
+                    .map(|(_, ty)| self.enum_image_words(Some(ty)))
+                    .unwrap_or(2);
+                writeln!(out, "  {slot} = alloca i64, i64 {words}").ok();
+                slot
+            })
+            .collect();
         if ret_ty == "void" {
             write!(out, "  call void @{}(", internal).ok();
         } else {
             write!(out, "  %res = call {} @{}(", ret_ty, internal).ok();
         }
-        self.write_export_wrapper_args(out, d, needs_state, boundary_types.as_deref());
+        self.write_export_wrapper_call_args(
+            out,
+            ExportWrapperCallSpec {
+                definition: d,
+                needs_state,
+                boundary_types: boundary_types.as_deref(),
+                hoisted: &hoisted_slots,
+                carriers: &carrier_slots,
+            },
+        );
         writeln!(out, ")").ok();
         if ret_ty == "void" {
             writeln!(out, "  ret void").ok();
@@ -6673,21 +6735,44 @@ impl LlvmBackend {
         writeln!(out, "}}").ok();
     }
 
-    fn write_export_wrapper_args(
+    fn write_export_wrapper_call_args(
         &self,
         out: &mut String,
-        d: &crate::ast::Definition,
-        needs_state: bool,
-        boundary_types: Option<&[String]>,
+        spec: ExportWrapperCallSpec<'_>,
     ) {
-        if needs_state {
+        if spec.needs_state {
             write!(out, "{}", self.ctx.state_ptr_param).ok();
         }
-        for (i, (_, fallback_ty)) in d.parameters.iter().enumerate() {
-            if needs_state || i > 0 {
+        for (i, slot) in spec.hoisted.iter().chain(spec.carriers.iter()).enumerate() {
+            if spec.needs_state || i > 0 {
                 write!(out, ", ").ok();
             }
-            let ty = boundary_types
+            write!(out, "ptr {slot}").ok();
+        }
+        let has_hidden = !spec.hoisted.is_empty() || !spec.carriers.is_empty();
+        // State was already written above; only the comma/separator state is
+        // needed for the remaining parameters.
+        self.write_export_wrapper_args(
+            out,
+            ExportWrapperArgs {
+                definition: spec.definition,
+                needs_state: false,
+                boundary_types: spec.boundary_types,
+                has_prefix: spec.needs_state || has_hidden,
+            },
+        );
+    }
+
+    fn write_export_wrapper_args(&self, out: &mut String, spec: ExportWrapperArgs<'_>) {
+        if spec.needs_state {
+            write!(out, "{}", self.ctx.state_ptr_param).ok();
+        }
+        for (i, (_, fallback_ty)) in spec.definition.parameters.iter().enumerate() {
+            if spec.needs_state || spec.has_prefix || i > 0 {
+                write!(out, ", ").ok();
+            }
+            let ty = spec
+                .boundary_types
                 .and_then(|types| types.get(i))
                 .cloned()
                 .unwrap_or_else(|| self.llvm_type(fallback_ty));

@@ -2279,6 +2279,29 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
         let check_l = format!("aacheck_{}", ok_l_n);
         let grow_l = format!("aagrow_{}", ok_l_n);
 
+        // 2026-11-03: lazy arena initialization. Every main emitter that inlines
+        // txn bodies (Direct-SSA, version-DAG, counted, folded) would otherwise
+        // have to remember to call emit_arena_init; one that forgets grew the
+        // arena from a zero base and returned a bogus pointer. Initialize on
+        // first use instead: if the base field is 0, run emit_arena_init, then
+        // fall through. Inline control flow here is safe because the loop
+        // emitters now route bodies through dedicated end blocks / captured
+        // final blocks.
+        let base_i = self.fun.next_reg_with_prefix("aalb");
+        let base_g = self.fun.next_reg_with_prefix("aalbg");
+        writeln!(out, "{}{} = getelementptr inbounds %State, ptr %state, i32 0, i32 {}",
+            indent, base_g, abase_idx).ok();
+        writeln!(out, "{}{} = load i64, ptr {}", indent, base_i, base_g).ok();
+        let zero = self.fun.next_reg_with_prefix("aalz");
+        writeln!(out, "{}{} = icmp eq i64 {}, 0", indent, zero, base_i).ok();
+        let init_l = format!("aalinit_{}", ok_l_n);
+        let ready_l = format!("aalready_{}", ok_l_n);
+        writeln!(out, "{}br i1 {}, label %{}, label %{}", indent, zero, init_l, ready_l).ok();
+        writeln!(out, "{}{}:", indent, init_l).ok();
+        self.emit_arena_init(out, indent);
+        writeln!(out, "{}br label %{}", indent, ready_l).ok();
+        writeln!(out, "{}{}:", indent, ready_l).ok();
+
         // Load current ptr and end from %State
         let cur = load_state_ptr!(aptr_idx, "aac");
         let end = load_state_ptr!(aend_idx, "aae");
@@ -2322,23 +2345,38 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
                 let new_end = self.fun.next_reg_with_prefix("aane");
                 writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, new_end, end_g, min_sz).ok();
                 store_state_ptr!(aend_idx, "aaes", &new_end);
-                let base = load_state_ptr!(abase_idx, "aaob");
-                store_state_ptr!(aptr_idx, "aaps", &base);
-                grow_incoming = base;
+                // 2026-11-03 (soundness): grow EXTENDS in place and KEEPS the
+                // bump. Resetting to base would overwrite live arena
+                // allocations. Bounded reuse is provided by scope-lifetime
+                // reset (`emit_arena_reset` at a proven-dead scope boundary),
+                // never by grow.
+                grow_incoming = cur.clone();
             } else {
-                let base = load_state_ptr!(abase_idx, "aaob");
+                let base_ptr = load_state_ptr!(abase_idx, "aaob");
                 let grow_sz2 = self.fun.next_reg_with_prefix("aags2");
                 writeln!(out, "{}{} = shl i64 {}, 1", indent, grow_sz2, size_reg).ok();
                 let min_sz2 = self.fun.next_reg_with_prefix("aams2");
                 writeln!(out, "{}{} = add i64 {}, {}", indent, min_sz2, grow_sz2, self.ctx.arena_initial_size).ok();
                 let new_base = self.fun.next_reg_with_prefix("aanb");
-                writeln!(out, "{}{} = call ptr @realloc(ptr {}, i64 {})", indent, new_base, base, min_sz2).ok();
-                store_state_ptr!(aptr_idx, "aaps", &new_base);
+                writeln!(out, "{}{} = call ptr @realloc(ptr {}, i64 {})", indent, new_base, base_ptr, min_sz2).ok();
                 store_state_ptr!(abase_idx, "aabs", &new_base);
                 let new_end = self.fun.next_reg_with_prefix("aane");
                 writeln!(out, "{}{} = getelementptr i8, ptr {}, i64 {}", indent, new_end, new_base, min_sz2).ok();
                 store_state_ptr!(aend_idx, "aaes", &new_end);
-                grow_incoming = new_base;
+                // Rebase the bump onto the moved base (preserve live data).
+                let cur_i = self.fun.next_reg_with_prefix("aacurb");
+                writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, cur_i, cur).ok();
+                let base_i = self.fun.next_reg_with_prefix("aabasi");
+                writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, base_i, base_ptr).ok();
+                let off = self.fun.next_reg_with_prefix("aaoff");
+                writeln!(out, "{}{} = sub i64 {}, {}", indent, off, cur_i, base_i).ok();
+                let nb_i = self.fun.next_reg_with_prefix("aanbi");
+                writeln!(out, "{}{} = ptrtoint ptr {} to i64", indent, nb_i, new_base).ok();
+                let nc_i = self.fun.next_reg_with_prefix("aanc");
+                writeln!(out, "{}{} = add i64 {}, {}", indent, nc_i, nb_i, off).ok();
+                let nc = self.fun.next_reg_with_prefix("aancp");
+                writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, nc, nc_i).ok();
+                grow_incoming = nc;
             }
             writeln!(out, "{}br label %aaok_{}", indent, ok_l_n).ok();
         }
@@ -2376,10 +2414,10 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
         let Some(abase_idx) = self.arena_base_idx else { return; };
         // 2026-07-19: Uses next_reg_with_prefix (txn_counter) for unique names.
         // Eliminates arena_counter — consistent with emit_arena_alloc pattern.
-        if self.has_async_txns {
-            writeln!(out, "{}%arena_mutex = alloca i64, align 8", indent).ok();
-            writeln!(out, "{}store i64 0, ptr %arena_mutex, align 8", indent).ok();
-        }
+        // 2026-11-03 (D35): the vestigial %arena_mutex was removed. It was
+        // per-call (an alloca) and never consulted by emit_arena_alloc, so it
+        // provided no cross-thread protection. Per-worker arenas are the real
+        // fix (Phase 1).
         // 2026-08-04 (Phase 4): embedded freestanding — point the bump pointer
         // at the static @embedded_heap global (no @malloc, no heap growth).
         if self.ctx.is_embedded {
@@ -2451,9 +2489,26 @@ pub(crate) fn emit_brk_syscall(&mut self, out: &mut String, v: &str, arg_reg: &s
             return;
         }
         let (base_val, _) = self.emit_state_load_i64_by_idx(out, indent, abase_idx);
+        // 2026-11-03: the hosted arena is brk-backed on Linux (init does
+        // brk(0)/brk(base+size)). Calling @free on a brk pointer is invalid
+        // (it was never malloc'd) and corrupted the heap. Shrink the program
+        // break back to the arena base instead — this releases the region so
+        // the next per-tick init reuses it (no 64KB/tick growth).
+        if self.arena_uses_brk() {
+            let t = self.fun.next_reg_with_prefix("afb");
+            let _ = self.emit_brk_syscall(out, &t, &base_val, indent);
+            return;
+        }
         let base_ptr = self.fun.next_reg_with_prefix("afp");
         writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, base_ptr, base_val).ok();
         writeln!(out, "{}call void @free(ptr {})", indent, base_ptr).ok();
+    }
+
+    /// True when the hosted arena is brk-backed (Linux x86_64/aarch64).
+    pub(crate) fn arena_uses_brk(&self) -> bool {
+        let t = &self.ctx.target_triple;
+        (t.starts_with("x86_64") && t.contains("linux"))
+            || (t.starts_with("aarch64") && t.contains("linux"))
     }
 
     // 2026-07-18: Check if we're in a scope with a known contract-proven bound.
@@ -3237,32 +3292,21 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // 2026-10-21 (B1 nested enum layout): concrete instance planner.
         let enum_depth = crate::config_tuning::target_settings_for(&self.ctx.target_triple)
             .max_enum_inline_depth;
-        self.ctx.enum_layout_planner =
-            Some(crate::analysis::enum_layout::EnumLayoutPlanner::new(&reordered_items, enum_depth));
-        let enum_lowering = self
-            .ctx
-            .enum_layout_planner
-            .as_ref()
-            .map(|layouts| {
-                crate::backend::llvm::enum_lowering::EnumLoweringPlan::build(
-                    &self.ctx.generalized_destination_ownership,
-                    layouts,
-                )
-            })
-            .unwrap_or_default();
-        self.ctx.enum_lowering = enum_lowering;
-        self.ctx.defn_object_sret = self
-            .ctx
-            .enum_layout_planner
-            .as_ref()
-            .map(|layouts| {
-                crate::analysis::object_repr::build_object_representation_plan(
-                    &reordered_items,
-                    layouts,
-                )
-            })
-            .map(|plan| plan.caller_destination_defns.into_iter().collect())
-            .unwrap_or_default();
+        let enum_layout_planner =
+            crate::analysis::enum_layout::EnumLayoutPlanner::new(&reordered_items, enum_depth)
+                .with_type_universe(self.ctx.type_universe.as_ref());
+        self.ctx.enum_lowering = crate::backend::llvm::enum_lowering::EnumLoweringPlan::build(
+            &self.ctx.generalized_destination_ownership,
+            &enum_layout_planner,
+        );
+        self.ctx.defn_object_sret =
+            crate::analysis::object_repr::build_object_representation_plan(
+                &reordered_items,
+                &enum_layout_planner,
+            )
+            .caller_destination_defns
+            .into_iter()
+            .collect();
         // 2026-10-21 (P2-1 ReturnedSmall): only constructor-shaped, sret-safe
         // enum results take the hidden slot; the joined plan owns the verdict.
         self.ctx.defn_sret = self
@@ -3723,37 +3767,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     if !td.body.slots.is_empty()
                         && td.body.slots.iter().all(|s| s.name.starts_with("__variant_")) =>
                 {
-                    let ctor_variants: Vec<&crate::ast::top::TypeDefSlot> = td
-                        .body
-                        .slots
-                        .iter()
-                        .filter(|s| s.name.starts_with("__variant_"))
-                        .collect();
-                    self.ctx.enum_handle_types.insert(td.name.clone());
                     // 2026-10-05 (json.bv match-binding): generic enum params
                     // are needed to substitute a variant's payload type at the
                     // match-binding site (Result<Frame,String> ⇒ T=Frame).
                     if !td.type_params.is_empty() {
                         self.ctx.obj_type_params.entry(td.name.clone())
                             .or_insert_with(|| td.type_params.iter().map(|p| p.name.clone()).collect());
-                    }
-                    for (idx, slot) in ctor_variants.iter().enumerate() {
-                        let vname =
-                            slot.name.trim_start_matches("__variant_").to_string();
-                        self.ctx.variant_ctor.insert(vname.clone(), (td.name.clone(), idx));
-                        // 2026-10-05 (json.bv match-binding): the declared
-                        // payload type per variant (generic params resolved
-                        // at the binding site against the scrutinee args).
-                        self.ctx.variant_payload.insert(vname.clone(), slot.ty.clone());
-                        // 2026-08-26: qualified `Enum::Variant` paths resolve
-                        // to the same tag index.
-                        self.ctx.variant_ctor.insert(
-                            format!("{}::{}", td.name, vname),
-                            (td.name.clone(), idx),
-                        );
-                        self.ctx
-                            .variant_payload
-                            .insert(format!("{}::{}", td.name, vname), slot.ty.clone());
                     }
                 }
                 TopLevel::TypeDef(td)
@@ -3824,34 +3843,9 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     // 2026-08-23 (Phase 5d): ENUM VARIANT CONSTRUCTION
                     // registry — parser enums are TypeDefs whose slots are
                     // __variant_<Name>; declaration order is the tag index.
-                    let ctor_variants: Vec<&crate::ast::top::TypeDefSlot> = td
-                        .body
-                        .slots
-                        .iter()
-                        .filter(|s| s.name.starts_with("__variant_"))
-                        .collect();
-                    if !ctor_variants.is_empty() {
-                        self.ctx.enum_handle_types.insert(td.name.clone());
-                    }
                     if !td.type_params.is_empty() {
                         self.ctx.obj_type_params.entry(td.name.clone())
                             .or_insert_with(|| td.type_params.iter().map(|p| p.name.clone()).collect());
-                    }
-                    for (idx, slot) in ctor_variants.iter().enumerate() {
-                        let vname =
-                            slot.name.trim_start_matches("__variant_").to_string();
-                        self.ctx.variant_ctor.insert(vname.clone(), (td.name.clone(), idx));
-                        // 2026-10-05 (json.bv match-binding): declared payload
-                        // type per variant (see the enum-only arm above).
-                        self.ctx.variant_payload.insert(vname.clone(), slot.ty.clone());
-                        // 2026-08-26: qualified path resolves to the same tag.
-                        self.ctx.variant_ctor.insert(
-                            format!("{}::{}", td.name, vname),
-                            (td.name.clone(), idx),
-                        );
-                        self.ctx
-                            .variant_payload
-                            .insert(format!("{}::{}", td.name, vname), slot.ty.clone());
                     }
                     // 2026-08-16 (slice-6 deletion): register the coll's
                     // default op BINDINGS in the backend too — compile.rs
@@ -3912,7 +3906,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                     }
                 }
                 TopLevel::Enum(e) => {
-                    self.ctx.enum_types.insert(e.name.clone(), e.clone());
                 }
                 // 2026-07-30: Unwrap Export to register defn/txn/asm_fn params
                 // from exported definitions. Without this, emit_user_call can't
@@ -4007,21 +4000,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
                       help: remove the meld routes that trigger dual-lens access, or add a loop.",
                     field_list.join(", "),
                 ));
-            }
-        }
-
-        // Build variant → (enum_name, discriminant, field_count) mapping.
-        for (enum_name, edef) in &self.ctx.enum_types {
-            let mut next_disc: u64 = 0;
-            for v in &edef.variants {
-                let (vname, field_count) = match v {
-                    crate::ast::EnumVariant::Unit(n) => (n.clone(), 0),
-                    crate::ast::EnumVariant::Tuple(n, fields) => (n.clone(), fields.len()),
-                    crate::ast::EnumVariant::Struct(n, fields) => (n.clone(), fields.len()),
-                };
-                let disc = next_disc;
-                next_disc += 1;
-                self.ctx.variant_disc.insert(vname, (enum_name.clone(), disc, field_count));
             }
         }
 

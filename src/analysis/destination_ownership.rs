@@ -72,6 +72,8 @@ pub enum SinkKind {
     /// `&value` exposes the value's address; the referent may not use a
     /// function-frame image unless the borrow is separately proven.
     AddressEscape,
+    /// A tuple stores the child handle; the child aliases tuple lifetime.
+    TupleStore,
     LoopCarrier,
     ExportReturn,
 }
@@ -86,6 +88,7 @@ impl SinkKind {
             SinkKind::UnknownCallArgument => "unknown-call-argument",
             SinkKind::ClosureCapture => "closure-capture",
             SinkKind::AddressEscape => "address-escape",
+            SinkKind::TupleStore => "tuple-store",
             SinkKind::LoopCarrier => "loop-carrier",
             SinkKind::ExportReturn => "export-return",
         }
@@ -102,6 +105,7 @@ pub enum EscapeKind {
     UnknownCallLifetime,
     ClosureLifetime,
     AddressLifetime,
+    TupleLifetime,
     LoopLifetime,
     ExportLifetime,
 }
@@ -116,6 +120,7 @@ impl EscapeKind {
             EscapeKind::UnknownCallLifetime => "unknown-call-lifetime",
             EscapeKind::ClosureLifetime => "closure-lifetime",
             EscapeKind::AddressLifetime => "address-lifetime",
+            EscapeKind::TupleLifetime => "tuple-lifetime",
             EscapeKind::LoopLifetime => "loop-lifetime",
             EscapeKind::ExportLifetime => "export-lifetime",
         }
@@ -399,6 +404,45 @@ pub fn analyze(items: &[TopLevel]) -> DestinationOwnershipPlan {
     plan
 }
 
+fn insert_member_specs(
+    specs: &mut BTreeMap<String, CallableSpec>,
+    td: &crate::ast::TypeDef,
+) {
+    for member in &td.body.members {
+        let Some(spec) = member_spec(td, member) else {
+            continue;
+        };
+        insert_spec(specs, spec);
+    }
+}
+
+fn member_spec(td: &crate::ast::TypeDef, member: &TopLevel) -> Option<CallableSpec> {
+    match member {
+        TopLevel::Definition(d) => {
+            let mut spec = spec_from_defn(d, CallableKind::Member, false);
+            spec.owner = format!("defn:{}::{}", td.name, d.name);
+            spec.name = format!("{}::{}", td.name, d.name);
+            Some(spec)
+        }
+        TopLevel::TypeDefOperator(d) => {
+            let mut spec = spec_from_defn(d, CallableKind::Member, false);
+            spec.owner = format!("defn:{}::{}", td.name, d.name);
+            spec.name = format!("{}::{}", td.name, d.name);
+            Some(spec)
+        }
+        TopLevel::Transaction(t) => Some(CallableSpec {
+            owner: format!("txn:{}::{}", td.name, t.name),
+            name: format!("{}::{}", td.name, t.name),
+            kind: CallableKind::Member,
+            parameters: t.parameters.clone(),
+            result: t.output_type.as_ref().and_then(result_type),
+            body: t.body.clone(),
+            exported: false,
+        }),
+        _ => None,
+    }
+}
+
 fn has_export_modifier(modifiers: &[crate::ast::Annotation]) -> bool {
     modifiers.iter().any(|modifier| modifier.name == "export")
 }
@@ -420,6 +464,9 @@ fn index_callables(items: &[TopLevel]) -> (BTreeMap<String, CallableSpec>, BTree
                 &mut specs,
                 spec_from_defn(d, CallableKind::Member, has_export_modifier(&d.modifiers)),
             ),
+            TopLevel::TypeDef(td) => {
+                insert_member_specs(&mut specs, td);
+            }
             TopLevel::Transaction(t) => insert_spec(
                 &mut specs,
                 CallableSpec {

@@ -3,11 +3,12 @@
 Variant selection and binding materialization are separate operations. A
 variant whose payload patterns are all wildcards needs the tag test but no
 payload read, owned copy or binding. This includes a zero-payload variant.
-`LlvmEmitter::bind_pattern` returns without materializing such payloads;
+`LlvmBackend::bind_pattern` returns without materializing such payloads;
 named bindings retain their existing ownership behavior.
 
 This rule prevents unreachable owned copies in tag-only predicates. It does
 not establish reclamation for named bindings or locally returned objects.
+Broader returned-value reclamation requires separate ownership proofs.
 The broader lifetime closure is tracked in
 `../plans/2026-11-03-collector-lifetime-closure.md`.
 

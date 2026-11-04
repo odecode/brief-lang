@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//! H0d corpus audit: every parsed `.bv` in Tier-1 + stdlib lowers to verified
+//! HIR; unsupported syntax is counted. The totals are a downward baseline for
+//! H1 normalization.
+
+use briev_compiler::hir::{lower_program, unsupported_counts, verify};
+use std::path::{Path, PathBuf};
+
+const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+// 2026-11-03: 56 -> 60. The new arena/intrinsic regression fixtures
+// (arena_scope_reset, arena_scope_reset_rejected, arena_free_cast) use
+// VolatileStore#/VolatileLoad#/Free#/Ptr casts, which surface as
+// `plugin-intercept` unsupported nodes when lower_program runs on raw source
+// (no plugin expansion). H3/H4 lower these; the baseline stays downward.
+const BASELINE_EXPRESSIONS: usize = 60;
+const BASELINE_STATEMENTS: usize = 0;
+
+fn bv_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            bv_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("bv") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn corpus_lowers_with_verified_ids_and_bounded_unsupported_syntax() {
+    let root = Path::new(PROJECT_ROOT);
+    let mut files = Vec::new();
+    bv_files(&root.join("tests/tier1"), &mut files);
+    bv_files(&root.join("lib/std"), &mut files);
+    files.sort();
+
+    let mut expressions = 0usize;
+    let mut statements = 0usize;
+    let mut parsed = 0usize;
+    let mut worst: Vec<(usize, String)> = Vec::new();
+    let mut tags: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for path in &files {
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(tokens) = briev_compiler::lexer::tokenize(&source) else {
+            continue;
+        };
+        let mut parser = briev_compiler::parser::Parser::new(tokens, &source);
+        let Ok(items) = parser.parse_program() else {
+            continue;
+        };
+        parsed += 1;
+        let program = lower_program(&items);
+        verify(&program).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let counts = unsupported_counts(&program);
+        expressions += counts.expressions;
+        statements += counts.statements;
+        for (tag, count) in &counts.expression_tags {
+            *tags.entry(*tag).or_insert(0) += *count;
+        }
+        worst.push((
+            counts.total(),
+            path.strip_prefix(root).unwrap_or(path).display().to_string(),
+        ));
+    }
+    worst.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    println!(
+        "HIR_UNSUPPORTED files={parsed} expressions={expressions} statements={statements} total={}",
+        expressions + statements
+    );
+    let mut tag_rows: Vec<_> = tags.into_iter().collect();
+    tag_rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    for (tag, count) in tag_rows {
+        println!("HIR_UNSUPPORTED_TAG {count:4} {tag}");
+    }
+    for (count, path) in worst.iter().take(12) {
+        println!("HIR_UNSUPPORTED_FILE {count:4} {path}");
+    }
+    assert!(
+        expressions <= BASELINE_EXPRESSIONS,
+        "unsupported expression count grew: {expressions} > {BASELINE_EXPRESSIONS}"
+    );
+    assert!(
+        statements <= BASELINE_STATEMENTS,
+        "unsupported statement count grew: {statements} > {BASELINE_STATEMENTS}"
+    );
+}

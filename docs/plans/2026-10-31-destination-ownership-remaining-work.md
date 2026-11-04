@@ -42,7 +42,16 @@ At `3c2aeaea`:
 - D6h retains one narrow fallback scan for generated foreach bindings that R1
   never records. This is correctness debt, not the intended end state.
 
-## P0 — pin the bugs found during merge readiness
+## P0 — pin the bugs found during merge readiness — COMPLETE (2026-10-31)
+
+Permanent regressions landed:
+
+- `object_literal_field_aliases_parent_lifetime` in the destination model.
+- `generated_foreach_binding_keeps_entry_slot` in the daily suite.
+- `net_stack_helpers_asan_stack_lifetime` in the daily suite (ASan,
+  `detect_use_after_return=1`).
+- D4b inline enum-object payloads disabled; full O0/O1/O2/O3 and ASan reruns
+  pass with the path off. Re-enable belongs in P3 after the alias proof.
 
 These bugs were found late; each needs a permanent regression test before more
 optimization.
@@ -72,11 +81,19 @@ focused backend test, not only ad-hoc shell checks.
 
 ## P1 — finish D7 boundary lane
 
-### D7f — complex export wrappers
+### D7f — complex export wrappers — COMPLETE (2026-10-31)
 
-Current wrapper scope: simple top-level exports with no enum/object sret, no
-hoisted sret, no recursive carriers, no plain context, and no `#export` name
-remap. Everything else keeps the direct-symbol path.
+Exported object and enum returns keep the frozen boxed public ABI and receive
+public wrappers. `object_repr` never grants an exported callable a hidden
+`%object_out`; D3 already keeps exported enum results boxed. Public signatures
+remain `i64` handles; internal bodies are emitted under
+`<name>__briev_internal`.
+
+Wrappers now allocate internal hoisted-sret and recursive-carrier slots, pass
+them in the internal signature order, and keep them off the public signature.
+A focused backend test pins slot allocation and call ordering. Plain-context
+exports (environment-gated diagnostic mode) and the `#export("name")` remap
+path stay on their existing direct-symbol/wrapper paths.
 
 Work:
 
@@ -103,16 +120,18 @@ Acceptance:
 - GLUE, bridge_glue, bridge_multi, C/JS export tests green;
 - no `_start`/duplicate-symbol regressions.
 
-### D7g — runtime-helper and bridge boundaries
+### D7g — runtime-helper and bridge boundaries — COMPLETE (2026-11-01)
 
-1. Inventory runtime helpers reached through intrinsics versus `frgn`.
-2. Add `RuntimeHelper` boundary plans only where a real ABI crossing exists;
-   do not encode algorithm names.
-3. Route bridge argument/result transforms through the same boundary decision
-   helpers as direct foreign calls.
-4. Keep the declared result type as the ABI contract; no implicit String/CStr
-   conversion.
-5. Add helper-focused LLVM declarations/call-signature checks.
+Inventory result: every user-visible runtime-helper crossing is a `frgn`
+ForeignBinding and therefore already has a ForeignCall boundary plan.
+Compiler-internal helpers (`int_to_str`, print lanes, collection growth) are
+not public boundaries and stay internal. No separate `RuntimeHelper` plan is
+invented.
+
+Direct and bridge calls consume the same boundary ABI decision; the declared
+FFI result type remains the ABI contract. The inventory regression
+`every_foreign_binding_has_a_lookupable_boundary` pins plan lookup for every
+`frgn`.
 
 Acceptance:
 
@@ -120,7 +139,28 @@ Acceptance:
 - bridge_glue and bridge_multi green;
 - no undeclared or mismatched helper declarations.
 
-### D7h — platform boundary evidence
+### D7h — platform boundary evidence — COMPLETE (2026-11-01)
+
+Green:
+
+- wasm32: `rbv_list_each_wasm`, `rbv_obj_init_wasm32`, `rbv_router`.
+- no-prelude/stdlib boundary export: `tests/no_prelude_boundary.rs`.
+- C/multi bridge: `bridge_glue`, `bridge_multi`, GLUE suite.
+- Node/JS export + extension: `tests/js_export_boundary.rs` calls the real
+  `gate.js` consumer.
+- Full public ABI regressions from P0/D7f.
+
+Two JS blockers were fixed: `glue/c.bv` now explicitly imports its cast-lane
+dependency so bridge IR defines `cstr_len`; bridge export uses library-mode
+emission; and stateful export wrappers pass `%state` exactly once.
+
+Real-browser I11 gate: PASS against `odecode/recommender-app` PR #1 head
+`764275f` with the current compiler, PostgreSQL 18.6, MovieLens 100k, and
+Playwright Chromium. Key metrics: `maxLongTaskMs=0`,
+`resultBeforeDatabaseCommit=true`, `savedAfterCommit=true`,
+`recommendationRenderUnchangedAfterSave=true`, `synchronousXhrCount=0`,
+`followupGetCount=0`. Evidence:
+`benchmarks/results/2026-11-01-d7h-boundary-evidence.md`.
 
 Run and record:
 
@@ -137,32 +177,49 @@ Acceptance:
 - evidence appended to this plan or a dated results file;
 - no frozen ABI delta.
 
-## P2 — close D6 foreach fallback
+## P2 — close D6 foreach fallback — COMPLETE (2026-11-01)
 
-The backend currently scans assignment names inside a foreach body only when
-R1 did not report them. This fallback exists because generated/macro-expanded
-bindings can bypass R1 scoping.
+Resolution: object-member bodies (`obj`/`type` `defn`/`txn` members) were
+absent from R1's callable index. They are now analyzed with type-qualified
+owners (`defn:HashMap::get`, `txn:T::step`), and `emit_member_body` switches
+the destination owner to that same key while emitting the inlined body.
+`HashMap.get`'s probe loops therefore resolve their own `LoopCarrier` facts;
+the legacy statement rewalk is deleted.
 
-Work:
+Acceptance met: no AST liveness rewalk remains in backend loop lowering; the
+hashmap dominance regression passes without it; full lib/daily/determinism and
+the complete runtime suite are green.
 
-1. Identify the generated binding shape from `test_hashmap_rehash`.
-2. Teach R1 or the destination adapter to record that binding as a
-   `LoopCarrier` with source name and site.
-3. Remove `collect_foreach_assigned` from the backend.
-4. Keep plan attachment a hard pipeline invariant.
-5. Add a regression test that fails if any foreach assignment alloca is emitted
-   inside the loop body.
+## P3 — harden object frame images and caller destinations — IN PROGRESS (2026-11-01)
 
-Acceptance: no AST liveness rewalk remains in backend loop lowering.
+Landed: tuple elements record `TupleStore` / `TupleLifetime`; a child object
+stored in a returned tuple stays heap-backed (`tuple_object_alias`, `41\n42\n`
+at O3/LTO). Collection elements, object fields, loop-assigned parent fields,
+and `&object` address escapes now have destination-model regressions proving
+the child is materialized and excluded from `stack_object_types_by_owner`.
+The collection-return runtime path is covered by `collection_rebind_gate`.
 
-## P3 — harden object frame images and caller destinations
+0. Re-enable D4b only after an O0/O1/O2/O3 + ASan proof of the i64 handle
+   round-trip. Current status: disabled; object payloads stay boxed.
 
+   Re-enable probe (2026-11-01): D4c was isolated off, then inline enum-object
+   payloads were turned on. O0/O2/O3 pass; O1 still crashes on the **third**
+   `ws_message_complete` call with a heap frame pointer whose `payload_len` is
+   garbage. Zero-initializing the reserved payload area fixed the first two
+   calls (header/payload values now correct) but not the third. The remaining
+   defect is a stale/wrong enum-image frame source on one branch, not padding
+   poison alone. Keep disabled until that branch is identified. Tracked in
+   `BUGS.md` under “D4b inline enum-object payload miscompiles at -O1”.
+   Follow-up: notail + exact sizes fixed net_stack O0–O3, and a stale
+   `expected_enum_type` constructor-owner bug was fixed/tested; recommender I11
+   still reports `malloc(): invalid size` with D4b on, so it stays disabled.
 1. Add alias tests for:
    - nested object literal fields;
-   - object in tuple;
-   - object in collection returned across a function;
-   - object field assigned in a loop;
-   - `&object` across FFI.
+   - object in tuple — DONE (`TupleLifetime` + `tuple_object_alias`);
+   - object in collection returned across a function — DONE
+     (`CollectionLifetime` + `collection_rebind_gate`);
+   - object field assigned in a loop — DONE (`ObjectLifetime` regression);
+   - `&object` across FFI — DONE (`AddressLifetime` regression).
 2. Verify `stack_object_types_by_owner` is alias-wide: one escaping alias
    excludes frame images for that owner/type.
 3. Keep D4c eligibility proof-based; test both accepted and rejected call
@@ -173,7 +230,44 @@ Acceptance: no AST liveness rewalk remains in backend loop lowering.
 
 Acceptance: no frame image can escape its owner lifetime by any path.
 
-## P4 — D8 retirement
+## P4 — D8 retirement — COMPLETE (2026-11-02)
+
+Landed slices:
+
+- Deleted the legacy `TailCarrierPlan` / `CarrierInfo` / `CarrierParam` ABI
+  view; `tail_carrier.rs` emits unified `RecursiveCarrierPlan` directly.
+- Deleted `CompilerContext.variant_payload` and its declaration-time
+  population. `enum_payload_type` now reads only
+  `EnumLoweringPlan.variant(scrut_ty, name)`, including generic substitution.
+- Removed the backend's direct `EnumLayoutPlanner` fallback from
+  `enum_layout()` / `enum_value_repr_for()`. `EnumLoweringPlan` is now the sole
+  runtime enum-layout source; the planner only constructs that plan.
+- Removed `CompilerContext.enum_layout_planner`; the planner is now a local
+  join input used only to build `EnumLoweringPlan` and object-result facts.
+- Removed `CompilerContext.variant_ctor`. Constructor tags now live in
+  `EnumLoweringPlan.variant_ctor`, built in source declaration order so
+  duplicate bare names keep the existing last-declaration-wins behavior.
+- Removed `CompilerContext.enum_handle_types`; enum-name checks read the
+  generalized plan's declared-enum map.
+- Removed the unused `CompilerContext.variant_disc`; discriminant/payload tests
+  now assert `EnumLoweringPlan` directly.
+- Removed write-only `CompilerContext.enum_types`; the generalized plan owns
+  enum declarations.
+
+All slices are behavior-neutral: recursive-carrier IR/daily gates, full enum
+tests, and full corpus determinism are green.
+
+Retention audit (2026-11-01): both `own_enum_value` and `retain_enum_return`
+remain required. No-op probes failed daily gates / real recommender I11
+respectively; details in
+`benchmarks/results/2026-11-01-d8-retention-audit.md`. Do not remove them
+without a proof-carrying replacement.
+
+D8 closeout (2026-11-02): P2’s fallback is retired; D4b is fixed/enabled through
+PR49/50/51; dormant selective-view and parameter-summary scaffolding removed
+after copy elision was refuted; retention helpers remain with audit evidence;
+PR49–53 closed as included. Remaining work is a separate region-local scalar
+replacement plan, not a legacy-path retirement.
 
 Only after P0–P3 are green.
 

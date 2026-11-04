@@ -4,6 +4,10 @@
 coll struct FixedSlots<T> { data: T[2]; };
 struct PairValue { left: Int; right: Int; };
 obj ObjectValue { left: Int; right: Int; };
+enum ChoiceValue { Selected(Int), Missing };
+defn choice_number(choice: ChoiceValue) -> Int {
+    term match choice { Selected(value) => value, Missing() => 0 };
+};
 let done: Bool = false;
 node main [!done][done] {
     let records: FixedSlots<PairValue> = [
@@ -29,6 +33,10 @@ node main [!done][done] {
     when strings[1] .^Length != 2 { endprogram 7; };
     strings[1] = "xyz";
     when strings[0] .^Length != 1 || strings[1] .^Length != 3 { endprogram 8; };
+    let choices: FixedSlots<ChoiceValue> = [Selected(7),Missing()];
+    when choice_number(choices[0]) != 7 || choice_number(choices[1]) != 0 { endprogram 9; };
+    choices[1] = Selected(11);
+    when choice_number(choices[0]) != 7 || choice_number(choices[1]) != 11 { endprogram 10; };
     println!("fixed_collection_element_layouts_ok");
     done = true;
     endprogram;

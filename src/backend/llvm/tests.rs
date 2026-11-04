@@ -170,6 +170,158 @@ fn default_contract() -> Contract {
 }
 
 #[test]
+fn exported_object_and_enum_returns_use_public_wrappers() {
+    let src = r#"
+obj P { a: Int; b: Int; };
+enum R { Ok(Int), Err(Int) };
+export defn make(x: Int) -> P { term P { a: x; b: 0 }; };
+export defn choose(x: Int) -> R { term Ok(x); };
+"#;
+    let tokens = crate::lexer::tokenize(src).expect("tokenize");
+    let mut parser = crate::parser::Parser::new(tokens, src);
+    let items = parser.parse_program().expect("parse");
+    let mut backend = LlvmBackend::new()
+        .with_force_emit_all(true)
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let output = backend.generate(&items, None);
+    for name in ["make", "choose"] {
+        assert!(
+            output.contains(&format!("@{name}__briev_internal(")),
+            "{name}: internal body symbol missing"
+        );
+        let public = output
+            .lines()
+            .find(|line| line.starts_with("define ") && line.contains(&format!("@{name}(")))
+            .unwrap_or_else(|| panic!("{name}: public wrapper missing"));
+        assert!(
+            public.starts_with("define i64 "),
+            "{name}: boxed public ABI changed: {public}"
+        );
+        assert!(
+            !public.contains("%object_out") && !public.contains("%enum_out"),
+            "{name}: public wrapper leaked hidden ABI: {public}"
+        );
+    }
+}
+
+#[test]
+fn export_wrapper_orders_hoisted_and_carrier_slots() {
+    let src = r#"
+enum R { Ok(Int) };
+enum S { A(Int), B };
+export defn loop(n: Int, s: S) -> Int { term 0; };
+"#;
+    let tokens = crate::lexer::tokenize(src).expect("tokenize");
+    let mut parser = crate::parser::Parser::new(tokens, src);
+    let items = parser.parse_program().expect("parse");
+    let d = items
+        .iter()
+        .find_map(|item| match item {
+            crate::ast::TopLevel::Export(export) => match export.inner.as_ref() {
+                crate::ast::TopLevel::Definition(d) => Some(d.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("exported definition");
+    let mut backend = LlvmBackend::new()
+        .with_force_emit_all(true)
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    backend
+        .ctx
+        .defn_return_types
+        .insert("step".to_string(), vec![crate::ast::Type::Custom("R".to_string())]);
+    backend
+        .ctx
+        .defn_hoisted_sret
+        .insert(d.name.clone(), vec!["step".to_string()]);
+
+    use crate::analysis::destination_model::{
+        CallableId, CallableNamespace, DestinationId, ProofReason, ProofStatus,
+        RecursiveCarrierArgClass, RecursiveCarrierPlan, RecursiveCarrierValue,
+        SemanticValueId, SemanticValueKind,
+    };
+    let callable = CallableId {
+        namespace: CallableNamespace::Definition,
+        name: d.name.clone(),
+    };
+    let carrier = RecursiveCarrierValue {
+        parameter: SemanticValueId {
+            callable: callable.clone(),
+            kind: SemanticValueKind::Parameter,
+            path: "param/1/1".to_string(),
+            incarnation: 0,
+        },
+        param_index: 1,
+        param_name: "s".to_string(),
+        result_local: "next".to_string(),
+        sret_callee: "A".to_string(),
+        arg_classes: vec![RecursiveCarrierArgClass::InlineNested],
+        carrier: DestinationId {
+            owner: d.name.clone(),
+            path: "recursive/1/s".to_string(),
+        },
+        class: crate::analysis::destination_model::GeneralDestinationClass::StableCarrier,
+        requires_backedge_copy: true,
+        proof: ProofStatus::Proven {
+            reasons: std::collections::BTreeSet::from([
+                ProofReason::StableCarrierLifetime,
+            ]),
+        },
+    };
+    backend.ctx.generalized_destination_ownership.recursive_carriers.insert(
+        callable.clone(),
+        RecursiveCarrierPlan {
+            callable,
+            carriers: vec![carrier],
+            proof: ProofStatus::Proven {
+                reasons: std::collections::BTreeSet::from([
+                    ProofReason::StableCarrierLifetime,
+                ]),
+            },
+        },
+    );
+
+    let mut out = String::new();
+    backend.emit_top_level_export_wrapper(
+        &mut out,
+        &d,
+        "loop__briev_internal",
+        false,
+    );
+    assert!(out.contains("%hsrt0 = alloca i64, i64 2"), "{out}");
+    assert!(out.contains("%carrier_slot0 = alloca i64, i64 2"), "{out}");
+    assert!(
+        out.contains("i64 @loop__briev_internal(ptr %hsrt0, ptr %carrier_slot0, i64 %arg0, i64 %arg1)"),
+        "hidden slot call order drifted:\n{out}"
+    );
+}
+
+#[test]
+fn stateful_export_wrapper_passes_state_once() {
+    let src = r#"
+txn step(x: Int) [true][true] -> Int { term x + 1; };
+export defn next(x: Int) -> Int { term step(x); };
+"#;
+    let tokens = crate::lexer::tokenize(src).expect("tokenize");
+    let mut parser = crate::parser::Parser::new(tokens, src);
+    let items = parser.parse_program().expect("parse");
+    let mut backend = LlvmBackend::new()
+        .with_force_emit_all(true)
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let output = backend.generate(&items, None);
+    let call = output
+        .lines()
+        .find(|line| line.contains("call i64 @next__briev_internal("))
+        .expect("stateful export wrapper call");
+    assert_eq!(
+        call.matches("%state").count(),
+        1,
+        "state pointer duplicated: {call}"
+    );
+}
+
+#[test]
 fn proven_non_escaping_object_literal_uses_frame_image() {
     let src = r#"
 obj P { x: Int; y: Int; };
@@ -1263,6 +1415,60 @@ fn function_body(ir: &str, sig: &str) -> String {
     rest[..end].to_string()
 }
 
+/// Run the plugin stage, register layout facts, and generate IR. Required for
+/// fixtures that use collection/closure/function-type surfaces resolved by
+/// plugins (the plain `parse_bv_source` + `register_typedefs` path cannot).
+fn generate_ir_plugin_pipeline(src: &str) -> String {
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    let mut pm = crate::plugin::PluginManager::new();
+    pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+        .expect("plugin stage failed");
+    crate::backend::register_types::register_typedefs(&mut items, &mut universe, 64)
+        .expect("type registration failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    backend.generate(&items, None)
+}
+
+/// 2026-11-03 (Proof 3 condition 2): the `let g = x -> …` arm builds its own
+/// closure env block (a separate site from `Expr::Lambda`). An enum captured
+/// there must own its image: the closure can outlive the producing frame.
+/// A closure with no free variables is the negative control (no ownership copy).
+#[test]
+fn closure_let_capture_enum_is_owned() {
+    let enum_src = r#"
+enum E { Val(Int), Empty };
+defn make_e(v: Int) -> E { term E.Val(v); };
+defn use() -> Int {
+    let e: E = make_e(7);
+    let f: fn(Int) -> Int = x -> match e { Val(n) => n + x, Empty => x };
+    term f(1);
+};
+let tick: Int = 0;
+let sink_val: Int = 0;
+node run [tick == 0][tick == 1] { sink_val = use(); tick = 1; term; };
+"#;
+    let plain_src = r#"
+defn use_plain() -> Int {
+    let f: fn(Int) -> Int = x -> x + 1;
+    term f(1);
+};
+let tick: Int = 0;
+let sink_val: Int = 0;
+node run [tick == 0][tick == 1] { sink_val = use_plain(); tick = 1; term; };
+"#;
+    let enum_body = function_body(&generate_ir_plugin_pipeline(enum_src), "@use(");
+    assert!(
+        enum_body.contains("@llvm.memcpy"),
+        "closure-let enum capture must own its image:\n{enum_body}"
+    );
+    let plain_body = function_body(&generate_ir_plugin_pipeline(plain_src), "@use_plain(");
+    assert!(
+        !plain_body.contains("@llvm.memcpy"),
+        "a capture-free closure must not emit an ownership copy:\n{plain_body}"
+    );
+}
+
 /// 2026-10-05 (json.bv): an enum arm that BINDS a String payload (`Err(e)`)
 /// must unbox it to a ptr — a raw i64 typed String re-boxed as
 /// `ptrtoint ptr <i64>` (invalid IR).
@@ -1296,6 +1502,115 @@ node report [beginprogram][true] {
     // The Err arm loads the String payload and inttoptr's it to a ptr before
     // re-boxing; without the unbox it would `ptrtoint ptr <i64>` (invalid).
     assert!(rewrap.contains("inttoptr"), "String payload must inttoptr:\n{rewrap}");
+}
+
+/// 2026-11-03 (Proof 3 condition 2, I11 root cause): an enum image stored into
+/// longer-lived state must be heap-owned first. The image produced by a call is
+/// a stack slot in the producing callable's frame; storing the raw handle into
+/// `%state` leaves it dangling after the callable returns (use-after-return).
+/// The emitter must call `own_enum_value` (malloc + memcpy) before the state
+/// store. Regression for `defn_store.bv`: garbage output under gate relaxation.
+#[test]
+fn enum_state_store_owns_image_before_publishing() {
+    let src = r#"
+obj P { a: Int; b: Int; };
+enum E { Wrap(P), Empty };
+let saved: E = E.Empty;
+let step: Int = 0;
+defn make_e() -> E { term E.Wrap(P { a: 1, b: 2 }); };
+defn store_it() -> Int {
+    let local: E = make_e();
+    saved = local;
+    term 0;
+};
+node produce [step == 0][step == 1] {
+    let r: Int = store_it();
+    step = 1;
+    term;
+};
+"#;
+    let mut items = parse_bv_source(src);
+    let mut universe = crate::type_universe::TypeUniverse::new();
+    crate::backend::register_types::register_typedefs(&mut items, &mut universe, 64)
+        .expect("type registration failed");
+    let mut backend = LlvmBackend::new().with_type_universe(universe);
+    let ir = backend.generate(&items, None);
+    let body = function_body(&ir, "@store_it");
+    assert!(
+        body.contains("@malloc"),
+        "state-stored enum image must be owned (malloc) before publishing:\n{body}"
+    );
+    assert!(
+        body.contains("@llvm.memcpy"),
+        "state-stored enum image must be copied to owned storage:\n{body}"
+    );
+    let memcpy_pos = body.find("@llvm.memcpy").expect("memcpy");
+    let store_pos = body.rfind("store i64").expect("state store");
+    assert!(
+        memcpy_pos < store_pos,
+        "ownership copy must precede the state store:\n{body}"
+    );
+}
+
+/// 2026-11-03 (Proof 3 condition 2): an enum element stored as a handle into a
+/// heap tuple image must own its image first — the tuple (and anything holding
+/// it) can outlive the frame that produced the element. Regression:
+/// `tuple_enum2.bv` SEGVs under `-O0 -fno-inline -fsanitize=address` without
+/// owning. A tuple of plain Ints must NOT emit an ownership copy (negative
+/// control), so the memcpy assertion is meaningful.
+#[test]
+fn tuple_element_enum_is_owned_before_storing() {
+    let enum_src = r#"
+obj P { a: Int; b: Int; };
+enum E { Wrap(P), Empty };
+defn make_e(v: Int) -> E { term E.Wrap(P { a: v, b: v + 1 }); };
+defn build() -> (E, Int) {
+    let e: E = make_e(1);
+    term (e, 7);
+};
+let tick: Int = 0;
+let sink_val: Int = 0;
+node run [tick == 0][tick == 1] {
+    let t: (E, Int) = build();
+    sink_val = t.1;
+    tick = 1;
+    term;
+};
+"#;
+    let int_src = r#"
+defn build() -> (Int, Int) {
+    term (1, 2);
+};
+let tick: Int = 0;
+let sink_val: Int = 0;
+node run [tick == 0][tick == 1] {
+    let t: (Int, Int) = build();
+    sink_val = t.1;
+    tick = 1;
+    term;
+};
+"#;
+    let compile = |src: &str| {
+        let mut items = parse_bv_source(src);
+        let mut universe = crate::type_universe::TypeUniverse::new();
+        let mut pm = crate::plugin::PluginManager::new();
+        pm.run_ast(crate::ast::StageKind::Parsed, &mut items, &mut universe)
+            .expect("plugin stage failed");
+        crate::backend::register_types::register_typedefs(&mut items, &mut universe, 64)
+            .expect("type registration failed");
+        let mut backend = LlvmBackend::new().with_type_universe(universe);
+        backend.generate(&items, None)
+    };
+    let enum_body = function_body(&compile(enum_src), "@build");
+    assert!(
+        enum_body.contains("@llvm.memcpy"),
+        "tuple enum element must be owned (memcpy) before storing:\n{enum_body}"
+    );
+    let int_body = function_body(&compile(int_src), "@build");
+    assert!(
+        !int_body.contains("@llvm.memcpy"),
+        "a tuple of plain Ints must not emit an ownership copy:\n{int_body}"
+    );
 }
 
 /// Mini-verifier (BUGS.md int-literal-float-init), per FUNCTION: a register
@@ -3632,6 +3947,31 @@ fn test_float_binary_add() {
 }
 
 #[test]
+fn stale_expected_enum_does_not_override_constructor_owner() {
+    let program = vec![
+        TopLevel::Enum(EnumDefinition {
+            name: "AdmissionError".to_string(),
+            type_params: vec![],
+            variants: vec![EnumVariant::Tuple("Rejected".to_string(), vec![Type::int()])],
+            span: None,
+        }),
+        TopLevel::Enum(EnumDefinition {
+            name: "OperationJob".to_string(),
+            type_params: vec![],
+            variants: vec![EnumVariant::Tuple("OwnedOperationJob".to_string(), vec![Type::int()])],
+            span: None,
+        }),
+    ];
+    let mut backend = LlvmBackend::new();
+    let _ = backend.generate(&program, None);
+    backend.fun.expected_enum_type = Some(Type::Custom("AdmissionError".to_string()));
+    assert_eq!(
+        backend.resolve_constructor_enum("OwnedOperationJob"),
+        Some(Type::Custom("OperationJob".to_string()))
+    );
+}
+
+#[test]
 fn test_enum_type_registered_and_variant_disc() {
     let mut backend = LlvmBackend::new();
     let program = vec![
@@ -3646,12 +3986,20 @@ fn test_enum_type_registered_and_variant_disc() {
         }),
     ];
     let _ = backend.generate(&program, None);
-    assert!(backend.ctx.enum_types.contains_key("Option"));
-    assert!(backend.ctx.variant_disc.contains_key("None"));
-    assert!(backend.ctx.variant_disc.contains_key("Some"));
-    assert_eq!(backend.ctx.variant_disc.get("None").map(|(_, d, _)| *d), Some(0));
-    assert_eq!(backend.ctx.variant_disc.get("Some").map(|(_, d, _)| *d), Some(1));
-    assert_eq!(backend.ctx.variant_disc.get("Some").map(|(_, _, f)| *f), Some(1));
+    assert_eq!(
+        backend.ctx.enum_lowering.variant_ctor("None"),
+        Some(("Option".to_string(), 0))
+    );
+    assert_eq!(
+        backend.ctx.enum_lowering.variant_ctor("Some"),
+        Some(("Option".to_string(), 1))
+    );
+    let option = backend
+        .ctx
+        .enum_lowering
+        .entry(&Type::Custom("Option".to_string()))
+        .expect("Option entry");
+    assert_eq!(option.variants[1].payload, Some(Type::int()));
 }
 
 #[test]
@@ -3669,9 +4017,20 @@ fn test_enum_multi_variant_discriminants() {
         }),
     ];
     let _ = backend.generate(&program, None);
-    assert_eq!(backend.ctx.variant_disc.get("Leaf").map(|(_, d, _)| *d), Some(0));
-    assert_eq!(backend.ctx.variant_disc.get("Node").map(|(_, d, _)| *d), Some(1));
-    assert_eq!(backend.ctx.variant_disc.get("Node").map(|(_, _, f)| *f), Some(2));
+    assert_eq!(
+        backend.ctx.enum_lowering.variant_ctor("Leaf"),
+        Some(("Tree".to_string(), 0))
+    );
+    assert_eq!(
+        backend.ctx.enum_lowering.variant_ctor("Node"),
+        Some(("Tree".to_string(), 1))
+    );
+    let tree = backend
+        .ctx
+        .enum_lowering
+        .entry(&Type::Custom("Tree".to_string()))
+        .expect("Tree entry");
+    assert_eq!(tree.variants[1].payload, Some(Type::Tuple(vec![Type::int(), Type::int()])));
 }
 
 #[test]
@@ -8289,7 +8648,12 @@ fn test_arrow_push_binds_returned_list_and_pooled_member_field() {
     let callers: Vec<&str> = ir.split("\ndefine ").skip(1)
         .filter(|function| function.contains("call i64 @__print_int")).collect();
     assert_eq!(callers.len(), 2, "both emitted callers must be checked");
-    for ir in callers {
+    for caller in callers { assert_arrow_push_caller_ir(caller); }
+}
+
+// 2026-11-03: keep SSA checks local to one emitted function; register names
+// are not globally unique. Retire this helper with native-only assertions.
+fn assert_arrow_push_caller_ir(ir: &str) {
     let lines: Vec<&str> = ir.lines().collect();
 
     // The transaction body is emitted twice (the alwaysinline @txn_go defn +
@@ -8370,7 +8734,6 @@ fn test_arrow_push_binds_returned_list_and_pooled_member_field() {
         );
     }
     assert_eq!(prints.len(), 2, "expected two prints per caller; got:\n{ir}");
-    }
 }
 
 /// 2026-08-18 (Phase E, BUGS.md SSA-main destructure): a FOREACH loop variable
@@ -12483,4 +12846,24 @@ node entry [beginprogram][true] {
         assert!(!line.contains("#8"), "may-trap defn must not claim memory(read): {line}");
     }
     assert!(ir.contains("call i64 @caller"), "the unused may-trap call must survive: {ir}");
+}
+
+#[test]
+fn bit_encoding_override_receives_canonical_storage_word() {
+    for width in [8, 32, 64, 128] {
+        let mut backend = LlvmBackend::new()
+            .with_type_universe(crate::type_universe::TypeUniverse::new())
+            .with_cast_from_bit_overrides(std::collections::HashMap::from([
+                ("String".to_string(), "decode_bits".to_string()),
+            ]));
+        let source = super::TypedRegister { name: "%raw".to_string(), ty: Type::Bits(width) };
+        let mut ir = String::new();
+        backend.emit_cast_path(&mut ir, "%decoded", &source, &Type::string(), "")
+            .expect("raw bits have an encoding route");
+        assert!(ir.contains("call ptr @decode_bits(i64 "), "constructor ABI: {ir}");
+        if width != 64 {
+            let op = if width < 64 { "zext" } else { "trunc" };
+            assert!(ir.contains(&format!("{op} i{width} %raw to i64")), "storage-word conversion: {ir}");
+        }
+    }
 }

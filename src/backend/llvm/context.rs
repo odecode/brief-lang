@@ -136,8 +136,6 @@ pub struct CompilerContext {
     pub tail_loop: crate::analysis::tail_recursion::TailLoopPlan,
     /// 2026-10-21 (nested carrier slots): loop-carried inline nested enum
     /// ownership plan for direct self-tail-recursive defns.
-    /// 2026-10-21 (nested enum layout): concrete enum image planner.
-    pub enum_layout_planner: Option<crate::analysis::enum_layout::EnumLayoutPlanner>,
     /// 2026-10-30 (D3b): semantic enum facts joined with physical layout.
     pub enum_lowering: crate::backend::llvm::enum_lowering::EnumLoweringPlan,
     /// 2026-10-30 (destination ownership D3): generalized frontend plan.
@@ -416,27 +414,18 @@ pub atomic_fields: std::collections::HashMap<String, String>,
     /// (`obj Stack<T, N>` → ["T", "N"]). Used to substitute a receiver's
     /// concrete type args into the generic slots/members (monomorphization).
     pub obj_type_params: HashMap<String, Vec<String>>,
-    pub enum_types: HashMap<String, EnumDefinition>,
+
     pub cell_defs: HashMap<String, CellDef>,
     pub cell_state_types: HashMap<String, (HashMap<String, usize>, Vec<String>)>,
     pub cell_wires: Vec<(String, String, String, String)>,
     pub cell_trigger_bindings: Vec<(String, String, String)>,
-    pub variant_disc: HashMap<String, (String, u64, usize)>,
+
     /// 2026-08-23 (Phase 5d): variant constructor registry from TypeDef
     /// enums — variant name → (enum name, tag index). Built during the
     /// definition walk; read by construction calls + match dispatch.
-    pub variant_ctor: HashMap<String, (String, usize)>,
-    /// 2026-08-26 (Track B): declared enum names — values are boxed
-    /// {tag,payload} images behind an i64 handle; llvm_type resolves them
-    /// to the handle width, never to a struct/pointer ABI.
-    pub enum_handle_types: std::collections::HashSet<String>,
-    /// 2026-10-05 (Phase 1, json.bv): variant name → declared payload type
-    /// from the enum's `__variant_<Name>` slot (before generic substitution).
-    /// `bind_pattern` needs it to type the payload binding — the old code
-    /// hardcoded Int, so a STRUCT payload (`Ok(frame)`) returned an
-    /// Int-typed register and `frame.value` panicked in codegen. Generic
-    /// params are substituted against the scrutinee's concrete args.
-    pub variant_payload: HashMap<String, crate::ast::Type>,
+
+
+
 
     // Optimization
     pub optimize_budget: u64,
@@ -668,7 +657,6 @@ impl CompilerContext {
             defn_hoisted_sret: HashMap::new(),
             tail_recursive: std::collections::HashSet::new(),
             tail_loop: crate::analysis::tail_recursion::TailLoopPlan::default(),
-            enum_layout_planner: None,
             enum_lowering: crate::backend::llvm::enum_lowering::EnumLoweringPlan::default(),
             generalized_destination_ownership: crate::analysis::destination_model::GeneralizedDestinationOwnershipPlan::default(),
             destination_plan_attached: false,
@@ -734,15 +722,10 @@ impl CompilerContext {
             dyn_concrete_tag_of: HashMap::new(),
             dyn_collection_info: std::collections::HashMap::new(),
             obj_type_params: HashMap::new(),
-            enum_types: HashMap::new(),
             cell_defs: HashMap::new(),
             cell_state_types: HashMap::new(),
             cell_wires: Vec::new(),
             cell_trigger_bindings: Vec::new(),
-            variant_disc: HashMap::new(),
-            variant_ctor: HashMap::new(),
-            variant_payload: HashMap::new(),
-            enum_handle_types: std::collections::HashSet::new(),
             optimize_budget: 256,
             // 2026-07-31: Phase 3 (§8.2) — arena/stack sizing comes from
             // config/ir-lowering.toml instead of hardcoded literals.
@@ -1127,6 +1110,9 @@ pub struct FunctionContext {    // SSA register counters — NEVER rewound (prev
     pub fn_ret_ty: String,
     pub main_body: bool,
     pub in_callable_txn: bool,
+    /// An inlined member returns to its enclosing transaction; it cannot
+    /// publish that transaction's partially updated browser state.
+    pub in_inline_member: bool,
     /// Local continuation for a bare return from an inlined member body.
     pub inline_member_exit: Option<String>,
     /// 2026-10-21 (plain-context experiment): the `%plain` pointer parameter
@@ -1529,6 +1515,7 @@ impl FunctionContext {
             fn_ret_ty: "void".to_string(),
             main_body: false,
             in_callable_txn: false,
+            in_inline_member: false,
             inline_member_exit: None,
             last_expr_reg: None,
             callable_txn_result: None,
@@ -1694,6 +1681,7 @@ impl FunctionContext {
         self.fn_ret_ty = "void".to_string();
         self.main_body = false;
         self.in_callable_txn = false;
+        self.in_inline_member = false;
         self.inline_member_exit = None;
         self.callable_txn_result = None;
         self.callable_txn_post_label = None;

@@ -902,10 +902,17 @@ before their lane starts.
 **Implementation:** in progress on
 `feat/generalized-value-destination-ownership`.
 
-**Current phase:** D7e is complete. Simple top-level exports get a public
-wrapper plus internal body symbol; hidden-ABI exports keep the direct-symbol
-path. Export/foreign plans drive parameter and result ABI selection. Next:
-D8 retirement after remaining complex-export-wrapper work.
+**Current phase:** D8 retirement has started after P0, P3 alias coverage, and
+D7a–D7h completed. The legacy `TailCarrierPlan` and `variant_payload` metadata
+are gone; recursive carriers are emitted directly and runtime enum layout/binding
+reads only `EnumLoweringPlan`. The planner is no longer backend state; it is a
+local join input, constructor tags/discriminants are plan-owned in declaration
+order, and enum-name checks read the generalized plan's declared-enum map. D4b inline enum-object payloads stay disabled
+after the `-O1` `net_stack_helpers` miscompile. D8 retention audit found both
+`own_enum_value` and `retain_enum_return` still carry unique obligations; no-op
+probes failed daily gates and real recommender I11 respectively. P2 now analyzes object-member bodies under type-qualified owners and switches
+the destination owner during inlined member emission. The generated-foreach
+statement rewalk is deleted; member-body loop carriers come from the plan.
 
 **Rollback:** delete `enum_lowering.rs` and its context field, restore emitter
 reads of `enum_layout_planner`, and restore `defn_sret` from `sret_safe_defns`.
@@ -914,3 +921,103 @@ return to D1/D2 analysis-only state.
 
 This record is authoritative for destination/ownership lowering. Implementation
 status lives in the execution plan; do not edit historical evidence in place.
+
+---
+
+## Part XIII — Lifetime and reclamation (2026-11-03)
+
+Full plan and phasing: `docs/plans/2026-11-03-lifetime-and-reclamation.md`.
+This part fixes the durable decisions; it does not renumber Parts I–XII.
+
+### D27. Lifetime is a proof in the destination plan — DECIDED
+
+Every semantic value carries a derived `Lifetime`
+(`Frame`/`TxnBody`/`StateField(i)`/`LoopCarrier`/`Program`/`External`) in
+addition to shape/ownership/destination. It is derived from the existing
+`SinkKind`/`EscapeKind` escape facts plus reactor reachability. There is no
+second ownership analysis.
+
+### D28. Allocation follows lifetime (construction-time strategy) — DECIDED
+
+The region a value's lifetime names selects its allocation at construction,
+reusing the `Alloc#` escape-DAG strategy bridge (`analysis/allocation.rs` →
+`analysis_alloc_strategies`). Sinks must not copy values whose constructed
+storage is already correct for the destination region. A heap aggregate may
+not hold a frame-region element image: container and embedded enum images
+share one lifetime.
+
+### D29. Immutable images; copy-on-escape or destination threading — DECIDED
+
+Shared images are immutable. When the source lifetime does not dominate the
+destination, either construct into the destination (D19 conditions) or emit an
+explicit copy (D22). Buffer reuse and free-on-overwrite are forbidden unless a
+sole-escape/no-alias proof holds. This supersedes the rejected intermediary
+"persistent buffer reuse" idea.
+
+### D30. Reclamation follows lifetime; no GC, no pervasive refcount — DECIDED
+
+`Frame`/`TxnBody` are reclaimed by the txn bump arena; `StateField` by an owned
+slot (threading or proven free-on-overwrite) plus a scheduled final free;
+`Program`/`Unknown` are boxed and leaked, reported by diagnostics; `External`
+is boundary. No tracing GC. A runtime refcount is permitted only as a proven,
+opt-in fallback for shapes that must be shared (D31), carrying the
+firing/ownership proof the earlier free-check lacked.
+
+### D31. Diagnostics make every fallback visible — DECIDED
+
+`memcheck` and strict profiles report, per value/lifetime, the proven
+deallocation point or the fallback with its reason. No silent leaks.
+
+### D32. Async is a lifetime dimension — DECIDED
+
+`async` worker threads mean cross-thread transfer is part of the proof. No
+shared-slot reuse for concurrent writers; sendable/unknown values stay heap and
+immutable. The explicit-concurrency contract is unchanged.
+
+### D33. Consumption, linear tasks, and free/keep unify under this model — DECIDED
+
+`~<-` consume, task linearity, and the `free`/`keep` hints express `Consumed`
+ownership and reclamation points in the same plan; they are not a parallel
+ownership system. `free` on a non-owned/untracked backing remains a no-op
+today and becomes a verified deallocation point only for tracked owned images.
+
+### D34. `async` is parallel by default where threads exist — DECIDED
+
+`async` is a semantic declaration of simultaneous firing; the efficient default
+is real parallel execution. Cooperative execution is a **declared capability
+fallback** (with a diagnostic) for targets without threads, never a silent
+downgrade. Substrate: `SysCall#(SYS_clone)` + futex (no pthreads, no C runtime),
+restoring the parallelism Family H documented as lost.
+
+### D35. Arenas are per-worker — DECIDED
+
+The bump arena is per-worker. A shared worker-id global races under
+`clone(CLONE_VM)`, so worker identity comes from **TLS** on thread-capable
+targets (`clone(CLONE_SETTLS)`, FS-relative arena cursor); cooperative/embedded
+targets use a single arena. `emit_arena_alloc` uses the current worker's
+cursor; init/reset/free is per worker per tick. The shared `%State` arena
+fields and the vestigial `%arena_mutex` are removed. (Corrected 2026-11-03:
+worker-indexed global slots without TLS are unsound.)
+
+### D36. `sync<group>` is a real join — DECIDED
+
+In the parallel reactor, members of a fired sync group commit at a join
+barrier; the cooperative group-commit path remains only in the capability
+fallback.
+
+### D37. Shared `%State` is safe for fields under the gate — DECIDED
+
+The concurrency gate proves eligible `async` pairs have no XOR read-write
+overlap and each tick reads pre-tick state; only the arena/allocator/output are
+shared mutable infrastructure (per-worker/atomic). Cross-thread values are
+immutable images with atomic handle swaps; no shared-slot reuse.
+
+### D38. Async interleaving is contract-unspecified — DECIDED
+
+Compiler/IR determinism is preserved; output interleaving across simultaneously
+firing nodes is not. Tests compare per-txn sequences or run the cooperative
+mode. This does not weaken the "never faster via a keyword" rule: parallel is
+the default for the semantics, not an opt-in speed keyword.
+
+**Migration:** Phases 0–7 in the plan. Unknown ⇒ box/copy/leak at every phase.
+**Rollback:** delete this part; D1–D26 remain authoritative.

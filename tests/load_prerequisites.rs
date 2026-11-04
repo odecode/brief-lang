@@ -45,3 +45,17 @@ fn indexed_collection_bounds_and_completion() {
         }
     }
 }
+
+#[test]
+fn collection_storage_and_member_boundaries_execute() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) { return; }
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/load");
+    for name in ["collection_index_store_gate", "fixed_collection_elements_gate",
+                 "index_effects_gate", "inline_member_term_gate"] {
+        let source = std::fs::read_to_string(fixtures.join(format!("{name}.bv"))).unwrap();
+        let expected = std::fs::read(fixtures.join(format!("{name}.golden"))).unwrap();
+        let result = run_program(&source);
+        assert!(result.status.success(), "{name}: {:?}", result.status);
+        assert_eq!(result.stdout, expected, "{name}");
+    }
+}

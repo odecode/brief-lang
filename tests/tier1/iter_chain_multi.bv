@@ -1,0 +1,17 @@
+obj A { x: Int; };
+obj B { y: Int; };
+
+let done: Bool = false;
+
+node main [done == false][done] {
+    let a: List<A> = [A { x: 1 }, A { x: 2 }];
+    let b: List<B> = [B { y: 3 }];
+    let c: List<A> = a + a;
+    let d: List<B> = b + b;
+    Print#(Count#(c));
+    Print#('\n');
+    Print#(Count#(d));
+    Print#('\n');
+    done = true;
+    term;
+};

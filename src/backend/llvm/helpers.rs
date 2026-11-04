@@ -1596,7 +1596,7 @@ impl LlvmBackend {
             Type::Custom(name) | Type::Applied(name, _) => name,
             _ => return None,
         };
-        if self.ctx.obj_types.contains(base) || self.ctx.enum_handle_types.contains(base) {
+        if self.ctx.obj_types.contains(base) || self.is_enum_type_name(base) {
             return None;
         }
         let key = ty.to_string();
@@ -2706,20 +2706,17 @@ impl LlvmBackend {
         Some(slot)
     }
 
-    /// Joined enum layout view. The D3b plan is authoritative when it has a
-    /// concrete entry; the target layout planner remains the conservative
-    /// fallback for types not seen by the frontend pass.
-    pub(crate) fn enum_layout(&self, ty: &crate::ast::Type) -> Option<crate::analysis::enum_layout::EnumLayout> {
+    pub(crate) fn is_enum_type_name(&self, name: &str) -> bool {
         self.ctx
-            .enum_lowering
-            .layout(ty)
-            .cloned()
-            .or_else(|| {
-                self.ctx
-                    .enum_layout_planner
-                    .as_ref()
-                    .and_then(|planner| planner.layout_for(ty))
-            })
+            .generalized_destination_ownership
+            .enums
+            .contains_key(name)
+    }
+
+    /// Joined enum layout view. `EnumLoweringPlan` is the sole runtime source;
+    /// `EnumLayoutPlanner` is retained only to build that plan.
+    pub(crate) fn enum_layout(&self, ty: &crate::ast::Type) -> Option<crate::analysis::enum_layout::EnumLayout> {
+        self.ctx.enum_lowering.layout(ty).cloned()
     }
 
     pub(crate) fn enum_value_repr_for(
@@ -2730,12 +2727,6 @@ impl LlvmBackend {
             .enum_lowering
             .entry(ty)
             .map(|entry| entry.representation)
-            .or_else(|| {
-                self.ctx
-                    .enum_layout_planner
-                    .as_ref()
-                    .and_then(|planner| planner.value_repr_for(ty))
-            })
     }
 
     /// 2026-10-25: an aggregate can outlive the caller-owned temporary image

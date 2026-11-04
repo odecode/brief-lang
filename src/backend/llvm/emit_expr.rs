@@ -845,7 +845,7 @@ impl LlvmBackend {
                         let enum_handle = matches!(
                             &briev_ty,
                             Type::Custom(n) | Type::Applied(n, _)
-                                if self.ctx.enum_handle_types.contains(n)
+                                if self.is_enum_type_name(n)
                         );
                         if enum_handle && field_llvm_ty == "i64" && self.ctx.int_bits < 64 {
                             let tr = self.fun.gen_reg();
@@ -1789,8 +1789,22 @@ impl LlvmBackend {
             // Falls through to LLVM coercion when no graph path exists.
             Expr::Cast(expr, target) => {
                 let src = self.emit_expr(out, expr, indent);
+                // 2026-11-03: propagate the allocation strategy through an
+                // address cast. `Alloc#` records its strategy under the
+                // allocation register; `Free#(a as Ptr<T>)` evaluates the cast
+                // to a NEW register, so without this the strategy lookup missed
+                // and `@free` ran on a brk-backed arena pointer (invalid free).
+                let src_strategy = self.fun.alloc_strategies.get(&src.name).cloned();
+                let address_cast = matches!(target, Type::Ptr(_)) || matches!(src.ty, Type::Ptr(_));
                 // Try casting graph path first
                 if let Some(result) = self.emit_cast_path(out, v, &src, target, indent) {
+                    if address_cast {
+                        if let Some(st) = &src_strategy {
+                            if result.name != src.name {
+                                self.fun.alloc_strategies.insert(result.name.clone(), st.clone());
+                            }
+                        }
+                    }
                     return result;
                 }
                 let target_ll = self.llvm_type(target);
@@ -1851,6 +1865,11 @@ impl LlvmBackend {
                     )
                     .ok();
                 }
+                if address_cast {
+                    if let Some(st) = &src_strategy {
+                        self.fun.alloc_strategies.insert(v.to_string(), st.clone());
+                    }
+                }
                 TypedRegister {
                     name: v.to_string(),
                     ty: target.clone(),
@@ -1909,6 +1928,10 @@ impl LlvmBackend {
                 writeln!(out, "{}store i64 {}, ptr {}", indent, fn_reg, env_p).ok();
                 for (j, var) in free_vars.iter().enumerate() {
                     let cap = self.emit_expr(out, &Expr::Identifier(var.clone()), indent);
+                    // 2026-11-03 (Proof 3 condition 2): a captured enum must own
+                    // its image; the closure (heap env) can outlive the frame
+                    // that produced the captured image. No-op for non-enums.
+                    let cap = self.own_enum_value(out, indent, &cap);
                     let slot = self.fun.gen_reg();
                     writeln!(
                         out,
@@ -2693,6 +2716,12 @@ impl LlvmBackend {
             writeln!(out, "{}store i64 {}, ptr {}", indent, count as i64, hdr).ok();
             for (i, elem) in exprs.iter().enumerate() {
                 let e = self.emit_expr(out, elem, indent);
+                // 2026-11-03 (Proof 3 condition 2): a tuple element stored as a
+                // handle must not point at the producing callable's stack image,
+                // which dies before the (heap) tuple image is read. Own enum
+                // elements (no-op for non-enum types). Nested aggregates are
+                // owned recursively by their own materializers.
+                let e = self.own_enum_value(out, indent, &e);
                 let slot = self.fun.gen_reg();
                 writeln!(
                     out,
@@ -2935,8 +2964,7 @@ impl LlvmBackend {
     }
 
     fn emit_struct_field_store(&mut self, out: &mut String, indent: &str, field: StructField<'_>) {
-        let fr = self.fun.gen_reg();
-        let val = self.emit_expr_inner(out, &fr, field.expr, indent);
+        let val = self.emit_struct_field_value(out, indent, &field);
         let val = self.own_enum_value(out, indent, &val);
         let offset = self.lookup_field_offset(field.type_name, field.name);
         let ptr_reg = self.fun.gen_reg();
@@ -2950,6 +2978,30 @@ impl LlvmBackend {
             return;
         }
         self.emit_struct_regular_field(out, indent, field, &val, &ptr_reg);
+    }
+
+    fn struct_field_type(&self, type_name: &str, name: &str) -> Option<Type> {
+        self.get_struct_fields(type_name)?
+            .iter().find(|(field, _)| field == name).map(|(_, ty)| ty.clone())
+    }
+
+    fn emit_struct_field_value(
+        &mut self,
+        out: &mut String,
+        indent: &str,
+        field: &StructField<'_>,
+    ) -> TypedRegister {
+        // 2026-11-01: a field constructor belongs to its declared enum, never
+        // an enclosing return's enum (whose tags/capacity may differ). Restore
+        // the outer context afterward; retire with per-expression type plans.
+        let field_enum = self.struct_field_type(field.type_name, field.name)
+            .filter(|ty| self.enum_layout(ty).is_some());
+        let saved = std::mem::replace(&mut self.fun.expected_enum_type, field_enum.clone());
+        let register = self.fun.gen_reg();
+        let mut value = self.emit_expr_inner(out, &register, field.expr, indent);
+        self.fun.expected_enum_type = saved;
+        if let Some(ty) = field_enum { value.ty = ty; }
+        value
     }
 
     fn emit_struct_atomic_field(
@@ -2993,12 +3045,7 @@ impl LlvmBackend {
             writeln!(out, "{}  store ptr {}, ptr {}", indent, conv, ptr_reg).ok();
             return;
         }
-        let field_ty = self
-            .ctx
-            .struct_types
-            .get(field.type_name)
-            .and_then(|fields| fields.iter().find(|(name, _)| name == field.name))
-            .map(|(_, ty)| ty.clone())
+        let field_ty = self.struct_field_type(field.type_name, field.name)
             .unwrap_or_else(|| val.ty.clone());
         let stored = self.coerce_register_value(out, indent, val, &field_ty);
         let fty = self.llvm_type(&field_ty);
@@ -4162,6 +4209,8 @@ impl LlvmBackend {
         // construction, non-identifier receivers). If an obj receiver ever
         // lands here, that is a retired-path regression (the member body would
         // GEP a fake boxed self instead of the pool column) — fail loudly.
+        let saved_destination_owner = self.fun.destination_owner.clone();
+        self.fun.destination_owner = member_destination_owner(type_name, member);
         let saved_prefix = self.fun.self_prefix.clone();
         let saved = self.fun.self_binding.clone();
         // 2026-08-13: clear the enclosing callable-txn convergence state while
@@ -4396,10 +4445,20 @@ impl LlvmBackend {
                 // coercion as ordinary calls (boxed Bool/Char are i64).
                 // Keep conversion centralized; retire with uniform call ABI.
                 let argument = TypedRegister { name: reg.clone(), ty: rty.clone() };
-                let argument = self.coerce_register_value(out, indent, &argument, pty);
+                // A generic receiver can itself be inside an unspecialized
+                // callable. Its element parameter has no concrete ABI yet.
+                // Bind the operand representation instead of coercing to
+                // the fallback LLVM width of the abstract parameter.
+                let param_ty = match pty {
+                    Type::Custom(name) if self.ctx.obj_type_params.get(&recv_base)
+                        .is_some_and(|names| names.contains(name))
+                        && self.ctx.type_universe.as_ref().and_then(|u| u.get(name)).is_none() => rty,
+                    _ => pty,
+                };
+                let argument = self.coerce_register_value(out, indent, &argument, param_ty);
                 self.fun.let_bindings.insert(pname.clone(), argument.name);
-                self.fun.let_binding_types.insert(pname.clone(), pty.clone());
-                self.fun.let_original_types.insert(pname.clone(), pty.clone());
+                self.fun.let_binding_types.insert(pname.clone(), param_ty.clone());
+                self.fun.let_original_types.insert(pname.clone(), param_ty.clone());
             }
             let _ = rty;
         }
@@ -4435,6 +4494,11 @@ impl LlvmBackend {
         if (proven || pregrown) && member_is_push && body.first().is_some_and(is_grow_guard) {
             body.remove(0);
         }
+        // 2026-11-01: inline member `term` returns a value, not a transaction
+        // commit. Suppress intermediate DOM publication while preserving the
+        // enclosing txn identity used by analysis proofs. Restore for nesting.
+        // Retire with an explicit commit-boundary plan for every inline body.
+        let saved_member_context = std::mem::replace(&mut self.fun.in_inline_member, true);
         // 2026-11-03: bare member terms must leave only this inline body.
         // Scope the exit label for nesting; never inherit a reactor abort.
         // Retire when inline calls have a shared value/void return plan.
@@ -4447,8 +4511,10 @@ impl LlvmBackend {
         writeln!(out, "{member_exit}:").ok();
         self.fun.cur_block = Some(member_exit);
         self.fun.inline_member_exit = saved_member_exit;
+        self.fun.in_inline_member = saved_member_context;
         self.fun.self_binding = saved;
         self.fun.self_prefix = saved_prefix;
+        self.fun.destination_owner = saved_destination_owner;
         self.fun.let_bindings = saved_bindings;
         self.fun.let_binding_types = saved_types;
         self.fun.let_original_types = saved_orig;
@@ -6016,7 +6082,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
     /// type_slots registry for `__variant_{name}`; ambiguous names error —
     /// bare construction requires unique variant names.
     pub(crate) fn enum_variant_ctor(&self, name: &str) -> Option<(String, usize)> {
-        self.ctx.variant_ctor.get(name).cloned()
+        self.ctx.enum_lowering.variant_ctor(name)
     }
 
     /// Resolve a match variant's declared payload type against the concrete
@@ -6026,23 +6092,37 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
     /// `resolve_field_type` performs for struct members. 2026-10-05 (json.bv):
     /// variant bindings previously hardcoded Int.
     pub(crate) fn enum_payload_type(&self, scrut_ty: &Type, vname: &str) -> Option<Type> {
-        if let Some(variant) = self.ctx.enum_lowering.variant(scrut_ty, vname) {
-            return variant.payload.clone();
-        }
-        let declared = self.ctx.variant_payload.get(vname).cloned().or_else(|| {
-            let bare = vname.rsplit("::").next().unwrap_or(vname);
-            self.ctx.variant_payload.get(bare).cloned()
-        })?;
-        let Type::Applied(base, args) = scrut_ty else {
-            return Some(declared);
-        };
-        let params = self.ctx.obj_type_params.get(base).cloned().unwrap_or_default();
-        if params.is_empty() {
-            return Some(declared);
-        }
-        let subst: std::collections::HashMap<String, Type> =
-            params.iter().cloned().zip(args.iter().cloned()).collect();
-        Some(crate::typechecker::substitute_type(&declared, &subst))
+        self.ctx
+            .enum_lowering
+            .variant(scrut_ty, vname)?
+            .payload
+            .clone()
+    }
+
+    fn emit_owned_object_payload(
+        &mut self,
+        out: &mut String,
+        indent: &str,
+        scrutinee: &str,
+        ty: &Type,
+    ) -> TypedRegister {
+        // 2026-11-01: an inline payload points inside its enum's image, which
+        // may be a caller stack slot. A bound object is an owning value and
+        // can escape via a return, collection or field. Copy its byte image;
+        // retire the copy only with a proved non-retaining projection consumer.
+        let name = object_payload_name(ty).expect("inline object payload type");
+        let bytes = self.struct_type_size(name);
+        let base = self.fun.gen_reg();
+        let source = self.fun.gen_reg();
+        let owned = self.fun.gen_reg();
+        let handle = self.fun.gen_reg();
+        let width = format!("i{}", self.ctx.int_bits);
+        writeln!(out, "{indent}{base} = inttoptr {width} {scrutinee} to ptr").ok();
+        writeln!(out, "{indent}{source} = getelementptr i64, ptr {base}, i64 1").ok();
+        writeln!(out, "{indent}{owned} = call ptr @malloc(i64 {bytes})").ok();
+        writeln!(out, "{indent}call void @llvm.memcpy.p0.p0.i64(ptr {owned}, ptr {source}, i64 {bytes}, i1 false)").ok();
+        writeln!(out, "{indent}{handle} = ptrtoint ptr {owned} to {width}").ok();
+        TypedRegister { name: handle, ty: ty.clone() }
     }
 
     /// Copy/construct a small object payload directly into the enum image.
@@ -6210,6 +6290,17 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         Some(word)
     }
 
+    pub(super) fn resolve_constructor_enum(&self, variant: &str) -> Option<Type> {
+        self.fun
+            .expected_enum_type
+            .clone()
+            .filter(|ty| self.ctx.enum_lowering.variant(ty, variant).is_some())
+            .or_else(|| {
+                self.enum_variant_ctor(variant)
+                    .map(|(name, _)| Type::Custom(name))
+            })
+    }
+
     /// Emit a variant constructor: box {tag, payload} → i64 handle.
     pub(crate) fn emit_enum_construct(
         &mut self,
@@ -6259,7 +6350,11 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         // 2026-10-21 (B0 nested enum layout): propagate the concrete enum
         // instance to payload constructors. `Ok(TcpState.X)` sees
         // TcpState, not the generic T payload.
-        let saved_expected_enum = self.fun.expected_enum_type.clone();
+        // The expected type may be stale from an enclosing constructor
+        // (`AdmissionError` around `OwnedOperationJob(WorkerTag)`). Only use it
+        // when this variant actually belongs to that enum; otherwise resolve
+        // the constructor's own enum from the plan-owned tag index.
+        let saved_expected_enum = self.resolve_constructor_enum(v);
         let payload_expected = saved_expected_enum
             .as_ref()
             .and_then(|t| self.enum_payload_type(t, v));
@@ -6655,7 +6750,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
     fn call_param_llvm_type(&self, ty: &Type) -> String {
         match ty {
             Type::Custom(n) | Type::Applied(n, _)
-                if self.ctx.enum_handle_types.contains(n) =>
+                if self.is_enum_type_name(n) =>
             {
                 format!("i{}", self.ctx.int_bits)
             }
@@ -7264,7 +7359,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         // are untouched by the probe.
         let match_result_hint = self.fun.item_return_type.clone();
         let expected_enum_result = match_result_hint.as_ref().filter(|ty| match ty {
-            Type::Custom(name) | Type::Applied(name, _) => self.ctx.enum_handle_types.contains(name),
+            Type::Custom(name) | Type::Applied(name, _) => self.is_enum_type_name(name),
             _ => false,
         });
         let probe_types = if let Some(expected) = expected_enum_result {
@@ -7284,7 +7379,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             .into_iter()
             .map(|t| match &t {
                 Type::Applied(n, _) | Type::Custom(n)
-                    if self.ctx.enum_handle_types.contains(n) =>
+                    if self.is_enum_type_name(n) =>
                 {
                     Type::int()
                 }
@@ -7711,18 +7806,7 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                         .and_then(|l| l.variant_payload_inline_object.get(tag_idx).copied())
                         .unwrap_or(false);
                     let payload = if inline_object {
-                        let base = self.fun.gen_reg();
-                        { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
-                        let nested = self.fun.gen_reg();
-                        writeln!(
-                            out,
-                            "{}{} = getelementptr i64, ptr {}, i64 1",
-                            indent, nested, base
-                        )
-                        .ok();
-                        let handle = self.fun.gen_reg();
-                        { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, handle, nested, hw).ok(); }
-                        TypedRegister { name: handle, ty: pty.clone() }
+                        self.emit_owned_object_payload(out, indent, scrut, &pty)
                     } else if inline_payload {
                         let base = self.fun.gen_reg();
                         { let hw = format!("i{}", self.ctx.int_bits); writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, base, hw, scrut).ok(); }
@@ -8690,6 +8774,9 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
         // leaving `16 as Bits<4>` holding 16 in an i64 register. Truncate the
         // integer source to exactly N bits here, before the graph. A source
         // that is already i{N} (a packed field read) is an identity.
+        // 2026-11-03: widening must zero-extend and pointer inputs need
+        // ptrtoint; relabelling a ptr as Bits produces invalid SSA. Retire
+        // this path when width assertions are lowered by the casting graph.
         if let Some(n) = crate::type_universe::bits_width(target) {
             // 2026-09-11 (Phase A4): Bits(0) — the flexible `Bit`/`Bits` — is
             // the CONTENT-VIEW cast target (the old `#Bit` category): it routes
@@ -8698,12 +8785,21 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
             if n > 0 {
                 let src_ll = self.llvm_type(&src.ty);
                 let tgt = format!("i{}", n);
-                if src_ll != tgt && src_ll.starts_with('i') {
+                if src_ll == "ptr" {
                     let reg = self.fun.gen_reg();
-                    writeln!(out, "{}{} = trunc {} {} to {}", indent, reg, src_ll, src.name, tgt).ok();
+                    writeln!(out, "{}{} = ptrtoint ptr {} to {}", indent, reg, src.name, tgt).ok();
                     return Some(TypedRegister { name: reg, ty: target.clone() });
                 }
-                return Some(TypedRegister { name: src.name.clone(), ty: target.clone() });
+                if src_ll != tgt && src_ll.starts_with('i') {
+                    let reg = self.fun.gen_reg();
+                    let width = src_ll[1..].parse::<u64>().ok()?;
+                    let op = if width < n { "zext" } else { "trunc" };
+                    writeln!(out, "{}{} = {} {} {} to {}", indent, reg, op, src_ll, src.name, tgt).ok();
+                    return Some(TypedRegister { name: reg, ty: target.clone() });
+                }
+                if src_ll == tgt {
+                    return Some(TypedRegister { name: src.name.clone(), ty: target.clone() });
+                }
             }
         }
         let graph = self.ctx.casting_graph.as_ref()?;
@@ -9029,9 +9125,10 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                     // A registered CastFrom(Bit) override for the target type
                     // calls the override function; otherwise the String default
                     // is the UTF8 wrap: inttoptr the address, then
-                    // briev_cstr_to_briev materializes the [len][bytes] header
-                    // by construction (length derived from the bytes). The
-                    // header is never inherited from the bits — it is created.
+                    // briev_bits_to_str copies the [len][bytes] buffer into
+                    // newly owned String storage (including embedded NULs).
+                    // 2026-11-03: use the source's actual integer width at
+                    // pointer conversion; constructors keep their i64 ABI.
                     let override_fn = match target.universe_key() {
                         Some(key) => self
                             .ctx
@@ -9040,12 +9137,21 @@ pub(crate) fn atomic_field_ordering(&self, type_name: &str, field_name: &str) ->
                             .and_then(|g| g.get_cast_from_bit(key)),
                         None => None,
                     };
-                    if let Some(fn_name) = override_fn {
+                    if let Some(fn_name) = override_fn.map(str::to_owned) {
+                        // The constructor boundary receives an i64 storage
+                        // word even when the explicit raw-bit source is i32.
+                        let mut argument = cur.clone();
+                        if cur_ll != "i64" {
+                            let width = cur_ll.strip_prefix('i')?.parse::<u64>().ok()?;
+                            argument = self.fun.gen_reg();
+                            let op = if width < 64 { "zext" } else { "trunc" };
+                            writeln!(out, "{}{} = {} {} {} to i64", indent, argument, op, cur_ll, cur).ok();
+                        }
                         writeln!(out, "{}{} = call {} @{}(i64 {})",
-                            indent, dst, dst_ll, fn_name, cur).ok();
+                            indent, dst, dst_ll, fn_name, argument).ok();
                     } else {
                         let p = self.fun.gen_reg();
-                        writeln!(out, "{}{} = inttoptr i64 {} to ptr", indent, p, cur).ok();
+                        writeln!(out, "{}{} = inttoptr {} {} to ptr", indent, p, cur_ll, cur).ok();
                         writeln!(out, "{}{} = call ptr @briev_bits_to_str(ptr {})",
                             indent, dst, p).ok();
                     }
@@ -9170,6 +9276,21 @@ mod tests {
 }
 
 /// 2026-07-31 (A5): the briev name of a member declaration (txn/defn/node).
+fn member_destination_owner(type_name: &str, m: &crate::ast::TopLevel) -> Option<String> {
+    match m {
+        crate::ast::TopLevel::Transaction(t) => {
+            Some(format!("txn:{type_name}::{}", t.name))
+        }
+        crate::ast::TopLevel::Definition(d) => {
+            Some(format!("defn:{type_name}::{}", d.name))
+        }
+        crate::ast::TopLevel::TypeDefOperator(d) => {
+            Some(format!("defn:{type_name}::{}", d.name))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn member_briev_name(m: &crate::ast::TopLevel) -> &str {
     match m {
         crate::ast::TopLevel::Transaction(t) => &t.name,
