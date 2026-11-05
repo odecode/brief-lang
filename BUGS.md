@@ -11901,6 +11901,7 @@ body brace so aggregate return types keep their layout. The two tier-2 dynamic
 payload ABI fixtures exercise the generated thunks at O0.
 
 
+
 ## 2026-11-05 — checked native time contract
 
 The new clock_ns_res API checks syscall failure before reading timespec and
@@ -11965,3 +11966,7 @@ bindings and false global-storage aliases from literal numeric constants.
 Correcting both removes 528 remaining startup bytes in the integrated client.
 Unknown/custom indexed effects remain conservative; escaping-slice and custom
 operation regressions prevent treating these new facts as blanket permission.
+
+## FIXED 2026-11-05 — Statement matches discard continuing arms
+
+Statement match used the last arm termination flag for the whole merge. Earlier continuing arms and unmatched values entered unreachable code. Reproducer: tests/fixtures/load/statement_match_fallthrough.bv. Fix preserves the emitted merge predecessors.

@@ -422,6 +422,7 @@ There is no TS emitter.
    unused) remain an opportunistic house-style pass.
 
 
+
 ## 2026-11-05 — inferred tuple element representation
 
 Unannotated destructuring of returned object tuples panicked on field access;
@@ -461,3 +462,7 @@ elements. Literal numeric constants carry value facts without aliasing global
 storage. Unknown and custom-operation indexing still captures its inputs and
 blocks reclamation until the operation's effects can be proved. Registering
 available bodies is conservative but can increase analysis cost on large inputs.
+
+### Statement matches discard continuing arms — 2026-11-05
+
+Statement matches retain a continuing merge for their no-match edge and any continuing arm. A final returning arm does not prove other arms terminate.
