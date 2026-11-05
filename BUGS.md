@@ -11900,6 +11900,7 @@ signature before instrumenting its body, and attach inlining attributes at the
 body brace so aggregate return types keep their layout. The two tier-2 dynamic
 payload ABI fixtures exercise the generated thunks at O0.
 
+
 ## 2026-11-05 — checked native time contract
 
 The new clock_ns_res API checks syscall failure before reading timespec and
@@ -11954,3 +11955,13 @@ chain back-references and dynamic dispatch remain conservative. Tests retain
 returned pointer aliases and reject a same-named free-function fallback.
 
 Status: FIXED 2026-11-05; 3,503 library tests pass, including all socket-effect and method-escape regressions.
+
+## FIXED 2026-11-05 — Structured-value reclamation barriers
+
+Reclamation treated slices, indexed casts and intrinsic method calls as unknown effects, and omitted source bodies used only through implicit cast dependencies. Small JSON catalogue checks leaked 16,683 bytes. Structured payload type facts, conservative slice provenance, shared index inference and complete body registration close these barriers.
+
+The same probe distinguished false list/element aliases from plain `let`
+bindings and false global-storage aliases from literal numeric constants.
+Correcting both removes 528 remaining startup bytes in the integrated client.
+Unknown/custom indexed effects remain conservative; escaping-slice and custom
+operation regressions prevent treating these new facts as blanket permission.
