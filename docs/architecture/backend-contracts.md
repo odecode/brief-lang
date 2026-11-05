@@ -423,6 +423,7 @@ There is no TS emitter.
 
 
 
+
 ## 2026-11-05 — inferred tuple element representation
 
 Unannotated destructuring of returned object tuples panicked on field access;
@@ -466,3 +467,7 @@ available bodies is conservative but can increase analysis cost on large inputs.
 ### Statement matches discard continuing arms — 2026-11-05
 
 Statement matches retain a continuing merge for their no-match edge and any continuing arm. A final returning arm does not prove other arms terminate.
+
+### Field receivers evaluated twice — 2026-11-05
+
+A field receiver is evaluated exactly once. Tuple/layout dispatch and the general loader share that typed value; nested projections preserve source evaluation counts.

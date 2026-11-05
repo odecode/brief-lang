@@ -11902,6 +11902,7 @@ payload ABI fixtures exercise the generated thunks at O0.
 
 
 
+
 ## 2026-11-05 — checked native time contract
 
 The new clock_ns_res API checks syscall failure before reading timespec and
@@ -11970,3 +11971,7 @@ operation regressions prevent treating these new facts as blanket permission.
 ## FIXED 2026-11-05 — Statement matches discard continuing arms
 
 Statement match used the last arm termination flag for the whole merge. Earlier continuing arms and unmatched values entered unreachable code. Reproducer: tests/fixtures/load/statement_match_fallthrough.bv. Fix preserves the emitted merge predecessors.
+
+## FIXED 2026-11-05 — Field receivers evaluated twice
+
+Field projection on a call result evaluated the receiver twice. sock_tcp_nonblocking().fd opened and leaked an extra descriptor. Reproducer: tests/fixtures/load/field_receiver_once.bv. The general loader now consumes the already evaluated typed register.
