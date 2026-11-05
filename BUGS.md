@@ -11908,3 +11908,16 @@ nonnegative contract by trapping on failure instead of returning -1. Native
 regressions cover an invalid clock ID and elapsed monotonic sleep. The collector
 prerequisite branch also carries process-stat, auxiliary-vector and histogram
 APIs; their contracts are documented under docs/architecture.
+
+## read_file descriptor ownership — 2026-11-05
+
+FIXED: every successful open in read_file now closes after read_whole returns,
+including EOF and read errors. Previously the whole-file result escaped without
+a close, exhausting file descriptors in repeated observations. The wrapper owns
+the descriptor; the recursive helper owns buffer growth. Preserve the original
+open/read error contract rather than replacing it with a close result.
+
+Controlled regression: file_descriptor_lifetime.bv compares the next available
+Linux descriptor after 640 normal, empty, growing, read-error and open-error
+calls. Unchanged main fails; the fixed program prints file_descriptors_stable.
+Valgrind reports zero errors and zero definite/indirect loss.
