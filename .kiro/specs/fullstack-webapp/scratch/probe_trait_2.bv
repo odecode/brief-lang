@@ -1,0 +1,22 @@
+// P2: trait with a DEFAULT method (built on the required one), an obj that
+// structurally conforms, and a direct call to the default on that obj.
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+    // default: bump twice, written once in the trait
+    defn bump_twice(this: Self, amount: Int) -> Self {
+        term bump(bump(this, amount), amount);
+    };
+};
+
+obj Tally {
+    total: Int;
+    defn bump(this: Tally, amount: Int) -> Tally {
+        term Tally { total: this.total + amount };
+    };
+};
+
+node entry [beginprogram][true] {
+    let t: Tally = Tally { total: 0 };
+    let t2: Tally = t.bump_twice(5);
+    endprogram Print#(t2.total);
+};

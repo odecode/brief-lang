@@ -1,0 +1,22 @@
+// Probe: can a defn be generic over the RECEIVER type and call an op member on
+// it, resolving structurally to whichever concrete type is passed? This is the
+// make-or-break capability for design D (one generic put_u16_be over any sink).
+
+obj SinkA {
+    total: Int;
+    op InsertAt: take_a(#Lh, #Rh);
+    txn take_a(val: Int) [true][total == total] { total = total + val; term; };
+};
+
+obj SinkB {
+    total: Int;
+    op InsertAt: take_b(#Lh, #Rh);
+    txn take_b(val: Int) [true][total == total] { total = total + val; term; };
+};
+
+// Generic over the sink type S. Uses the <- operator (op InsertAt) structurally.
+defn feed_twice<S>(sink: S, val: Int) -> S {
+    sink <- val;
+    sink <- val;
+    term sink;
+};

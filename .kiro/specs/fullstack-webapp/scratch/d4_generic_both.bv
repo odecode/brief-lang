@@ -1,0 +1,49 @@
+// D4: ONE generic writer over the ByteSink trait, used with BOTH ByteBuf (fixed)
+// and GrowBuf (growing) in one program. This is the payoff of design D: the same
+// code path serves both sinks. write_tagged writes a u16 big-endian tag then a
+// NUL-terminated label - it names NO concrete type, only <S: ByteSink>, and
+// calls the trait default put_u16_be and put_cstr (which build on the required
+// put_u8/put_bytes each sink provides with its own contracts).
+//
+// Fixed path (ByteBuf, cap 16): tag 0x1234 then "Hi" -> bytes 18,52,72,105,0.
+// Growing path (GrowBuf, cap 2): SAME call, but the small cap forces reallocs
+// mid-write (the u16 already fills cap 2, so put_cstr must grow) - proving the
+// generic writer is correct even as the sink's ptr moves underneath it. Same
+// bytes expected: 18,52,72,105,0.
+import "std/net/bytes.bv";
+
+// The generic writer: written once, over any ByteSink.
+defn write_tagged<S: ByteSink>(sink: S, tag: Int, label: String) -> S {
+    let tagged: S = put_u16_be(sink, tag);
+    term put_cstr(tagged, label);
+};
+
+node entry [beginprogram][true] {
+    // Fixed sink.
+    let fixed0: ByteBuf = buf_new(16);
+    let fixed1: ByteBuf = write_tagged(fixed0, 4660, "Hi");
+    let fixed_b0: Int = get_u8(fixed1, 0);
+    let fixed_b1: Int = get_u8(fixed1, 1);
+    let fixed_b2: Int = get_u8(fixed1, 2);
+    let fixed_b3: Int = get_u8(fixed1, 3);
+    let fixed_b4: Int = get_u8(fixed1, 4);
+    Print#(fixed_b0);
+    Print#(fixed_b1);
+    Print#(fixed_b2);
+    Print#(fixed_b3);
+    Print#(fixed_b4);
+
+    // Growing sink - SAME write_tagged, tiny starting cap forces reallocation.
+    let grow0: GrowBuf = grow_new(2);
+    let grow1: GrowBuf = write_tagged(grow0, 4660, "Hi");
+    let grow_b0: Int = grow_get_u8(grow1, 0);
+    let grow_b1: Int = grow_get_u8(grow1, 1);
+    let grow_b2: Int = grow_get_u8(grow1, 2);
+    let grow_b3: Int = grow_get_u8(grow1, 3);
+    let grow_b4: Int = grow_get_u8(grow1, 4);
+    Print#(grow_b0);
+    Print#(grow_b1);
+    Print#(grow_b2);
+    Print#(grow_b3);
+    endprogram Print#(grow_b4);
+};

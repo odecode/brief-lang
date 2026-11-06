@@ -1,0 +1,34 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. L2 — `lib/std/net/socket.bv`: TCP client over raw syscalls": [
+      {
+        "executionId": "be1077cc-79ea-4189-8803-73f069562a8c",
+        "chatSessionId": "sess_06cdd6ee-cc9d-49ee-9de1-b55aa9890e48",
+        "timestamp": 1792227521883
+      },
+      {
+        "executionId": "cb999d78-458d-4566-8a0a-ad71d5d9114c",
+        "chatSessionId": "sess_981d9c81-d281-4e0f-90fe-59b7181b917e",
+        "timestamp": 1792304547185
+      }
+    ],
+    "3. L3b/L3c — `lib/std/net/http.bv` (HTTP/1.1 + WS upgrade) and `lib/std/net/websocket.bv` (frames)": [
+      {
+        "executionId": "5300f30c-4d8e-4fea-bb68-4a9441ebe195",
+        "chatSessionId": "sess_dcbf56ba-2b4e-4ded-9d6c-4821eb0481a8",
+        "timestamp": 1792390927200
+      },
+      {
+        "executionId": "6af84123-0b6c-4367-bf25-655aea9f48ec",
+        "chatSessionId": "sess_3bcd8f37-5afd-4878-8cde-f78165dc0d23",
+        "timestamp": 1792391149724
+      },
+      {
+        "executionId": "6af84123-0b6c-4367-bf25-655aea9f48ec",
+        "chatSessionId": "sess_3bcd8f37-5afd-4878-8cde-f78165dc0d23",
+        "timestamp": 1792393973689
+      }
+    ]
+  }
+}

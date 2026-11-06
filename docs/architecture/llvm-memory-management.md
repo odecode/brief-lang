@@ -1188,3 +1188,107 @@ the traditional `@malloc` + `@free` per operation. This is correct but
 not optimized — these paths are single-shot and don't benefit from
 arena reuse. If a callable txn is hot, it should be refactored as a
 reactive txn with a contract-proven bound to enable arena + preallocation.
+
+### Inline object payload capacity (2026-11-01)
+
+Enum planning consumes resolved object byte sizes from the type universe, the
+same authority used by object-image emission. Payload word counts round those
+bytes upward before applying the inline threshold and selecting the enum value
+representation. Unknown resolved sizes do not license inline object storage.
+AST-only planning retains its field-word model when no universe is available.
+This prevents nested object payloads from overflowing an enum image.
+
+Callable transaction local slots are emitted in the function entry block before
+parameter bindings. Prologue analysis must never emit instructions before the
+function header: those instructions would become invalid module-level IR.
+
+Each object field establishes its own declared enum construction context and
+restores the enclosing expression context afterward. The resulting field value
+keeps its enum type so aggregate ownership copies use that enum's image size.
+
+Inline object enum bindings own their byte image. An interior pointer into an
+enum image is insufficient because the image may occupy a caller stack slot,
+while an extracted object can outlive it through a return or aggregate field.
+Borrowed projection lowering requires a non-retaining consumer proof.
+
+Object payload inline eligibility is independent of enum recursion depth: a
+resolved finite object image has the same representation in a nested enum as in
+standalone construction and matching. Enum depth caps apply to enum recursion.
+
+Callable transaction temporaries use one register namespace from the first entry
+allocation through the final body instruction. Reset the counter before emitting
+entry storage, never between the prologue and body.
+
+## Proof-directed call regions (2026-11-04)
+
+`analysis/reclamation.rs` derives a separate allocation-identity graph for each
+candidate callable. Its incoming storage is borrowed; allocations made during
+that invocation have distinct identities even when an earlier caller used the
+same allocation site. Copy, projection, raw memory, return and call constraints
+reach a fixed point across recursive edges. Generic bodies use the same concrete
+specialization identity as codegen (`analysis/generic_specialization.rs`).
+
+The initial consumer targets hosted native Linux x86-64 executables. Library,
+shared-library, embedded, wasm and existing arena paths keep their existing
+lowering. A scope is eligible only if no owned allocation reaches a returned
+value, incoming storage or an unclassified consumer. Owning result images remain
+with their caller. Global escapes and unknown effects suspend inheritance;
+`keep` remains a lifetime constraint. Conservative reasons remain queryable in
+`ReclamationPlan`; an absent proof is never permission to release a handle.
+
+Private region records track actual malloc results rather than type-shaped
+handles. Thus static/borrowed payloads and caller destination images never enter
+the owned-allocation list. Explicit free removes a record, realloc updates it,
+and failed realloc preserves the original record. A separate active-scope chain
+allows explicit releases of older allocations even while tracking is suspended.
+The source/runtime allocator ABI is unchanged. Reclamation occurs at proved call
+exits after all in-scope aliases; it does not depend on helper or type names.
+
+The LLVM consumer preserves parameter ABI and target/inlining attributes while
+invalidating stale memory-effect promises. It rewrites allocator instructions,
+never string data or inline-assembly text. The platform borrowing syscall table
+is in `config/memory-effects.toml`; unknown interfaces remain conservative.
+
+Native safety fixtures cover returned/late-used aliases, recursive and nested
+enum payloads, borrowed static strings, caller-held fields and early exits.
+Runtime bookkeeping is independently checked under Valgrind at O0 and O3/LTO.
+Collector memory readiness is a separate required gate; these architectural
+rules alone are not a claim that the application memory gate passes.
+
+Field constraints keep independent object members and enum variant payloads
+separate. Runtime reflection evaluates its receiver, so definition liveness must
+include calls beneath that receiver before deriving ownership. Syscall borrowing
+requires an exact number: a known literal mixed with an unknown value or used in
+arithmetic is not evidence that the resulting number names a borrowing interface.
+The constant lattice propagates uncertainty as well as known alternatives.
+
+Recursive functions inherit enclosing scopes rather than receiving a return
+epilogue that would prevent tail-call elimination. Proved nonrecursive scopes
+retain their frames in separate `noinline` calls. A generated-IR A/B established
+that inlining the TLS-visible frame causes linear stack growth; retire this
+restriction only with a consumer that preserves bounded tail execution. Clone
+memory-effect attribute groups without changing pure functions, reserve every
+referenced group ID, and preserve quoted attribute values. Group 15 is explicitly
+defined as potentially trapping, read/write code; it cannot promise `norecurse`.
+
+The sole reactive node's proof maps to the compiler-owned process driver,
+independently of its source name. Multiple reactive nodes do not license this
+entry scope. An explicit program-end marker drains active scopes after evaluating
+the exit value. Process-lifetime global allocations remain outside these scopes.
+
+Entry eligibility additionally requires closed scalar global initializers.
+State declarations or executable/allocating initializers without global lifetime
+facts disable the process scope; independently proved helper scopes still work.
+Reactor pre/postcondition expressions participate in the graph because their
+calls execute in the same driver as the node body. Global binding types come
+from declarations, so ordinary scalar state tests retain their proved effects.
+
+`Malloc#` and hosted `Alloc#` share allocator emission and provenance bookkeeping.
+Their handles and remaining-size metadata use the target pointer width; only
+the allocator's size argument widens to its existing ABI. This prevents a
+wasm32 pointer-typed register from containing an undeclared i64 result.
+
+Non-scalar pointer slots use target-width handles. Store adaptation consumes
+recorded physical register types or casting-graph resolution, including values
+widened at member-call boundaries. A generic parameter's spelling cannot prove
+its physical width; it must not bypass the normal narrowing conversion.

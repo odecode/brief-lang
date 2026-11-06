@@ -1,5 +1,17 @@
 # Backend Contracts & Decision Record
 
+## Raw-bit casts and tuple handles (2026-11-03 clarification)
+
+The Bit protocol category uses an encoding constructor when converting to
+String. Data-to-String preserves an already constructed representation handle.
+Concrete Bits<N> casts convert pointers to integer registers and zero-extend
+when widening raw integers. These distinct routes must remain covered together.
+
+LLVM tuple handles follow the target integer width (i32 on wasm32, i64 on
+x86_64), as established by f5bb16e6e. Tuple storage slots remain i64 words;
+slot width does not determine the function return ABI. Construction, calls,
+returns and destructuring must agree on handle width.
+
 **2026-08-23** · Distills every architectural decision from the backend
 scaffolding effort (plans `2026-08-23-backend-scaffolding-foundation.md`
 through `-webstack-v2-completion`, all CLOSED). This is the normative

@@ -1021,3 +1021,16 @@ the default for the semantics, not an opt-in speed keyword.
 
 **Migration:** Phases 0–7 in the plan. Unknown ⇒ box/copy/leak at every phase.
 **Rollback:** delete this part; D1–D26 remain authoritative.
+
+## Native call-region consumer (2026-11-04)
+
+Destination ownership and allocation ownership remain independent. A caller's
+result slot is never registered merely because it contains an enum or object.
+Frontend escape constraints license a call scope only when its allocations do
+not survive through returns, incoming storage, globals or unknown consumers.
+The native consumer records actual allocator results and releases those records
+at the proved scope boundary. Borrowed/static payloads are not recorded. Returned
+images can therefore survive in the consuming caller while its local backing
+allocations are reclaimed when that caller finishes. See
+`llvm-memory-management.md`, “Proof-directed call regions”, for target limits,
+recursive-call conservatism and explicit allocator interactions.

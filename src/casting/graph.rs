@@ -240,6 +240,11 @@ impl CastingGraph {
         // raw storage reinterpretation.
         self.set_lane("Data", "Bit", LaneKind::Bitcast);
         self.set_lane("Bit", "Data", LaneKind::Bitcast);
+        // 2026-11-03: raw bits require the encoding constructor, while Data
+        // already carries a representation handle. Keep the direct edge so
+        // BFS cannot bypass construction through Data's pointer cast. Remove
+        // only when declared cast constructors replace this default lane.
+        self.set_lane("Bit", "String", LaneKind::CastFromBitCallback);
         // 2026-08-28 (boundary handle invariant): Data — the universal
         // parent — IS the i64 handle at any boundary; Int ↔ Data is a
         // representation identity (Bitcast), giving pointer-representation
@@ -1475,15 +1480,17 @@ mod tests {
 
     #[test]
     fn test_bit_to_string() {
-        // 2026-08-01 (B2): Bit → String (the ENCODING DOOR) now routes through
-        // Data: Bit→Data is a bitcast, then Data→String is the encoding door
-        // from the Bit category, which materializes the String representation.
+        // 2026-11-03: preserve the August 1 encoding-door contract with a
+        // direct edge; Data now carries an already constructed representation.
         let graph = CastingGraph::new();
         let path = graph.find_path("Bit", "", "String", "");
         assert!(path.is_some());
         // The last hop is the encoding door.
         let last = path.unwrap().last().unwrap().lane.clone();
         assert_eq!(last, LaneKind::CastFromBitCallback);
+        let data = graph.find_path("Data", "", "String", "").unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].lane, LaneKind::IntToPtr);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+Add `std/net/http_response.bv`, a reusable bounded incremental HTTP/1.0 and HTTP/1.1 response framer for explicit Content-Length responses.
+
+Call `http_response_frame(header_limit, body_limit)`, append received bytes to a ByteBuf, and call `http_response_progress(frame, buffer, eof)`. It returns 0 for incomplete, 1 for complete and a negative value for invalid framing. `http_response_reset` reuses the frame between responses.
+
+The parser rejects duplicate Content-Length, transfer encoding, oversized/truncated messages, invalid header syntax and excess bytes already in the supplied buffer. It accepts final statuses 200–599, with absent zero-length framing allowed for 204/304. It deliberately does not implement TLS, chunked or EOF-delimited bodies, interim responses or redirect handling. HTTP version tokens are case-sensitive; header names are case-insensitive.
+
+The native gate exercises 20 cases plus incremental byte arrival, bounds, EOF, sticky failure and reset/reuse at O0 and O3. The module is pure Briev and this branch contains no compiler changes. The scheduled HTTP integration uses the statement-match and field-receiver fixes plus the prior nonblocking transport stack; repeated JSON validation also uses the structured-lifetime fix and #66. Final branch and integration validation is recorded below for this branch.
+
+Validation on 400952a2: 3,499 library tests passed with the long source-conformance sweep delegated to CI; the native response-framing gate passed at O0 and O3; cargo build passed without warnings. The feature is independently verified on main. Combined HTTP-client correctness, resource and compiler gates are recorded separately for the integration branch.
+
+Final combined verification (integration fd52b03f): 3,511 library tests and all 10 integration tests pass, including the new O0/O3 regressions, enum/list retention, descriptor availability, integer-output allocations, nonblocking transport and wasm32 tuple verification. The full ten-program IR determinism gate passes. Build has no warnings; Praetor has no new diagnostics. Clang 17 and 18 execute all three corpus programs with identical semantic output after excluding only the explicitly labelled timing values; the raw-byte matrix reports a parity failure on those elapsed times and is not claimed as passing. Source conformance remains delegated to CI; Kani cannot start on the executor's older glibc.
+
+The pinned integration also passes all controlled HTTP cases, two 50-request Valgrind cases (zero errors/lost bytes/open network descriptors), and a 25/25 successful GET /movies smoke at 5/s against an existing native server executable. This verifies the client path, not a fresh server build or server capacity.

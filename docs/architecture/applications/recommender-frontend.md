@@ -7,6 +7,12 @@ numbers displayed in the UI are one-based; the HTTP/WebSocket protocol uses
 zero-based item IDs. Updating an existing rating does not count as another
 distinct movie.
 
+Choosing a movie updates the title and selection flags using only the visible
+page (at most 12 cards). It preserves the existing ratings, ordering and page
+counts, without filtering the full catalogue or sending a request. The compiler
+checkout's examples/recommender/run-demo.sh builds this source copy; the external
+recommender-app checkout has a separate source and output directory.
+
 The native `GET /movies` endpoint returns the ordered MovieLens catalogue with
 each zero-based `item_id` and UTF-8 `title`. The UI improvement plan in
 `.kiro/specs/recommender-app/tasks-uiux-improvement.md` migrates the current
@@ -137,3 +143,13 @@ generic callable transactions use concrete element layouts; String decoding
 uses UTF-8; unchanged text is not rewritten on repeated flushes. Window events
 on the same element retain their individual handlers. WASM lowering promotes
 allocas and eliminates eligible tail recursion before stack-machine emission.
+
+Inline member/operator returns do not publish DOM changes. The enclosing
+transaction publishes its final state; collection reads must not re-render a
+partially updated page. Compiler FunctionState records inline member context
+without changing the transaction identity used by analysis proofs.
+
+A bare transaction term publishes only on its successful postcondition branch;
+it neither publishes nor performs exit cleanup while the post remains false.
+The sign-out confirmation transaction requires confirmation on entry and
+signed-out state on completion, because logout clears the confirmation flag.

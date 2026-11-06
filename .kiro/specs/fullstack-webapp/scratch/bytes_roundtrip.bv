@@ -1,0 +1,15 @@
+// Round-trip test for lib/std/net/bytes.bv (Task 1.7 mini, integer ops only).
+// Writes 0x1234 big-endian, then checks: round-trip value = 4660, raw byte 0 =
+// 0x12 = 18 (high byte first proves big-endian), raw byte 1 = 0x34 = 52.
+import "std/net/bytes.bv";
+
+node entry [beginprogram][true] {
+    let buf: ByteBuf = buf_new(8);
+    let filled: ByteBuf = put_u16_be(buf, 4660);
+    let roundtrip: Int = get_u16_be(filled, 0);
+    let byte0: Int = get_u8(filled, 0);
+    let byte1: Int = get_u8(filled, 1);
+    Print#(roundtrip);
+    Print#(byte0);
+    endprogram Print#(byte1);
+};

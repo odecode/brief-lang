@@ -1,0 +1,39 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inline members must not publish the outer transaction</title><style>body{max-width:1000px;margin:40px auto;padding:0 24px;color:#203046;background:#f6f8fb;font:17px/1.65 system-ui}h1{line-height:1.2}h2{margin-top:32px}pre{background:#152536;color:#e3edf7;padding:20px;overflow:auto;font:13px/1.65 Consolas,monospace;border-radius:10px}a{color:#235eaf}.tag{color:#6650a5;font-weight:bold}article{background:white;padding:28px;border-radius:16px} </style><body><a href="index.html">← All fixes</a><p class="tag">Compiler · Fix 09</p><h1>Inline members must not publish the outer transaction</h1><article><h2>Intended behavior and failure</h2><p>An inlined collection member returns to its caller; that return is not completion of the caller’s transaction. The old emission kept the outer transaction name but had no context distinguishing an inline member return from an outer publication boundary.</p><h2>Actual source change</h2><p>Repository: C:\Users\wotto\code\briev-lang<br>Source: <code>src/backend/llvm/emit_expr.rs</code></p><p>This is a verbatim Git diff against HEAD. Lines starting − are the earlier code; + marks the replacement; unmarked lines provide context. Each @@ header gives the original and current line ranges. Nearby comments are included as source context.</p><pre>@@ -4402,17 +4420,23 @@ impl LlvmBackend {
+         // BEFORE the binding maps were cleared for the body â€” the map no
+         // longer holds caller locals here.
+         let pregrown = member_is_push &amp;&amp; recv_local_name.as_ref()
+             .is_some_and(|n| self.ctx.coll_pregrow.contains_key(&amp;(txn_name, n.clone())));
+         let mut body = body;
+         if (proven || pregrown) &amp;&amp; member_is_push &amp;&amp; body.first().is_some_and(is_grow_guard) {
+             body.remove(0);
+         }
++        // 2026-11-01: inline member `term` returns a value, not a transaction
++        // commit. Suppress intermediate DOM publication while preserving the
++        // enclosing txn identity used by analysis proofs. Restore for nesting.
++        // Retire with an explicit commit-boundary plan for every inline body.
++        let saved_member_context = std::mem::replace(&amp;mut self.fun.in_inline_member, true);
+         crate::backend::llvm::emit_stmt::emit_statement_sequence(self, out, &amp;body, indent);
++        self.fun.in_inline_member = saved_member_context;
+         self.fun.self_binding = saved;
+         self.fun.self_prefix = saved_prefix;
+         self.fun.let_bindings = saved_bindings;
+         self.fun.let_binding_types = saved_types;
+         self.fun.let_original_types = saved_orig;
+         self.fun.last_val_temps = saved_lvt;
+         self.fun.last_val_types = saved_lvt_types;
+         // 2026-09-24: cur_block intentionally NOT restored â€” see the removal
+
+@@ -74,11 +74,11 @@ pub(super) fn emit_web_flush_batch(backend: &amp;mut LlvmBackend, out: &amp;mut String,
+     let txn_name = backend.fun.txn_name.clone();
+     // 2026-10-23 (webstack stateless fn): wrapper/defn emission is not a
+     // state-machine transaction. A stateless body has no %state parameter, so
+     // flushing there emits undefined IR. Only real txn/reactive drivers set
+     // txn_name and are eligible.
+-    if txn_name.is_empty() || backend.fun.stateless_body {
++    if txn_name.is_empty() || backend.fun.stateless_body || backend.fun.in_inline_member {
+         return;
+     }
+     // 2026-08-10: the write_set is frontend analysis â€” sorted by field index
+     // for deterministic IR (AGENTS.md HashMap iteration rule).
+     let mut written: Vec&lt;usize&gt; = backend.ctx.transition_graph.as_ref()
+</pre><h2>Reading the code</h2><p>mem::replace sets in_inline_member to true and saves the previous Boolean. After emitting the member body, restoring the saved value supports nested inline calls. emit_web_flush_batch now returns early when this flag is true. Keeping txn_name intact preserves the analysis proofs associated with the surrounding transaction.</p><h2>Why the correction works and how it was checked</h2><p>Twelve indexed card reads triggered repeated page reconciliation. Scoped suppression reduced 14 flushes to two; the separate bare-term correction removed the last duplicate. A compiler regression checks publication count and the generated-browser fixture checks actual flushes.</p></article></body></html>

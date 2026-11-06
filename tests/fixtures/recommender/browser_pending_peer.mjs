@@ -97,7 +97,20 @@ try {
   await page.evaluate(text => window.__pendingPeer.message(text), JSON.stringify(initial));
   await page.getByText('Movie 41', { exact: true }).waitFor();
 
+  const requestsBeforeSelection = await page.evaluate(() => window.__pendingPeer.requests.length);
+  const pageBeforeSelection = await page.locator('#movie-page').innerText();
+  const ratingsBeforeSelection = await page.locator('#ratings').innerText();
+  const movieFive = page.locator('.movie-list li').filter({ has: page.getByText('Movie 5', { exact: true }) });
+  await movieFive.getByRole('button').click();
+  await movieFive.getByRole('button', { name: 'Selected', exact: true }).waitFor();
   await page.locator('.movie-list li').filter({ has: page.getByText('Movie 6', { exact: true }) }).getByRole('button').click();
+  await page.locator('.selected-title').getByText('Movie 6', { exact: true }).waitFor();
+  await movieFive.getByRole('button', { name: 'Choose', exact: true }).waitFor();
+  assert.equal(await page.locator('.select-movie.selected').count(), 1);
+  assert.equal(await page.locator('#movie-page').innerText(), pageBeforeSelection);
+  assert.equal(await page.locator('#ratings').innerText(), ratingsBeforeSelection);
+  assert.equal(await page.evaluate(() => window.__pendingPeer.requests.length), requestsBeforeSelection);
+  assert.equal(await page.evaluate(() => window.__pendingPeer.sent.length), 0);
   await page.getByRole('button', { name: '4 stars', exact: true }).click();
   await page.locator('#save-rating').click();
   await page.locator('#ratings').getByText('· saving', { exact: false }).waitFor();
@@ -121,10 +134,16 @@ try {
   await page.evaluate(text => window.__pendingPeer.message(text), JSON.stringify(refreshed));
   assert.equal(await page.locator('#recommendations li').count(), 1);
 
-  await page.evaluate(() => window.__pendingPeer.sockets.at(-1).close());
-  await page.locator('.movie-list li').filter({ has: page.getByText('Movie 7', { exact: true }) }).getByRole('button').click();
-  await page.getByRole('button', { name: '5 stars', exact: true }).click();
-  await page.locator('#save-rating').click();
+  // Keep close and submit in one event turn so reconnect timing cannot
+  // change this HTTP-fallback test into a live-channel submission.
+  await page.evaluate(() => {
+    window.__pendingPeer.sockets.at(-1).close();
+    const row = [...document.querySelectorAll('.movie-list li')]
+      .find(item => item.querySelector('strong').textContent === 'Movie 7');
+    row.querySelector('button').click();
+    document.querySelector('[aria-label="5 stars"]').click();
+    document.querySelector('#save-rating').click();
+  });
   await page.waitForFunction(() => window.__pendingPeer.requests.some(request => request.url.includes('/v1/ratings')));
   const submitIndex = await page.evaluate(() => window.__pendingPeer.requests.findIndex(request => request.url.includes('/v1/ratings')));
   const fallback = JSON.parse(await page.evaluate(index => window.__pendingPeer.requests[index].body, submitIndex));
@@ -146,11 +165,16 @@ try {
   await page.getByText('Rating saved.', { exact: true }).waitFor();
   assert.equal(await page.locator('#recommendations li').count(), 1);
 
-  await page.evaluate(() => window.__pendingPeer.sockets.at(-1).close());
-  const submitCountBeforeFailure = await page.evaluate(() => window.__pendingPeer.requests.filter(request => request.url.includes('/v1/ratings')).length);
-  await page.locator('.movie-list li').filter({ has: page.getByText('Movie 8', { exact: true }) }).getByRole('button').click();
-  await page.getByRole('button', { name: '2 stars', exact: true }).click();
-  await page.locator('#save-rating').click();
+  const submitCountBeforeFailure = await page.evaluate(() => {
+    const count = window.__pendingPeer.requests.filter(request => request.url.includes('/v1/ratings')).length;
+    window.__pendingPeer.sockets.at(-1).close();
+    const row = [...document.querySelectorAll('.movie-list li')]
+      .find(item => item.querySelector('strong').textContent === 'Movie 8');
+    row.querySelector('button').click();
+    document.querySelector('[aria-label="2 stars"]').click();
+    document.querySelector('#save-rating').click();
+    return count;
+  });
   await page.waitForFunction(count => window.__pendingPeer.requests.filter(request => request.url.includes('/v1/ratings')).length > count, submitCountBeforeFailure);
   const failedSubmit = await page.evaluate(() => window.__pendingPeer.requests.map((request, index) => ({ request, index }))
     .filter(entry => entry.request.url.includes('/v1/ratings')).at(-1).index);

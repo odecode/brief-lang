@@ -1,0 +1,17 @@
+Preserve ownership and type facts through structured values so scalar consumers can reclaim temporary allocations without shortening escaping values' lifetimes.
+
+The discriminators are local versus escaping slices, enum payload destructuring, indexed casts, and a plain binding versus collection destructuring. These previously introduced unknown-effect barriers or false aliases. Literal numeric constants also incorrectly carried their global storage address as provenance.
+
+In `src/analysis/reclamation/walk.rs`, retain payload type facts, resolve index types through the type checker, model slices as a possible fresh allocation plus backing-storage alias, classify pure intrinsic methods through the existing registry, and make only actual destructuring load elements. Available definition bodies include implicit cast targets omitted from direct-call liveness. Unknown calls and custom indexed operations remain conservative barriers.
+
+Six focused ownership tests cover positive and negative cases. The existing contiguous-view test accepts either malloc or region allocation while retaining its layout checks. A native JSON parsing fixture runs at O0 and O3. The combined integration additionally validates repeated successful and rejected HTTP catalogue responses under Valgrind.
+
+This main-based branch is independently testable. Full JSON/socket reclamation additionally depends on #66's concrete method and socket effects; preserve that method-dispatch path when combining the changes. The pure-intrinsic fallback here composes after concrete method resolution. No capacity or compiler-speed claim is made: analyzing available bodies can be expensive for large programs, and a fresh full web-server build did not finish during the integration experiment.
+
+Validation on commit 632f602e: 3,505 library tests passed (the long source-conformance sweep is delegated to CI); the structured-lifetime native regression passed at O0 and O3; `cargo build` passed with no warnings. Praetor comparison on the changed Rust files found no new diagnostics. Kani could not start: the installed binary requires glibc 2.32–2.34, unavailable in this WSL environment. The final merged integration results are recorded below.
+
+Source locations in 632f602e: src/analysis/reclamation/walk.rs:36 (implicit-cast bodies), :185 (plain binding versus destructuring), :223 (payload pattern facts), :306 (slice provenance), and :372 (conservative indexed-operation barrier). Payload substitution is in src/analysis/reclamation/walk/structured.rs.
+
+Final combined verification (integration fd52b03f): 3,511 library tests and all 10 integration tests pass, including the new O0/O3 regressions, enum/list retention, descriptor availability, integer-output allocations, nonblocking transport and wasm32 tuple verification. The full ten-program IR determinism gate passes. Build has no warnings; Praetor has no new diagnostics. Clang 17 and 18 execute all three corpus programs with identical semantic output after excluding only the explicitly labelled timing values; the raw-byte matrix reports a parity failure on those elapsed times and is not claimed as passing. Source conformance remains delegated to CI; Kani cannot start on the executor's older glibc.
+
+The pinned integration also passes all controlled HTTP cases, two 50-request Valgrind cases (zero errors/lost bytes/open network descriptors), and a 25/25 successful GET /movies smoke at 5/s against an existing native server executable. This verifies the client path, not a fresh server build or server capacity.

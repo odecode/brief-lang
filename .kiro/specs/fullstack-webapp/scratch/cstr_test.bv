@@ -1,0 +1,15 @@
+// Test put_cstr: write "Hi" NUL-terminated, read back bytes. Expect H=72, i=105,
+// NUL=0, and the final buffer len = 3 (2 bytes + terminator).
+import "std/net/bytes.bv";
+
+node entry [beginprogram][true] {
+    let buf: ByteBuf = buf_new(16);
+    let written: ByteBuf = put_cstr(buf, "Hi");
+    let byte0: Int = get_u8(written, 0);
+    let byte1: Int = get_u8(written, 1);
+    let byte2: Int = get_u8(written, 2);
+    Print#(byte0);
+    Print#(byte1);
+    Print#(byte2);
+    endprogram Print#(written.len);
+};

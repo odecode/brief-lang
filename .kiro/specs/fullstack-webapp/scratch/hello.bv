@@ -1,0 +1,5 @@
+// Minimal firing hello: a node fires in the reactor tick loop (a plain txn does not).
+// endprogram makes the output observable so the optimizer keeps it.
+node entry [beginprogram][true] {
+    endprogram Print#("Hello from Briev");
+};

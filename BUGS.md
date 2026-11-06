@@ -11832,6 +11832,124 @@ is admitted only for a type parameter of the enclosing callable.
 This is part of the enum value model migration: collection elements must own a
 complete value or an explicitly owned box, never a borrowed constructor slot.
 
+## 2026-10-28: pooled object replacement lost across reactor sweeps — fixed
+
+Merge `5c2ec29c` selected main's assignment emitter and dropped the pooled
+whole-object publication arm from `894fcfa5`. The recommender queued auth job 2,
+but the next sweep saw persistence_busy=false, auth_slot=-1, job 0, next_job=2.
+The worker returned a matching response, which the coordinator discarded; the
+HTTP request waited indefinitely and the browser displayed network.
+Restore the general assignment bridge using emit_instance_seed_from_value;
+retain local shadowing and dependent/boxed pool guards. Copy native field widths
+when boxing a pool row. Gate: pooled_object_replacement_survives_reactor_firings
+at O0/O2, plus live authentication and session checks.
+
+## FIXED 2026-11-01: nested object payload underallocates inline enum image
+
+Repro: `obj Inner { a: Int; b: Int; c: Int; }; obj Outer { inner: Inner; tail: Int; }; enum E { Wrap(Outer), Empty };`
+Constructing Wrap from an object-returning helper panics: the enum planner reserves
+two words but object emission copies the resolved 32-byte image. The recommender
+hits this for RatingSaved. Fix: feed resolved universe object sizes into
+enum planning before inline eligibility and representation selection. Unknown
+sizes remain boxed. No application workaround. Verified by the native and WASM builds, focused reproductions and live browser save flow.
+
+## FIXED 2026-11-01: callable transaction locals emitted outside function
+
+Repro: a parameterized txn declares a local, assigns it in a when block, then
+reads it afterward. emit_body_prologue emits its stack allocation before the
+function header; LLVM rejects the module. Fix: run the existing
+prologue after the entry label and before parameter binding, preserving its
+shadowing and dominance rules. scratch/callable_txn_local_slot.rbv isolates the
+failure. Verified by the isolated WASM repro and full app build; no application workaround.
+
+## FIXED 2026-11-01: enum field constructor inherits unrelated return layout
+
+Server diagnostic: OwnedOperationJob expects Result<ProfileUpdate,AdmissionError>,
+so tag 1 selects AdmissionError's three-word capacity while copying a six-word
+WorkerTag. Struct field emission did not establish its declared enum context.
+Fix: scope expected enum type to each field, restore the outer context,
+and retain the declared enum type for field ownership. No application workaround.
+
+## FIXED 2026-11-01: inline object enum extraction returns a stack interior
+
+Both app targets compile, but the native server frees 0x90 after worker startup.
+Debugger: worker_channel_close receives a channel whose buffer object points
+into a dead stack frame. Enum object pattern binding returned the interior of
+a caller-owned enum image; unwrap then retained that pointer in an object field.
+Bound object values need an owned image unless a non-retaining projection proof
+licenses borrowing. Fix: copy inline object payload images at binding.
+Verified by the O0 lifetime gate and live server/browser save flow; no app workaround.
+
+## FIXED 2026-11-01: nested enum object payload changes ABI at depth cap
+
+Saving a rating corrupts the stack in protocol_decode_worker: the nested enum
+planner applies the enum recursion cap to finite object images, boxes the object
+in the parent layout, but standalone construction/matching inlines it. The child
+writes beyond the parent's reserved image. Object image size is independent of
+enum recursion depth; preserve its representation when nested. Fix prepared.
+
+2026-11-01 closure verification: both app targets build; the browser selection smoke and real-server registration/login/rating-save flow pass. Full browser pending-peer regression passes. Library suite is the final running gate.
+
+## OPEN 2026-11-01 final-suite observations
+
+Recommender closure final cargo test --lib reports failures outside its focused
+20 passing tests. Confirmed examples: backend::spirv::tests::test_scale_kernel_passes_spirv_val
+rejects emitted SPIR-V 1.6 under a 1.5 target; wasm32_tuple_return_uses_boxed_i64_abi
+expects a boxed tuple helper that emission does not contain. These do not block
+the verified native/WASM recommender registration/login/selection/save flow.
+The full conformance sweep is still running; final status goes in the closure plan.
+
+## FIXED 2026-11-01: inline collection reads publish partial browser transactions
+
+A member's term inherited the outer txn name and emitted DOM publication.
+select_movie flushed 14 times for 12 cards, repeatedly reconciling the same DOM.
+A generated-host deferral experiment reduced this to one flush per click while
+preserving final selection state. Fix prepared: suppress flushes inside scoped
+inline member bodies, retaining the outer txn identity for analysis proofs.
+
+## FIXED 2026-11-01: callable transaction resets register allocator after entry
+
+Changing commit emission exposed duplicate t82 definitions: entry alloca and
+body GEP. emit_callable_txn reset txn_counter after prologue allocation, reusing
+register names. Reset once before any instruction in the function instead.
+
+2026-11-01 commit-boundary verification: emitted selection has one flush; browser
+profile confirms one publication per click and full pending-peer gate passes.
+Bare term publication/cleanup now occurs only on the successful stop branch.
+Logout confirmation now states signed-out completion rather than requiring the
+confirmation flag that logout clears. Focused compiler regressions are the
+final running gate; no full-suite rerun or benchmarks requested for this change.
+
+2026-11-01 final commit-boundary gate: 9/9 crash regressions, 9/9 bare-term
+semantics, full pending-peer browser gate and release/debug IR equality pass.
+Measured final selection publishes once per click (~0.95 ms fixture average).
+Release compiler used by run-demo.sh is rebuilt; current frontend assets served.
+
+2026-11-02 wasm recommendation score displayed as zero: protocol validation
+accepted the decoded 4.5, but `Float as String` rendered `0 / 5 predicted`.
+An experimental `Int64` formatter rewrite broke stdlib contract proofs;
+restoring the original formatter still produced the correct score once the
+backend was fixed, so the width hypothesis was refuted. Generated wasm IR
+showed `frac_all_digits` called the digit loop then returned literal zero.
+A guarded recursive `term` had set
+`tail_loop_backedge`, and the later false continuation inherited it, dropping
+the actual terminal return. Guarded emission now clears that state at its
+merge. The standalone browser fixture renders `4.5 / 5 predicted` and pins
+the result; the compiler regression pins the guarded tail-loop IR.
+
+2026-11-03 raw-bit encoding regression: the representation-preserving
+Data-to-String lane introduced in 894fcfa5 also removed the encoding route
+from the Bit category. Restored its explicit constructor edge. Concrete
+Bits<N> pointer casts now emit ptrtoint; widening raw integers zero-extends
+instead of emitting an invalid trunc. The default constructor consumes the
+actual source width; custom constructors receive their canonical i64 word.
+Native and wasm String/Bits/String and String/Data/String reproductions pass.
+
+The tuple-return test incorrectly required i64 on wasm despite f5bb16e6e's
+intentional target-width ABI. It now checks matching definition/call/use on
+32- and 64-bit targets; the browser return/destructure/field fixture yields 6.
+The new browser cast fixture also verifies Bits<8>-to-Bits<32> widening.
+
 ## 2026-11-03: native monotonic clock failure violated return contract
 
 Found while building the Briev-native recommender load harness. os/time.bv
@@ -11934,3 +12052,120 @@ the allocation lowering keeps address and remaining-length provenance aligned.
 Inline member coercion also widened unresolved element parameters before
 target-width stores. Preserve the actual operand type for abstract parameters.
 The rbv_list_each_wasm corpus reproduces both failures and now passes.
+
+## FIXED 2026-11-04: native integer printing retained a string per value
+
+Printing a signed integer constructed an owned decimal string, copied the bytes
+to buffered stdout, and lost its backing allocation. Emit the decimal digits
+directly to the existing byte sink. Keeping the magnitude nonpositive covers
+INT64_MIN without overflow. Native allocator and byte-output gates cover
+repeated writes across a flush and the old allocation-count failure.
+
+## 2026-11-04 — nested environment macros missed parsed-stage expansion
+
+`foreach index in 0..get_env_int!("READS")` and nested arguments such as
+`get_env_int!(get_env_or_default!("KEY", "READS"))` could retain a plugin
+intercept until codegen. The environment plugin used a partial AST walker:
+loop bodies, guards, index operands and intercept arguments were omitted.
+It now uses the shared exhaustive postorder mutable visitor, retaining the
+compile-time constant pass, receiver-first calls and unrelated plugin nodes.
+Focused regression and end-to-end verification are in progress. This repairs
+expansion only; general collector allocation reclamation remains open.
+
+Verification: expansion regressions 3/3 and native integration 1/1 pass;
+3,441 library tests pass (only delegated conformance sweep excluded); compiler
+build passes; quick IR determinism 3/3 passes. Current SPIR-V validator and
+LLVM 17 bin paths were selected explicitly. Praetor reports no diagnostics in
+the changed environment plugin or new tests. General reclamation remains open.
+
+## 2026-11-04 — local returned allocations lack reclamation (repair in progress)
+
+Whole-file results, parser list storage, object observations and enum images
+outlived local consumers. Destination representation did not prove ownership of
+the image or active payload, and returned heap allocations were not registered
+for general destruction. Do not infer permission to free from Result<T,E> or
+an LLVM register's shape.
+
+The new frontend call-region analysis separates incoming borrowed storage from
+allocations created during a call, propagates recursive/alias/memory facts and
+uses concrete generic specializations. Its native consumer tracks actual
+allocations, including explicit free and realloc, and releases only within a
+proved non-escaping scope. The independent runtime and native alias fixtures
+pass Valgrind with zero lost bytes or memory errors. Collector verification and
+final regression gates remain pending; no memory-stability claim yet.
+
+### 2026-11-04 memory closure verification
+
+The local returned-allocation repair is FIXED for the hosted Linux x86-64
+collector path. All nine Valgrind cases now report zero definite/indirect loss
+and zero errors. Both 5,000-row self-preflights have flat RSS/virtual memory
+after warmup. Alias, borrowed/static and caller-storage native fixtures pass;
+the independent allocator runtime passes O0 and O3/LTO with failure injection.
+Full evidence and target/conservative fallback limits are in
+`docs/plans/2026-11-04-collector-reclamation-closure.md`.
+
+Two prerequisite defects were also fixed: runtime reflection omitted receiver
+calls from definition liveness, and LLVM attribute group 15 was accidentally
+commented out by literal escaped newlines. Cloned attribute IDs must reserve
+all references, including undefined ones; otherwise a new group silently gives
+old functions incorrect effects (including `norecurse`). Region frames also
+need separate calls to preserve the recursive driver's bounded tail execution;
+the generated-IR A/B and native bounded-execution fixture pin that requirement.
+
+Exact-number effects must propagate uncertainty: `SysCall#(number+1,pointer)`
+cannot borrow merely because one operand is literal 1. Computed or partly
+unknown numbers now conservatively capture; focused tests cover both cases.
+
+Wasm verification also exposed two representation defects. `Malloc#` returned
+an i64 SSA value with a wasm32 pointer type; reuse target-width allocator
+emission/provenance rather than duplicating it. Non-scalar pointer stores also
+guessed that a one-letter generic type meant an i32 register, even after member
+argument coercion had widened it. Consume recorded register representation or
+the casting-graph type instead. The existing wasm collection/JSON corpus
+exercises both paths; the native collector's allocation ABI is preserved.
+
+## 2026-11-05 — unannotated object tuple destructuring panics
+
+A controlled load-transport peer returning `(Socket,Socket)` exposed LLVM
+codegen binding both unannotated elements as Int. Subsequent `.fd` access
+panicked with "field access '.fd' on non-struct type 'Int' reached codegen".
+The destructure emitter consults only the optional source annotation and
+ignores the typed initializer. Consuming the initializer type alone is
+insufficient: tuple materialization also returns Int and loses local element
+types. The candidate was removed after its local-tuple regression failed.
+OPEN. Reproducer: recommender `benchmarks/load/probes/transport_progress.bv`.
+Investigation: `docs/plans/2026-11-05-load-transport-tuple-types.md`.
+
+The rebuilt working compiler also exposes a separate OPEN lifetime defect:
+`int_to_str` emits a pointer view for `d as String`, then frees `d` and returns
+the freed pointer. `process_metrics_gate` segfaults natively; Valgrind reports
+six errors including reads from freed decimal-string storage in `proc_stat_read`.
+The older November 4 binary passed the functional baseline, so those earlier
+results cannot establish safety of the current rebuilt source.
+
+## 2026-11-05 — collector checkpoint completed from clean main
+
+The descriptor leak is fixed independently on `fix/read-file-descriptor-lifetime`
+(`6850858a`, PR #63). Trigger: repeated `read_file("/proc/self/stat")` or reads
+of a directory kept consuming descriptors because read_file returned read_whole
+without close. The wrapper now closes after every successful open, preserving
+the read result. No application workaround was added.
+
+The earlier int_to_str use-after-free reproduces in this dirty integration's
+aliasing Data-to-String graph combined with the copied upstream free-after-copy
+formatter. Clean main retains the encoding copy and passes the collector memory
+checks. Do not publish a stdlib free-removal patch against main for this mismatch.
+This working tree remains preserved; verified collector development uses the
+separate integration/load-collector-verified worktree at
+`C:/Users/wotto/code/recommender-compiler-carveouts/load-collector-prerequisites`.
+
+PR #64 (`c403e943`) packages checked timing, process-stat/auxv and bounded
+histograms. Combined commit `68e81bf1` passes 3499 library tests (the previously
+delegated source sweep stays in CI), native regressions and the collector
+checkpoint: ten Valgrind checks and two 5000-row runs with flat post-warmup
+memory. App checkpoint commit: `80aae72`. The tuple/transport probe remains
+pending, independent of this completed collector checkpoint.
+
+2026-11-05 transport continuation: inferred tuple metadata/slot decoding fixed in 05d8aef7 (PR #65). Separate lifetime proof work covers copying socket effects and explicit-receiver methods; controlled transport gates pass. See clean carve-out plans; original working-tree changes preserved.
+
+2026-11-05 controlled transport COMPLETE: PR #65 tuple metadata/representations and PR #66 copying-socket/concrete-method lifetime proofs pass clean-branch and combined gates. Stdlib feature is PR #67. App checkpoint ac7ffa7; verified integration 044192d4. Toolchain harness observation: toolchain_matrix.sh compares elapsed-time output verbatim and exits on absent output globs with pipefail; all three programs execute under Clang 17/18 and semantic output matches after removing only named timing label/value pairs. Original harness unchanged; full evidence is in the app checkpoint record.

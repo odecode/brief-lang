@@ -1,0 +1,41 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Transaction allocations inside the function</title><style>body{max-width:1000px;margin:40px auto;padding:0 24px;color:#203046;background:#f6f8fb;font:17px/1.65 system-ui}h1{line-height:1.2}h2{margin-top:32px}pre{background:#152536;color:#e3edf7;padding:20px;overflow:auto;font:13px/1.65 Consolas,monospace;border-radius:10px}a{color:#235eaf}.tag{color:#6650a5;font-weight:bold}article{background:white;padding:28px;border-radius:16px} </style><body><a href="index.html">← All fixes</a><p class="tag">Compiler · Fix 07</p><h1>Transaction allocations inside the function</h1><article><h2>Intended behavior and failure</h2><p>Local stack allocations belong inside the LLVM function that uses them. The old callable-transaction emitter wrote its body prologue before the function header.</p><h2>Actual source change</h2><p>Repository: C:\Users\wotto\code\briev-lang<br>Source: <code>src/backend/llvm/emit_toplevel.rs</code></p><p>This is a verbatim Git diff against HEAD. Lines starting − are the earlier code; + marks the replacement; unmarked lines provide context. Each @@ header gives the original and current line ranges. Nearby comments are included as source context.</p><pre>@@ -5863,17 +5867,19 @@ fn probe_ok_checks(
+         self.fun.ssa_old_float_regs.clear();
+         // 2026-10-16 (S4, fifth path): callable-txn bodies had the SAME flaw-4
+         // shape â€” no reassigned-let pre-declaration, so `let b = 0;` +
+         // `when c { b = â€¦; }` demoted the alloca into the guard block while
+         // post-guard reads landed outside its dominance. The prologue runs
+         // before the parameter slots bind (:pN_s / let_bindings below), so a
+         // body let shadows nothing and params win any collision exactly as
+         // before. Default opts: this driver&#x27;s selective clears above stand.
+-        self.emit_body_prologue(out, &amp;txn.body, PrologueOpts::default());
++        // 2026-11-01: Emit this prologue inside entry, below; reassigned lets
++        // allocate stack storage and cannot appear between function definitions.
++        // Keep it before parameter binding; retire with a unified function builder.
+ 
+         let has_return = if let Some(ref ot) = txn.output_type {
+             match ot {
+                 crate::ast::OutputType::Single(ty) =&gt; !matches!(ty, Type::Void),
+                 crate::ast::OutputType::Tuple(ts) =&gt; !ts.is_empty(),
+                 _ =&gt; false,
+             }
+         } else {
+
+@@ -5935,16 +5941,17 @@ fn probe_ok_checks(
+             let _ = write!(out, &quot;, {} %arg{}&quot;, self.llvm_type(t), i);
+         }
+         // 2026-07-04: Use #8 (argmemonly) for callable transactions.
+         // Callable txns never access @link trigger globals â€” they only
+         // read/write through %state. argmemonly tells LLVM the function
+         // only accesses memory through its pointer arguments.
+         writeln!(out, &quot;) local_unnamed_addr #8{} {{&quot;, inline_str).ok();
+         writeln!(out, &quot;  entry:&quot;).ok();
++        self.emit_body_prologue(out, &amp;txn.body, PrologueOpts::default());
+ 
+         // 2026-07-18: Use the function&#x27;s return type for %result, not always i64.
+         // Bool-returning functions need i8 result type to match the define i8 signature.
+         // 2026-08-11 (Phase 2a2 fix): a parameterized VOID txn (e.g.
+         // `txn set_name(n: String)`) emitted `alloca void` + `store void 0` â€”
+         // invalid LLVM (&quot;void type only allowed for function results&quot;) that
+         // made llc reject the wasm module. The result slot only exists when
+         // the txn actually returns a value.
+</pre><h2>Reading the code</h2><p>emit_body_prologue discovers and emits local storage needed by the transaction body. writeln! appends LLVM instructions to the output string. PrologueOpts::default() constructs default options. The call is moved after the emitted entry label, but remains before parameter binding so the existing binding order is preserved.</p><h2>Why the correction works and how it was checked</h2><p>A reassigned local caused alloca to appear at module scope and LLVM rejected the app. A callable-local regression checks allocation placement; the isolated repro and app frontend compiled successfully.</p></article></body></html>

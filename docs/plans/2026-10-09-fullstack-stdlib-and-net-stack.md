@@ -317,6 +317,52 @@ WORKFLOW.md; the existing WSL `brievc` binary predates this Rust edit. I09 keeps
 static template punctuation ASCII until the rebuilt compiler verifies Unicode
 output.
 
+## 2026-11-01 compiler bug log: nested object enum image
+
+Recommender SavedRating(RatingSaved) exposes an inline enum image smaller than
+the resolved object payload. Minimal repro and fix status: BUGS.md entry dated
+2026-11-01; execution record docs/plans/2026-11-01-recommender-compiler-closure.md.
+No stdlib/app workaround; planner must consume resolved object byte sizes.
+
+### 2026-11-01 callable transaction entry allocation
+
+The recommender selection loop exposes a module-level alloca emitted by the
+callable transaction prologue. Minimal repro: scratch/callable_txn_local_slot.rbv.
+Move the prologue into entry, before parameter bindings; no stdlib workaround.
+
+### 2026-11-01 enum field context
+
+OwnedOperationJob inside an object inherited the enclosing Result return layout.
+Field emission must scope constructors to the declared field enum; no app workaround.
+
+### 2026-11-01 inline object projection lifetime
+
+Worker startup exposes unwrap returning an inline object's interior pointer into
+a stack enum image. Bound object values must own an image before escaping; no
+application workaround. Runtime evidence and status are in the closure plan.
+
+### 2026-11-01 nested enum object ABI
+
+Save decoding exposes differing nested/standalone object payload capacities.
+Finite object images must not change representation at the enum recursion cap.
+
+### 2026-11-01 inline member commit boundary
+
+Repeated selection renders came from collection At members publishing the outer
+transaction on their own term. The generated-host experiment reduced 14 flushes
+per click to one. Scope inline member context and retain only the outer commit;
+see docs/plans/2026-11-01-recommender-selection-commit-boundary.md.
+
+### 2026-11-03 compiler regression closure
+
+Raw `Bits<N>` encoding lost its constructor when Data-to-String became a
+representation cast. Restored a distinct graph edge, corrected concrete bit
+casts from pointers and widening integers, and verified native/browser round
+trips without an app workaround. The tuple test's i64-only expectation was
+obsolete after upstream's target-width handle migration; both target widths
+and a browser return/destructure fixture now cover the intended ABI. See
+`docs/plans/2026-11-03-cast-and-tuple-regressions.md` for verification.
+
 ## 2026-11-03 — load-harness compiler fix submissions
 
 The load work's native compiler fixes were carved from upstream main 373e548e
@@ -329,3 +375,163 @@ to upstream's centralized enum query and retains newer browser publication
 rules. Native gates and clean-branch library suites pass; the long conformance
 sweep is delegated to upstream CI. Broad returned-value lifetime closure and
 interpreter indexed-write parity remain open rather than being claimed fixed.
+
+## 2026-11-04 increment — nested environment expansion
+
+The collector probe exposed an unresolved nested `get_env_int!` intercept.
+The environment plugin's partial walker omitted control-flow/operand positions
+and intercept arguments. Migrate it to the shared exhaustive postorder visitor;
+preserve constants, receiver-first calls and unknown plugin nodes. Focused
+regressions and native end-to-end verification are in progress. No harness
+workaround or bounded-memory claim is introduced.
+
+Expansion verification: 3 focused unit tests, native integration and 3,441
+library tests pass; only the delegated conformance sweep is excluded. Build
+passes without new warnings and quick IR determinism passes all three corpus
+programs. Select the installed current SPIR-V validator and LLVM 17 tools on
+PATH. No reclamation change or load-testing readiness claim follows.
+
+## 2026-11-04 increment — collector memory closure
+
+General frontend allocation/alias/escape facts now license hosted native call
+regions. The runtime tracks actual allocator results, preserving caller images
+and borrowed/static payloads, and handles explicit free/realloc and failures.
+No collector-level frees or helper-name compiler exceptions were added.
+
+All nine Valgrind cases pass with zero definite/indirect loss and memory errors.
+Two 5,000-sample runs at 500 Hz stay flat after warmup: RSS 355 and 378 pages,
+virtual memory 3,989,504 bytes in both. Full load functional checks pass.
+Native alias/runtime and both wasm gates pass; library verification passes
+3,459 tests with only the delegated source conformance sweep excluded. Compiler
+build and all seven IR determinism corpus programs pass. Kani cannot start on
+the executor's older glibc; the harnesses are not claimed formally verified.
+
+The investigation also fixed runtime-reflection liveness, missing/colliding LLVM
+attribute groups, tail-execution frame retention and wasm allocator/store widths.
+Evidence, target limits, commands and hashes:
+`docs/plans/2026-11-04-collector-reclamation-closure.md`. The application load
+plan is `C:/Users/wotto/code/recommender-app/docs/plans/2026-11-03-briev-native-load-harness.md`.
+Memory repair is complete in the working checkout; backend capacity and sustained
+application campaigns remain unmeasured. Commit/carve-out awaits workflow approval.
+
+## 2026-11-05 — load collector checkpoint and resource bug log
+
+- [x] Reproducible collector checkpoint committed in recommender-app as
+  `80aae72`; execution record is
+  `../recommender-app/docs/plans/2026-11-05-collector-checkpoint.md`.
+- Minimal resource trigger: `read_file("/proc/self/stat")` repeated, or
+  `read_file("/proc/self")` returning EISDIR. Main leaked the opened descriptor.
+  Proper fix: retain read_whole's result, close the descriptor, return that
+  result. No harness workaround. Independent branch `6850858a`, PR #63:
+  https://github.com/Randozart/briev-lang/pull/63.
+- Collector prerequisites are a separate clean feature, `c403e943`, PR #64:
+  https://github.com/Randozart/briev-lang/pull/64. No compiler Rust changes.
+- `integration/load-collector-verified` at `68e81bf1` combines both branches
+  in the load-collector-prerequisites carve-out worktree. Both branches and
+  integration passed 3499 library tests; the source sweep remains CI-delegated.
+- Ten Valgrind cases pass. Two 5000-row runs at 500 Hz have zero missed arrivals,
+  RSS flat at 373 and 393 pages after warmup, and VM fixed at 3989504 bytes.
+  These establish collector readiness, not target capacity or endurance.
+- This dirty integration's Data alias cast conflicts with main's formatter
+  copy-and-free assumption. Preserve the work; use the verified clean-main
+  integration for this checkpoint. The unresolved tuple transport probe is next.
+
+## 2026-11-05 transport continuation
+
+Controlled transport now passes partial send/read, EAGAIN, split binary bytes,
+readable hangup/EOF, EPIPE without SIGPIPE, TCP success/refusal, poll cleanup and
+11 invalid-bound/lifetime gates. All four successful probes pass Valgrind and
+leave no newly opened descriptors. The probe now retains put_u8's returned
+ByteBuf view. Collector regression readiness remains green.
+
+Compiler fix fix/tuple-value-types (05d8aef7), PR #65:
+https://github.com/Randozart/briev-lang/pull/65.
+Clean lifetime-proof and stdlib transport carve-outs are undergoing final gates.
+The original dirty compiler checkout is preserved. Local/fork main were
+fast-forwarded to upstream 2d9d37b7; validation branches pin base 84f37578.
+
+## Current load checkpoint — COMPLETE 2026-11-05
+
+- Application commit: `ac7ffa7` in `../recommender-app`.
+- Use clean compiler worktree `../recommender-compiler-carveouts/load-transport-verified`, branch `integration/load-transport-verified`, commit `044192d4`. Pinned WSL binary: `/home/otto/briev-load-tools/transport-brievc-final`.
+- PR #65 tuple values: `fix/tuple-value-types` / `05d8aef7`; https://github.com/Randozart/briev-lang/pull/65.
+- PR #66 lifetime proofs: `fix/socket-borrowing-effects` / `59ec602e`; https://github.com/Randozart/briev-lang/pull/66.
+- PR #67 transport stdlib: `feat/nonblocking-client-transport` / `1eb1d3a0`; https://github.com/Randozart/briev-lang/pull/67.
+- Integration includes earlier collector PRs #63/#64 and upstream `2d9d37b7`. Local and fork main were synced to that upstream commit.
+- Final gates: 3,505 library tests, five native integrations, wasm32 execution, ten-program IR determinism, four transport Valgrind/descriptor probes, eleven rejection cases, and full collector readiness all pass. Collector preflights: 2×5,000 samples, flat post-warmup RSS 369/365 pages, VM 3,989,504 bytes, zero missed arrivals.
+- Source conformance sweep remains delegated to CI. Kani cannot start on this WSL glibc. All three Clang 17/18 corpus programs execute and have identical semantic output; the raw matrix comparator falsely differs on printed elapsed-time values. Detailed evidence and limits: `../recommender-app/docs/plans/2026-11-05-controlled-transport-checkpoint.md`.
+- Next checkpoint: one bounded HTTP journey attached to arrival scheduling and attempt outcomes. No server capacity claim yet.
+- Preserve the original dirty compiler and pre-existing app edits. The old `load-collector-prerequisites` worktree is now on `integration/load-transport-development` with exploratory changes; use the clean verified worktree above.
+
+
+## 2026-11-05 — scheduled catalogue HTTP checkpoint complete
+
+- App commit `bfa4cc3` implements bounded fresh-connection GET /movies arrivals,
+  independent JSON validation, deadlines, outcome accounting and latency CSV.
+- Final smoke: 25 offered at 5/s, four slots, 2s timeout, 1682 items; 25 success,
+  zero misses/failures. Existing server binary c7b88cac was used; a fresh full
+  server compilation did not complete. No capacity/endurance claim.
+- Controlled full/split/truncated/duplicate-length/non-200/wrong-ID/stall/refusal
+  and saturation gates pass. Both 50-request Valgrind cases have zero errors,
+  zero lost bytes and no open network descriptors.
+- Clean main-based PRs: #68 structured lifetimes (`632f602e`), #69 statement-match
+  fallthrough (`bb69d282`), #70 single field-receiver evaluation (`3fb01c97`),
+  #71 response framing (`400952a2`). URLs: https://github.com/Randozart/briev-lang/pull/68,
+  /pull/69, /pull/70, /pull/71 on the same repository.
+- Integration `fd52b03f`, branch `integration/http-load-final`, clean worktree
+  `../recommender-compiler-carveouts/load-http-final`; no integration PR.
+  Pinned compiler: `/home/otto/briev-load-tools/http-load-brievc-final`, SHA-256
+  b9866394672f37f1a3f3e0fd74c3625362945f9fa1d0c4d35262b95dbcaad7b7.
+- Final compiler gates: 3511 library tests, 10 integration tests, ten-program IR
+  determinism, no build warnings or new Praetor diagnostics. Clang 17/18 execute
+  all three matrix programs with identical semantic output; raw parity fails
+  only on labelled elapsed-time values. Source sweep remains delegated to CI;
+  Kani cannot start on this WSL glibc.
+- Compiler bug discriminators: a returning final match arm suppressed earlier
+  continuing arms; `factory().field` called the factory twice; plain bindings,
+  literal constants, slices, enum payloads and implicit cast dependencies lost
+  or conflated ownership facts. General compiler fixes replace all workarounds.
+- Usage and complete evidence: `../recommender-app/benchmarks/load/HTTP-LOAD.md`
+  and `../recommender-app/docs/plans/2026-11-05-http-load-checkpoint-results.md`.
+- Next: authenticated rating/save/recommendation journey, then staged capacity
+  and endurance work. Existing dirty compiler/app edits remain preserved.
+
+The prior load-transport-verified worktree is now on integration/http-load-journey with the exploratory working copy. Use the clean load-http-final worktree above for reproducible builds.
+
+## 2026-11-05 — PR #70 CI integration closed
+
+Upstream 78be8eb6 added a HIR Field caller using the old field-loader argument.
+PR #70's merged build therefore failed E0308 despite the earlier-base local
+checks. Merged current upstream and pushed 22ce21eb on
+fix/field-receiver-evaluation: the unevaluated HIR receiver passes None;
+the already evaluated AST receiver keeps Some. All three callers were audited.
+The native counter regression now runs with HIR unset/enabled at O0/O3; the
+older unfixed transport compiler fails its first assertion (exit 1), while the
+fixed compiler passes. Local 3499-library-test, build/check, Praetor, ten-case
+IR determinism and eight-case HIR A/B gates pass. Clang 17/18 semantic parity
+passes with the existing labelled-timing raw-comparator limitation.
+Full replacement CI PASSED on 22ce21eb:
+https://github.com/Randozart/briev-lang/actions/runs/42030028017.
+PR: https://github.com/Randozart/briev-lang/pull/70.
+The existing HTTP benchmark integration/binary pin remains unchanged.
+
+## 2026-11-06 — authenticated journey complete; Linux migration handoff
+
+Five serial authenticated ratings now pass admission/save/fresh-prediction checks,
+including cold-start transition, logout and exact durable SQL receipt verification.
+App implementation b3e046f; compiler integration 0adcbba2 on
+integration/load-journey-verified. Main/local/fork synchronized to b9933004.
+Compiler fixes: upstream PRs #72 (integer representations), #73 (entropy borrowing),
+#74 (trait-default effects), #75 (tuple-field provenance). All isolated suites and
+3,516 combined library tests pass; builds have no warnings. Native AST/HIR O0/O3,
+ten-case determinism, eight-case AST/HIR parity and Praetor checks pass. Clang
+17/18 semantic parity passes; raw matrix comparator differs only on labelled
+timings. Kani cannot start on old WSL glibc. CI status must be checked on GitHub.
+Final client Valgrind: zero errors/lost bytes and no open network sockets.
+
+For a fresh agent, use the recommender repository's docs/agent/START-HERE.md,
+benchmarks/load/JOURNEY.md and the dated checkpoint results. The next checkpoint
+is multi-user scheduled authenticated journeys plus stage histograms, then
+capacity/endurance. The legacy dirty compiler root and older worktrees are
+migration snapshots, not the verified compiler. The Linux handoff supersedes
+Windows absolute paths in this historical ledger.

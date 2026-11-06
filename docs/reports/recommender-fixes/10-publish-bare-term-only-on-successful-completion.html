@@ -1,0 +1,31 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Publish bare term only on successful completion</title><style>body{max-width:1000px;margin:40px auto;padding:0 24px;color:#203046;background:#f6f8fb;font:17px/1.65 system-ui}h1{line-height:1.2}h2{margin-top:32px}pre{background:#152536;color:#e3edf7;padding:20px;overflow:auto;font:13px/1.65 Consolas,monospace;border-radius:10px}a{color:#235eaf}.tag{color:#6650a5;font-weight:bold}article{background:white;padding:28px;border-radius:16px} </style><body><a href="index.html">← All fixes</a><p class="tag">Compiler · Fix 10</p><h1>Publish bare term only on successful completion</h1><article><h2>Intended behavior and failure</h2><p>A bare term must publish and perform exit cleanup only when its completion postcondition succeeds. The old common Term path published before that decision, while the successful bare-term stop path published again.</p><h2>Actual source change</h2><p>Repository: C:\Users\wotto\code\briev-lang<br>Source: <code>src/backend/llvm/emit_stmt.rs</code></p><p>This is a verbatim Git diff against HEAD. Lines starting − are the earlier code; + marks the replacement; unmarked lines provide context. Each @@ header gives the original and current line ranges. Nearby comments are included as source context.</p><pre>@@ -1935,22 +1947,25 @@ pub fn emit_statement(backend: &amp;mut LlvmBackend, out: &amp;mut String, stmt: &amp;Statem
+         }
+         Statement::Term(val) =&gt; {
+             // 2026-07-26: Phase 4 â€” webstack flush at term.
+             // 2026-08-10: real update batch â€” each field the transaction wrote
+             // (transition-graph write_set) is stored into @__web_flush_buf as a
+             // {handle, value_ptr, value_len} record, then __web_flush_state is
+             // called with the buffer + count. The JS shim applies the DOM
+             // mutations synchronously before the transaction completes.
+-            if backend.ctx.webstack_enabled {
++            // 2026-11-01: value terms finish here; bare terms finish only
++            // when their post holds, through emit_bare_term_stop. Publishing
++            // or cleaning up here for a bare term duplicates its commit and
++            // exposes partial state when its post is still false.
++            // Keep deferred cleanup at the same successful firing boundary.
++            if val.is_some() {
+                 emit_web_flush_batch(backend, out, indent);
++                backend.flush_defer_cleanup(out, indent);
+             }
+-            // 2026-08-09 (Phase 10): run deferred cleanup before the firing
+-            // exits (term is a successful completion).
+-            backend.flush_defer_cleanup(out, indent);
+             if let Some(val) = val {
+                 let saved_enum_ret = backend.fun.enum_return_context;
+                 let saved_expected_enum = backend.fun.expected_enum_type.clone();
+                 let saved_object_ret = backend.fun.object_return_context;
+                 backend.fun.object_return_context = backend.fun.object_out_slot.is_some();
+                 let returns_enum = backend.fun.item_return_type.as_ref()
+                     .map(|t| backend.ctx.enum_handle_types.contains(type_bare_name(t)))
+                     .unwrap_or(false);
+</pre><h2>Reading the code</h2><p>val is an Option containing the value of a value-returning term, if present. is_some() distinguishes it from a bare term. The corrected common path handles value terms only; the existing emit_bare_term_stop path owns successful bare-term publication and cleanup. This aligns observable page updates with the transaction’s completion condition.</p><h2>Why the correction works and how it was checked</h2><p>After inline-member suppression, selection still flushed twice. This change brought it to one and also prevents premature cleanup/publication when the bare-term postcondition is false. All nine focused bare-term checks passed.</p></article></body></html>

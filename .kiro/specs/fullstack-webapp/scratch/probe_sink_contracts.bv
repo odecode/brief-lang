@@ -1,0 +1,32 @@
+// Probe design D core premise: one trait, two impls with DIFFERENT put_one
+// contracts (fixed = room precondition; growing = none), plus a default method
+// built on put_one. Does the default typecheck for both impls?
+
+trait Sink {
+    defn put_one(sink: Self, val: Int) -> Self;
+    // derived default: write the same byte twice, written once here
+    defn put_two(sink: Self, val: Int) -> Self {
+        term put_one(put_one(sink, val), val);
+    };
+};
+
+// Fixed sink: put_one requires room (len < cap).
+obj FixedSink {
+    len: Int;
+    cap: Int;
+    defn put_one(sink: FixedSink, val: Int) -> FixedSink
+        [sink.len < sink.cap][term.len == sink.len + 1]
+    {
+        term FixedSink { len: sink.len + 1, cap: sink.cap };
+    };
+};
+
+// Growing sink: put_one always succeeds, no room precondition.
+obj GrowSink {
+    len: Int;
+    defn put_one(sink: GrowSink, val: Int) -> GrowSink
+        [true][term.len == sink.len + 1]
+    {
+        term GrowSink { len: sink.len + 1 };
+    };
+};

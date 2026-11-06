@@ -1,0 +1,60 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Enum context for struct fields</title><style>body{max-width:1000px;margin:40px auto;padding:0 24px;color:#203046;background:#f6f8fb;font:17px/1.65 system-ui}h1{line-height:1.2}h2{margin-top:32px}pre{background:#152536;color:#e3edf7;padding:20px;overflow:auto;font:13px/1.65 Consolas,monospace;border-radius:10px}a{color:#235eaf}.tag{color:#6650a5;font-weight:bold}article{background:white;padding:28px;border-radius:16px} </style><body><a href="index.html">← All fixes</a><p class="tag">Compiler · Fix 05</p><h1>Enum context for struct fields</h1><article><h2>Intended behavior and failure</h2><p>Each object field must be compiled using its declared type. Previously field expression emission inherited the surrounding expected enum, which could belong to an unrelated function return.</p><h2>Actual source change</h2><p>Repository: C:\Users\wotto\code\briev-lang<br>Source: <code>src/backend/llvm/emit_expr.rs</code></p><p>This is a verbatim Git diff against HEAD. Lines starting − are the earlier code; + marks the replacement; unmarked lines provide context. Each @@ header gives the original and current line ranges. Nearby comments are included as source context.</p><pre>@@ -2984,33 +2984,56 @@ impl LlvmBackend {
+                     expr: field_expr,
+                     base_ptr: image.base_ptr,
+                 },
+             );
+         }
+     }
+ 
+     fn emit_struct_field_store(&amp;mut self, out: &amp;mut String, indent: &amp;str, field: StructField&lt;&#x27;_&gt;) {
+-        let fr = self.fun.gen_reg();
+-        let val = self.emit_expr_inner(out, &amp;fr, field.expr, indent);
++        let val = self.emit_struct_field_value(out, indent, &amp;field);
+         let val = self.own_enum_value(out, indent, &amp;val);
+         let offset = self.lookup_field_offset(field.type_name, field.name);
+         let ptr_reg = self.fun.gen_reg();
+         writeln!(out, &quot;{}  {} = getelementptr i8, ptr {}, i64 {}&quot;, indent, ptr_reg, field.base_ptr, offset).ok();
+         if let Some(ordering) = self.atomic_field_ordering(field.type_name, field.name) {
+             self.emit_struct_atomic_field(out, indent, &amp;val, &amp;ptr_reg, ordering);
+             return;
+         }
+         if let Some(pf) = self.packed_field(field.type_name, field.name) {
+             out.push_str(&amp;self.emit_packed_field_store(indent, &amp;ptr_reg, &amp;pf, &amp;val));
+             return;
+         }
+         self.emit_struct_regular_field(out, indent, field, &amp;val, &amp;ptr_reg);
+     }
+ 
++    fn struct_field_type(&amp;self, type_name: &amp;str, name: &amp;str) -&gt; Option&lt;Type&gt; {
++        self.get_struct_fields(type_name)?
++            .iter().find(|(field, _)| field == name).map(|(_, ty)| ty.clone())
++    }
++
++    fn emit_struct_field_value(
++        &amp;mut self,
++        out: &amp;mut String,
++        indent: &amp;str,
++        field: &amp;StructField&lt;&#x27;_&gt;,
++    ) -&gt; TypedRegister {
++        // 2026-11-01: a field constructor belongs to its declared enum, never
++        // an enclosing return&#x27;s enum (whose tags/capacity may differ). Restore
++        // the outer context afterward; retire with per-expression type plans.
++        let field_enum = self.struct_field_type(field.type_name, field.name)
++            .filter(|ty| self.enum_layout(ty).is_some());
++        let saved = std::mem::replace(&amp;mut self.fun.expected_enum_type, field_enum.clone());
++        let register = self.fun.gen_reg();
++        let mut value = self.emit_expr_inner(out, &amp;register, field.expr, indent);
++        self.fun.expected_enum_type = saved;
++        if let Some(ty) = field_enum { value.ty = ty; }
++        value
++    }
++
+     fn emit_struct_atomic_field(
+         &amp;mut self,
+         out: &amp;mut String,
+         indent: &amp;str,
+         val: &amp;TypedRegister,
+         ptr_reg: &amp;str,
+         ordering: &amp;str,
+     ) {
+</pre><h2>Reading the code</h2><p>&mut self permits changing compiler state. std::mem::replace installs a new value and returns the previous one. clone duplicates type metadata. filter keeps only fields that are enums. The helper saves the surrounding expected_enum_type, installs the field’s enum type, emits the field expression, restores the original context, then records the declared type for ownership handling.</p><h2>Why the correction works and how it was checked</h2><p>OwnedOperationJob previously inherited Result<ProfileUpdate,AdmissionError> context rather than OperationJob; a tag then selected the wrong payload capacity. Scoped context prevents this cross-expression leakage. A regression checks correct field context and restoration; both app targets built afterward.</p></article></body></html>

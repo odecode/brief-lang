@@ -1,0 +1,21 @@
+// P4 (S4): a NON-conforming type passed to a <T: Counter> generic must be
+// REJECTED at the call site with a helpful diagnostic — not silently accepted.
+// `MyGadget` has no `bump`, so `bump_twice(gadget, 5)` violates T: Counter.
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+};
+
+obj MyGadget {
+    size: Int;
+    // deliberately NO bump — MyGadget does not conform to Counter
+};
+
+defn bump_twice<T: Counter>(this: T, amount: Int) -> T {
+    term bump(bump(this, amount), amount);
+};
+
+node entry [beginprogram][true] {
+    let gadget: MyGadget = MyGadget { size: 0 };
+    let gadget2: MyGadget = bump_twice(gadget, 5);
+    endprogram Print#(gadget2.size);
+};

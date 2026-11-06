@@ -1,0 +1,45 @@
+// Minimal reproduction of the ACTUAL blocker (liveness, NOT typecheck). Mirrors
+// bytes.bv's structure so it typechecks like the real code: a trait with a
+// required method, an obj that provides it, and the obj's member calls a FREE-
+// STANDING helper. growbuf_test typechecks and fails only at CODEGEN with
+// "unreached defn [helper]" - the liveness pass does not follow the call edge
+// from a usage-rooted obj member body into the free-standing helper it calls.
+//
+// Expect: typecheck OK, then build panics "unreached defn [helper]" (confirming
+// the liveness gap) OR prints 7 (meaning the gap is narrower than the member
+// path and needs more isolation).
+
+trait Bump {
+    defn bump(sink: Self, val: Int) -> Self;
+};
+
+defn helper(val: Int) [true][term == val + 1] -> Int {
+    term val + 1;
+};
+
+// Alpha is declared BEFORE Beta and ALSO has a `bump` member - but Alpha's bump
+// calls NO helper. If liveness indexes member bodies by BARE name with
+// first-wins (or_insert), then "bump" maps to ALPHA's body; rooting Beta's bump
+// (via constructing Beta) walks Alpha's body, misses helper, and helper is
+// judged dead -> panic. This mirrors bytes.bv: ByteBuf.put_u8 (no helper call)
+// is declared before GrowBuf.put_u8 (calls grow_to_fit).
+obj Alpha {
+    n: Int;
+    defn bump(sink: Alpha, val: Int) -> Alpha [true][term.n == sink.n + 1] {
+        term Alpha { n: sink.n + 1 };
+    };
+};
+
+obj Beta {
+    n: Int;
+    defn bump(sink: Beta, val: Int) -> Beta [true][term.n == sink.n + 1] {
+        let bumped: Int = helper(sink.n);
+        term Beta { n: bumped };
+    };
+};
+
+node entry [beginprogram][true] {
+    let beta0: Beta = Beta { n: 6 };
+    let beta1: Beta = bump(beta0, 0);
+    endprogram Print#(beta1.n);
+};

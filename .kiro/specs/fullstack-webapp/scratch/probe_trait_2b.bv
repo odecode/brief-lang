@@ -1,0 +1,20 @@
+// P2b: call the trait default as a FREE function bump_twice(t, 5), not a method.
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+    defn bump_twice(this: Self, amount: Int) -> Self {
+        term bump(bump(this, amount), amount);
+    };
+};
+
+obj Tally {
+    total: Int;
+    defn bump(this: Tally, amount: Int) -> Tally {
+        term Tally { total: this.total + amount };
+    };
+};
+
+node entry [beginprogram][true] {
+    let t: Tally = Tally { total: 0 };
+    let t2: Tally = bump_twice(t, 5);
+    endprogram Print#(t2.total);
+};

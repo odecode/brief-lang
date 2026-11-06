@@ -1,0 +1,52 @@
+// FULL case for integration/both-fixes: TWO objs with a same-named put_one
+// member (triggers the liveness member-collision bug) AND Growing.put_one is
+// stateful via free-standing grow_it -> Malloc# (triggers the needs-state
+// type-dependent bug). A generic write_pair<S: Sink> is used with BOTH.
+//
+// Needs the LIVENESS fix (so grow_it, reached only via Growing.put_one, is not
+// judged dead when Fixed.put_one - declared first, calls nothing - wins the
+// bare-name slot) AND the NEEDS-STATE fix (so write_pair$Growing/put_two$Growing
+// take %state for the grow_it call). Neither fix alone builds this.
+//
+// Expected: 7 (Fixed: 5+2) then 9 (Growing: 7+2).
+
+defn grow_it(seed: Int) [true][term == seed + 1] -> Int {
+    let fresh: Int = Malloc#(16) as Int;
+    Store#(fresh, seed, 8);
+    term seed + 1;
+};
+
+trait Sink {
+    defn put_one(sink: Self, val: Int) -> Self;
+    defn put_two(sink: Self, val: Int) -> Self {
+        term put_one(put_one(sink, val), val);
+    };
+};
+
+obj Fixed {
+    n: Int;
+    defn put_one(sink: Fixed, val: Int) -> Fixed [true][term.n == sink.n + 1] {
+        term Fixed { n: sink.n + 1 };
+    };
+};
+
+obj Growing {
+    n: Int;
+    defn put_one(sink: Growing, val: Int) -> Growing [true][term.n == sink.n + 1] {
+        let bumped: Int = grow_it(sink.n);
+        term Growing { n: bumped };
+    };
+};
+
+defn write_pair<S: Sink>(sink: S, val: Int) -> S {
+    term put_two(sink, val);
+};
+
+node entry [beginprogram][true] {
+    let fixed0: Fixed = Fixed { n: 5 };
+    let fixed1: Fixed = write_pair(fixed0, 0);
+    let grow0: Growing = Growing { n: 7 };
+    let grow1: Growing = write_pair(grow0, 0);
+    Print#(fixed1.n);
+    endprogram Print#(grow1.n);
+};

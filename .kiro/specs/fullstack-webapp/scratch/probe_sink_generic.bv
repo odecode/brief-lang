@@ -1,0 +1,27 @@
+trait Sink {
+    defn put_one(sink: Self, val: Int) -> Self;
+    defn put_two(sink: Self, val: Int) -> Self {
+        term put_one(put_one(sink, val), val);
+    };
+};
+
+obj FixedSink {
+    len: Int;
+    cap: Int;
+    defn put_one(sink: FixedSink, val: Int) -> FixedSink
+        [sink.len < sink.cap][term.len == sink.len + 1]
+    {
+        term FixedSink { len: sink.len + 1, cap: sink.cap };
+    };
+};
+
+// Generic writer over any Sink: calls the trait default put_two.
+defn write_pair<S: Sink>(sink: S, val: Int) -> S {
+    term put_two(sink, val);
+};
+
+node entry [beginprogram][true] {
+    let fixed: FixedSink = FixedSink { len: 0, cap: 8 };
+    let after: FixedSink = write_pair(fixed, 42);
+    endprogram Print#(after.len);
+};

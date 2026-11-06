@@ -1,0 +1,22 @@
+// P3: a trait-constrained generic defn <T: Counter> calling the trait method.
+trait Counter {
+    defn bump(this: Self, amount: Int) -> Self;
+};
+
+obj Tally {
+    total: Int;
+    defn bump(this: Tally, amount: Int) -> Tally {
+        term Tally { total: this.total + amount };
+    };
+};
+
+// Generic constrained by the trait - the make-or-break form for design D.
+defn bump_twice<T: Counter>(this: T, amount: Int) -> T {
+    term bump(bump(this, amount), amount);
+};
+
+node entry [beginprogram][true] {
+    let t: Tally = Tally { total: 0 };
+    let t2: Tally = bump_twice(t, 5);
+    endprogram Print#(t2.total);
+};

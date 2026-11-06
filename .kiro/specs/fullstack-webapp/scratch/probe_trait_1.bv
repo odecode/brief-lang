@@ -1,0 +1,4 @@
+// P1: does a trait declaration parse + typecheck? (SPEC 8.6 syntax)
+trait ByteSink {
+    defn put_one(sink: Self, val: Int) -> Self;
+};

@@ -1,0 +1,26 @@
+// D3 test for GrowBuf (growing ByteSink). Start cap 2, write 5 bytes (10,20,30,
+// 40,50) with put_u8 - this forces at least two reallocations (2 -> 4 -> 8). Then
+// read all five back. If the realloc+copy preserved data, we get 10/20/30/40/50
+// and final len 5. The whole point: the SAME put_u8 call site keeps working as
+// the buffer silently moves underneath it.
+import "std/net/bytes.bv";
+
+node entry [beginprogram][true] {
+    let buf0: GrowBuf = grow_new(2);
+    let buf1: GrowBuf = put_u8(buf0, 10);
+    let buf2: GrowBuf = put_u8(buf1, 20);
+    let buf3: GrowBuf = put_u8(buf2, 30);
+    let buf4: GrowBuf = put_u8(buf3, 40);
+    let buf5: GrowBuf = put_u8(buf4, 50);
+    let byte0: Int = grow_get_u8(buf5, 0);
+    let byte1: Int = grow_get_u8(buf5, 1);
+    let byte2: Int = grow_get_u8(buf5, 2);
+    let byte3: Int = grow_get_u8(buf5, 3);
+    let byte4: Int = grow_get_u8(buf5, 4);
+    Print#(byte0);
+    Print#(byte1);
+    Print#(byte2);
+    Print#(byte3);
+    Print#(byte4);
+    endprogram Print#(buf5.len);
+};

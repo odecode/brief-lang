@@ -1,0 +1,11 @@
+obj Endpoint { descriptor: Int; };
+defn endpoints() -> (Endpoint,Endpoint) {
+    term (Endpoint { descriptor: 17 }, Endpoint { descriptor: 25 });
+};
+let done: Bool = false;
+node main [!done][done] {
+    let (left,right) = endpoints();
+    when left.descriptor + right.descriptor != 42 { trap; };
+    done = true;
+    endprogram;
+};

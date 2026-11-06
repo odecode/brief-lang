@@ -338,6 +338,13 @@ A backend can start with just `bytes` and be fully correct. It then opts into `p
 | `plugin/loader.rs` | System plugin discovery from `plugins/{stage}/`, inline `$(Stage)` block extraction |
 | `plugin/intrinsics.rs` | `$` intrinsic dispatch — navigation chains, AST constructors, diagnostics |
 
+Environment macro expansion uses `ast::visit_mut::walk_toplevel`, the shared
+exhaustive postorder visitor. Nested arguments and receivers are expanded before
+the containing macro; environment rewrites preserve receiver-first argument
+order and leave other plugin names intact. Direct environment constants retain
+the separate compile-time evaluation pass. (2026-11-04: replaces the partial
+walker that missed control-flow and operand positions; future plugin dispatch
+consolidation must preserve this traversal contract.)
 ### Normalizer (`src/backend/normalizer.rs`)
 
 | Module | Purpose |
