@@ -18,6 +18,8 @@ pub mod vector_phi;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod metadata_tests;
 
 
 pub use builder::LLVMBuilder;
@@ -1196,6 +1198,14 @@ pub(super) fn emit_loop_metadata(
     writeln!(out, "{0}br label %{1}, !llvm.loop !{2}", indent, backedge_label, md_idx).ok();
 }
 
+/// Reserve a contiguous module-wide ID range for one metadata family.
+/// 2026-10-22: centralize single nodes and loop bundles to prevent overlaps.
+pub(super) fn reserve_metadata_ids(counter: &mut usize, count: usize) -> usize {
+    let first = *counter;
+    *counter += count;
+    first
+}
+
 /// Same as `emit_loop_metadata` but the caller supplies the backedge text.
 /// Use when the backedge is a conditional branch (br i1) or when multiple
 /// backedges share the same metadata node.
@@ -1233,8 +1243,7 @@ pub(super) fn emit_loop_metadata_nodes(
 
     let entries = md_entries.join(", ");
     writeln!(pending_metadata, "!{0} = !{{!{0}, {1}}}", start, entries).ok();
-    *metadata_counter += md_count;
-    start
+    reserve_metadata_ids(metadata_counter, md_count)
 }
 
 fn extract_trigger_keys(pre: &Expr, trigger_names: &std::collections::HashSet<&str>) -> Option<Vec<i64>> {
@@ -4402,6 +4411,13 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             }
         }
 
+        // 2026-10-22: reserve the complete TBAA prefix AFTER structural type
+        // registration and BEFORE function emission. One module allocator
+        // replaces fixed !50/!99/!100 reservations, including fixpoint reruns.
+        self.ctx.metadata_counter = self.ctx.type_universe.as_ref()
+            .map_or(5, |universe| universe.types.len()) + 1;
+        self.ctx.state_alias_scope_md = reserve_metadata_ids(&mut self.ctx.metadata_counter, 1);
+        self.ctx.pending_metadata.clear();
         let mut range_meta: Vec<String> = Vec::new();
 
         // Definitions
@@ -5360,10 +5376,6 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         }
 
         // Attributes
-        if !self.fun.pending_metadata.is_empty() {
-            writeln!(out, "; Loop metadata").ok();
-            out.push_str(&self.fun.pending_metadata);
-        }
         writeln!(out).ok();
         // 2026-07-21: Fast-math attributes (tried for nbody vrcpps conversion, but
         // vrcpps only works on vector types — all nbody divisions are scalar fdiv).
@@ -5494,10 +5506,10 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // represents "accesses to %State memory."  By annotating volatile
         // accesses through Ptr<T> with !noalias !{!StateScope}, we tell LLVM
         // that the Ptr<T> access does NOT alias with any %State field access.
-        // The scope ID is fixed at 99 to avoid conflicts with TBAA (!0..!N),
-        // range metadata (!{i}), and function-scoped metadata (starting at 100).
-        self.ctx.state_alias_scope_md = 99;
-        writeln!(out, "!99 = distinct !{{}} ; StateAliasScope").ok();
+        // 2026-10-22: allocate this node after the TBAA prefix at module
+        // entry; ranges and loops use the same monotonic allocator. A fixed
+        // ID cannot remain disjoint from an unbounded type universe.
+        writeln!(out, "!{} = distinct !{{}} ; StateAliasScope", self.ctx.state_alias_scope_md).ok();
 
         // Build optimization report if requested
         if self.ctx.optimize_report {
@@ -5819,6 +5831,12 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         // 2026-08-06 (fix): escaping closures — emit the collected closure
         // functions at the end of the module.
         self.emit_pending_closures(&mut out);
+        // 2026-10-22: late closures and web materializers can allocate nodes
+        // too. Flush once after every function family has emitted its body.
+        if !self.ctx.pending_metadata.is_empty() {
+            writeln!(out, "; Loop metadata").ok();
+            out.push_str(&self.ctx.pending_metadata);
+        }
 
         // ── Owned _start + captured environ (Family F, 2026-09-10) ──────
         // When the program references NOTHING from briev_rt.c or libc, the

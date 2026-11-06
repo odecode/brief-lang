@@ -3389,11 +3389,14 @@ fn test_range_metadata_suppressed_for_written_field() {
     // field loads. The inline `!range !{0, bound}` reload emitted by
     // emit_precondition_check is sound (fresh read inside the guard's safe path)
     // and is allowed to remain.
-    let module_level_range_on_x_load = output.contains("!range !50")
-        || output.contains("!range !51");
+    let module_level_range_on_x_load = output.lines().any(|line| {
+        line.split_once("!range !")
+            .and_then(|(_, suffix)| suffix.chars().next())
+            .is_some_and(|first| first.is_ascii_digit())
+    });
     assert!(!module_level_range_on_x_load,
         "precondition-derived !range must not attach to loads of a written field\n{output}");
-    assert!(!output.contains("!5 = !{ i64 -9223372036854775808, i64 1 }"),
+    assert!(!output.contains(" = !{ i64 -9223372036854775808, i64 1 }"),
         "the module-level range node for the written field must not be emitted\n{output}");
 }
 

@@ -10651,3 +10651,16 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## 2026-10-22 — LLVM metadata reservations overlap on large programs (FIXED in working tree)
+
+The recommender server emitted both a TBAA type node and StateAliasScope as
+`!99`; clang rejected it with “Metadata id is already used.” Range nodes began
+at !50 and loop/invariant-load nodes at !100, so these families could also
+overlap. Function resets additionally cleared pending module metadata.
+
+All generated nodes now use one module counter after the registered TBAA
+prefix. Pending definitions survive function reset/snapshot operations and
+reset only per emission round. Regression tests cover large universes, late
+structural registration, and cross-function metadata lifetime. See
+`docs/plans/2026-10-22-module-metadata-allocation.md` for verification evidence.

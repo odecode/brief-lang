@@ -4,6 +4,13 @@
 
 **Status:** Living document — updated as the backend evolves.
 
+2026-10-22: LLVM numeric metadata has module lifetime. TBAA owns the
+deterministic prefix; after structural types are registered, a shared
+CompilerContext counter allocates state alias, range, invariant-load and loop
+nodes. Pending definitions also live in CompilerContext so function resets and
+inline snapshots cannot erase them or rewind allocation. Each emission round
+resets this state. Fixed numeric reservations cannot bound the type universe.
+
 ---
 
 ## 1. Core Architecture
@@ -14,14 +21,14 @@ The backend state is strictly stratified into three lifetimes to prevent state l
 
 | Layer | Type | Scope | Mutability | Contents |
 |-------|------|-------|------------|----------|
-| **CompilerContext** | `context.rs` | Global (entire compilation) | Read-only during codegen | AST definitions, FFI signatures, target specs, field layouts, casting graph |
+| **CompilerContext** | `context.rs` | Global (entire compilation) | Stable program facts; mutable module emission state | AST definitions, FFI signatures, target specs, field layouts, casting graph, metadata allocator/definitions |
 | **FunctionContext** | `context.rs` | Per-function/transaction | Mutable per-function | SSA registers (`gen_reg`), phi nodes, type caches, loop state |
 | **LlvmBackend** | `mod.rs` | Orchestrator | Delegates to modules | `generate()`, dispatch, helper functions |
 
 **Rules:**
 - Never add transient, function-scoped compilation variables to `CompilerContext`.
 - All registers must be requested via `self.fun.gen_reg()`. Manual register arithmetic is forbidden.
-- `CompilerContext` is read-only during codegen. If you need mutable per-function state, add it to `FunctionContext`.
+- Keep program facts stable during codegen. Module emission state such as metadata allocation belongs in `CompilerContext`; mutable per-function state belongs in `FunctionContext`.
 
 ### 1.2 Module Map
 
