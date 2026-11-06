@@ -10723,3 +10723,16 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## 2026-10-22 — wasm32 typed Int constant emits an i64 load (OPEN)
+
+**Symptom:** comparing a Briev `Int` field against a typed Int constant emits
+`icmp i32 ..., i64 ...` on wasm32, and `llc` rejects the module.
+
+**Root cause:** constant globals used the target-independent protocol width,
+and identifier reads hardcoded `load i64`. Flexible Int is i32 on wasm32.
+
+**Fix:** use the backend's target-derived `llvm_type` for constant globals,
+aliases and loads, and retain the declared Briev type in the loaded register.
+The wasm32 regression covers declaration and read. See
+`docs/plans/2026-10-22-wasm-constant-width.md`.

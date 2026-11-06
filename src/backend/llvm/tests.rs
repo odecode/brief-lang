@@ -9761,6 +9761,27 @@ fn test_webstack_int_literal_emits_target_width() {
 }
 
 #[test]
+fn test_wasm32_int_constant_global_and_load_use_target_width() {
+    let src = r#"
+const ITEM_LIMIT: Int = 1682;
+defn below_limit(value: Int) -> Bool { term value < ITEM_LIMIT; };
+node start [true][true] { term below_limit(1); };
+"#;
+    let tokens = crate::lexer::tokenize(src).unwrap();
+    let mut parser = crate::parser::Parser::new(tokens, src);
+    let items = parser.parse_program().unwrap();
+    let mut backend = LlvmBackend::new()
+        .with_webstack(true)
+        .with_int_bits(32)
+        .with_target_triple("wasm32-unknown-wasi")
+        .with_type_universe(crate::type_universe::TypeUniverse::new());
+    let ir = backend.generate(&items, None);
+    assert!(ir.contains("@ITEM_LIMIT = constant i32 1682"), "constant global must use wasm32 Int width:\n{ir}");
+    assert!(ir.contains("load i32, ptr @ITEM_LIMIT"), "constant reference must use the declared target width:\n{ir}");
+    assert!(!ir.contains("load i64, ptr @ITEM_LIMIT"), "constant reads cannot hardcode i64 on wasm32:\n{ir}");
+}
+
+#[test]
 fn test_webstack_state_int_slots_are_target_width() {
     // 2026-08-10: flexible Int %State slots are i{int_bits} (i32 on wasm32) —
     // the --int-bits design intent. x86_64 (int_bits=64) is unchanged.

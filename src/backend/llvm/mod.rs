@@ -4245,7 +4245,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
         sorted_constants.sort();
         for name in &sorted_constants {
             let (ty, expr) = &self.ctx.constants[name];
-            let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+            // 2026-10-22: constants must honor target-sized flexible Int just
+            // like ordinary values; universe metadata alone may describe the
+            // 64-bit maximum on wasm32. Keep declarations, aliases and reads
+            // on `llvm_type`. To undo: only if target-independent Int returns.
+            let llvm_ty = self.llvm_type(ty);
             let key = match expr {
                 Expr::Float(f) => format!("{}:{}", llvm_ty, float_to_llvm_str(*f, &llvm_ty)),
                 Expr::Decimal(n) => format!("{}:{}", llvm_ty, n),
@@ -4277,11 +4281,11 @@ self.ctx.live_defns = analysis.defn_liveness.live.clone();
             let (ty, expr) = &self.ctx.constants[name];
             let canonical = alias_map.get(name).cloned().unwrap_or_else(|| name.clone());
             if canonical != *name {
-                let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+                let llvm_ty = self.llvm_type(ty);
                 writeln!(out, "@{} = alias {}, {}* @{}", name, llvm_ty, llvm_ty, canonical).ok();
                 continue;
             }
-            let llvm_ty = protocol_llvm_type(ty, self.ctx.type_universe.as_ref());
+            let llvm_ty = self.llvm_type(ty);
             let val_str = match expr {
                 Expr::Float(f) => float_to_llvm_str(*f, &llvm_ty),
                 Expr::Decimal(n) => n.to_string(),

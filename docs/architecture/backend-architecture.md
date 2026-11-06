@@ -4,6 +4,12 @@
 
 **Status:** Living document — updated as the backend evolves.
 
+2026-10-22: flexible integer constants use `LlvmBackend::llvm_type` for both
+their globals and reads. The protocol universe may describe the maximum width
+of `Int`, while the selected target chooses its concrete width (i32 on wasm32,
+i64 on the native target). Declarations, aliases and loads must share that
+target-derived type.
+
 ---
 
 ## 1. Core Architecture
