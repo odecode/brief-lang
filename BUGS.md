@@ -10723,3 +10723,17 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+## 2026-10-22 — collection arrows retain unused native event trap (OPEN)
+
+**Symptom:** a WASM program using JSON collection updates emits
+`event_strict_trap` and its Linux `briev_syscall` helper despite containing no
+event read.
+
+**Root cause:** liveness seeded the complete task/event helper family for every
+`ArrowAssign`. Collection writes share this syntax with event-wire writes, so
+ordinary list mutation pulled in task scheduling and the strict-read trap.
+
+**Fix:** remove the statement-level task/event seed and let the emitted-call
+fixpoint derive backend-generated event calls. The regression checks ordinary
+arrow writes do not retain unused task/event helpers.
+See `docs/plans/2026-10-22-event-trap-liveness.md`.

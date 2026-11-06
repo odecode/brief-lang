@@ -39,6 +39,12 @@ compiled button resolves a missing wasm export and the click throws at
 runtime (BUGS.md 2026-10-06 view-handler drop). `build` = `build_with_roots`
 with an empty set — native programs get the same verdict as before.
 
+`ArrowAssign` does not seed task/event helpers. Collection and event writes
+share that AST form, and emitted event calls are discovered by the LLVM
+emitted-call fixpoint. This keeps ordinary collection updates from importing
+unused task scheduling and target-specific trap/output code; live event calls
+still enter the closure through their emitted edges.
+
 ## The intrinsic→helper table
 
 Intrinsic lowerings may emit calls to pure-Briev helper defns

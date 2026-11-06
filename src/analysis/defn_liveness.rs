@@ -499,9 +499,11 @@ impl<'a> Builder<'a> {
     /// spawned tasks' port fire/read/ready lower to the event family
     /// (briev_event_*_impl, event_strict_trap). Root the whole family
     /// — type-agnostic over-approx; `mark` is a no-op for helpers absent from
-    /// the unit. The event helpers' own callees (write_all/print_str_raw
-    /// etc.) join
-    /// the closure when their bodies are walked from the worklist.
+    /// the unit. 2026-10-22: a strict read trap is deliberately not in this
+    /// set: only the emitted read site calls it, and the LLVM call-closure
+    /// fixpoint discovers that edge. Seeding it for an ordinary collection
+    /// arrow pulled native stderr/syscall code into portable WASM. To undo:
+    /// restore the helper here and accept that every arrow imports that path.
     fn root_task_event_family(&self, queue: &mut Vec<String>) {
         for h in [
             "briev_task_spawn_impl",
@@ -511,7 +513,6 @@ impl<'a> Builder<'a> {
             "briev_event_ready_impl",
             "briev_event_read_impl",
             "briev_event_fire_impl",
-            "event_strict_trap",
         ] {
             self.mark(h, queue);
         }
@@ -563,12 +564,10 @@ impl<'a> Builder<'a> {
                     }
                     self.walk_expr(t, queue);
                 }
-                // 2026-09-23 (async Phase D soundness-net catch): `w <- v;`
-                // on an Event<_> wire lowers to briev_event_fire_impl. The
-                // pass is type-agnostic — root the task/event family whenever
-                // an arrow is assigned (mark is a no-op when the helpers are
-                // absent; a spawn/await program roots them anyway).
-                self.root_task_event_family(queue);
+                // 2026-10-22: collection writes and Event<_> writes share this
+                // AST form. The latter's backend-generated event-fire call is
+                // derived by the LLVM emitted-call fixpoint; seeding the whole
+                // task runtime for every collection update defeats target DCE.
                 self.walk_expr(value, queue);
             }
             Statement::EndProgram(maybe_e) => {
@@ -1423,6 +1422,22 @@ mod tests {
         let l = DefnLiveness::build(&items);
         assert!(l.is_live("print_int"));
         assert!(l.is_live("print_str"));
+    }
+
+    #[test]
+    fn collection_arrow_does_not_root_unused_task_runtime() {
+        let items = vec![
+            txn("main_node", true, vec![Statement::ArrowAssign {
+                target: None,
+                value: Box::new(Expr::Decimal(1)),
+                consume: false,
+            }]),
+            defn("briev_event_fire_impl", vec![Statement::Term(None)]),
+            defn("event_strict_trap", vec![Statement::Term(None)]),
+        ];
+        let liveness = DefnLiveness::build(&items);
+        assert!(!liveness.is_live("briev_event_fire_impl"));
+        assert!(!liveness.is_live("event_strict_trap"));
     }
 
     #[test]
