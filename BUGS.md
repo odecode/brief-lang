@@ -10651,3 +10651,16 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+
+## Print macros skipped nested statement and operand positions (2026-10-22)
+
+The recommender worker contract's foreach/guard failure diagnostic reached LLVM
+as PluginIntercept and panicked. Print expansion had partial private walkers:
+foreach/match bodies, container/operand positions and behavioral members could
+escape resolution. The new exhaustive mutable postorder AST visitor processes
+children before print replacement, preserving nested receiver/argument expansion.
+The print plugin uses it and returns nested format errors. Print# retains typed
+dispatch; its unused annotation table and partial walkers are retired.
+Regression coverage includes nested diagnostics, unknown-plugin children,
+malformed nested formats, exactly-once postorder mutation and read/mutable
+coverage agreement. See docs/architecture/ast-traversal.md and the dated plan.
