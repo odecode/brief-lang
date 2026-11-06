@@ -57,7 +57,7 @@ fn register_definition(graph: &mut Graph, definition: &crate::ast::Definition) {
 }
 
 fn register_result(graph: &mut Graph, name: &str, output: Option<&crate::ast::OutputType>, void_default: bool) {
-    let ty = output.and_then(|output| output.all_types().into_iter().next());
+    let ty = output.and_then(output_value_type);
     let scalar = match output {
         Some(crate::ast::OutputType::Single(ty)) => scalar_result(graph, ty),
         None => void_default,
@@ -73,6 +73,18 @@ fn register_result(graph: &mut Graph, name: &str, output: Option<&crate::ast::Ou
     let image = graph.allocation(name);
     let result = graph.callables[name].result;
     graph.copy(image, result);
+}
+
+// 2026-11-05: product results retain their shape for inferred bindings and
+// projections. Flattening to the first leaf blocks otherwise closed regions.
+// Retire with a shared semantic output-type resolver.
+fn output_value_type(output: &crate::ast::OutputType) -> Option<crate::ast::Type> {
+    use crate::ast::{OutputType, Type};
+    match output {
+        OutputType::Tuple(items) => items.iter().map(output_value_type).collect::<Option<Vec<_>>>().map(Type::Tuple),
+        OutputType::Named(_, inner) => output_value_type(inner),
+        _ => output.all_types().into_iter().next(),
+    }
 }
 
 fn scalar_result(graph: &Graph, ty: &crate::ast::Type) -> bool {
@@ -105,6 +117,7 @@ fn register_enum(graph: &mut Graph, definition: &crate::ast::EnumDefinition) {
 }
 
 fn register_typedef(graph: &mut Graph, definition: &crate::ast::TypeDef) {
+    register_methods(graph, definition);
     if definition.body.op_bindings.iter().any(|binding| !matches!(&binding.expr,
         Expr::Call(name, _, _) if crate::intrinsic_signatures::get_intrinsic_signature(name).is_some())) {
         graph.user_operators.insert(definition.name.clone());
@@ -112,6 +125,38 @@ fn register_typedef(graph: &mut Graph, definition: &crate::ast::TypeDef) {
     for slot in &definition.body.slots {
         if let Some(name) = slot.name.strip_prefix("__variant_") { graph.constructors.insert(name.into()); }
     }
+}
+
+// 2026-11-05: concrete explicit-receiver methods participate in the same call
+// graph as free functions. Unsupported members retain a shadowing entry so
+// they can never accidentally dispatch to a same-named free function.
+fn register_methods(graph: &mut Graph, definition: &crate::ast::TypeDef) {
+    for member in &definition.body.members {
+        if let TopLevel::Transaction(method) = member {
+            graph.methods.insert((definition.name.clone(), method.name.clone()), None);
+        }
+        let TopLevel::Definition(method) = member else { continue };
+        let key = (definition.name.clone(), method.name.clone());
+        graph.methods.insert(key.clone(), None);
+        if !definition.type_params.is_empty() || !method.type_params.is_empty() { continue; }
+        if uses_implicit_receiver(definition, member) { continue; }
+        let Some((_, receiver)) = method.parameters.first() else { continue };
+        if receiver.universe_key() != Some(definition.name.as_str()) { continue; }
+        let mut callable = method.clone();
+        callable.name = format!("{}::{}", definition.name, method.name);
+        register_definition(graph, &callable);
+        graph.methods.insert(key, Some(callable.name));
+    }
+}
+
+fn uses_implicit_receiver(definition: &crate::ast::TypeDef, member: &TopLevel) -> bool {
+    let mut implicit = false;
+    crate::ast::visit::walk_toplevel(member, &mut |expression| {
+        if let Expr::Identifier(name) = expression {
+            implicit |= name == "self" || definition.body.slots.iter().any(|slot| slot.name == *name);
+        }
+    });
+    implicit
 }
 fn register_callable(graph: &mut Graph, name: &str, count: usize) {
     let params = (0..count).map(|_| graph.root()).collect();
@@ -167,7 +212,7 @@ impl Builder<'_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
             Statement::Let { name, names, expr, ty, .. } => {
-                if let Some(ty) = ty.clone().or_else(|| expr.as_ref().and_then(|expr| self.expression_type(expr))) { self.types.insert(name.clone(), ty); }
+                self.bind_types(name, names, ty.as_ref(), expr.as_ref());
                 let target = self.local(name);
                 if let Some(expr) = expr {
                     let value = self.expression(expr);
@@ -209,6 +254,15 @@ impl Builder<'_> {
             Statement::Break | Statement::Trap | Statement::Halt
             | Statement::MetadataAssignment(..) | Statement::FreeHint(_) => {}
             _ => self.unsupported(),
+        }
+    }
+
+    fn bind_types(&mut self, name: &str, names: &[String], declared: Option<&crate::ast::Type>, expr: Option<&Expr>) {
+        let Some(ty) = declared.cloned().or_else(|| expr.and_then(|expr| self.expression_type(expr))) else { return };
+        self.types.insert(name.into(), ty.clone());
+        if names.len() <= 1 { return; }
+        if let crate::ast::Type::Tuple(elements) = ty {
+            self.types.extend(names.iter().cloned().zip(elements));
         }
     }
 
@@ -294,6 +348,9 @@ impl Builder<'_> {
                 let base = self.expression(base); let result = self.graph.node(); self.load(base, result); result
             }
             Expr::Cast(value, target) => self.cast(value, target),
+            Expr::MethodCall(receiver, name, args, None, refs) if refs.is_empty() => {
+                self.method_call(receiver, name, args)
+            }
             Expr::Consume(value) | Expr::Capture { expr: value, .. } => self.expression(value),
             Expr::AddrOf(value) => {
                 let value = self.expression(value); let result = self.graph.allocation(self.owner);
@@ -356,7 +413,9 @@ impl Builder<'_> {
     }
 
     fn binary(&mut self, operator: BinaryOpKind, lhs: &Expr, rhs: &Expr) -> Node {
-        let left = self.expression(lhs); let right = self.expression(rhs); let result = self.graph.unknown_value();
+        let left = self.expression(lhs); let right = self.expression(rhs);
+        let bitwise = matches!(operator, BinaryOpKind::BitAnd | BinaryOpKind::BitOr | BinaryOpKind::BitXor);
+        let result = if bitwise { self.graph.node() } else { self.graph.unknown_value() };
         if self.expression_type(lhs).is_none() || self.expression_type(rhs).is_none() {
             self.unsupported(); self.capture(&[left, right]);
         }
@@ -365,7 +424,8 @@ impl Builder<'_> {
         }
         if matches!(operator, BinaryOpKind::Eq | BinaryOpKind::Neq | BinaryOpKind::Lt | BinaryOpKind::Gt
             | BinaryOpKind::Le | BinaryOpKind::Ge | BinaryOpKind::And | BinaryOpKind::Or) { return result; }
-        self.graph.copy(left, result); self.graph.copy(right, result);
+        if bitwise { self.graph.constraints.push(Constraint::Bitwise(operator, left, right, result)); }
+        else { self.graph.copy(left, result); self.graph.copy(right, result); }
         if operator == BinaryOpKind::Concat || self.allocating_operator(lhs, operator) || self.allocating_operator(rhs, operator) {
             let allocation = self.graph.allocation(self.owner); self.graph.copy(allocation, result);
         }
@@ -405,7 +465,13 @@ impl Builder<'_> {
             Expr::Char(_) => Some(crate::ast::Type::char_()),
             Expr::Float(_) => Some(crate::ast::Type::float()),
             Expr::Bool(_) => Some(crate::ast::Type::bool_()),
+            Expr::Tuple(values) => values.iter().map(|value| self.expression_type(value))
+                .collect::<Option<Vec<_>>>().map(crate::ast::Type::Tuple),
             Expr::Cast(_, target) => Some(target.clone()),
+            Expr::MethodCall(receiver, name, args, None, refs) if refs.is_empty() => {
+                let target = self.method_target(receiver, name, args.len())?;
+                self.graph.return_types.get(&target).cloned()
+            }
             Expr::Call(name, arguments, _) => self.graph.return_types.get(name).cloned().or_else(|| self.generic_result(name, arguments)).or_else(|| {
                 use crate::intrinsic_signatures::ReturnKind;
                 match crate::intrinsic_signatures::get_intrinsic_signature(name)?.return_kind {
@@ -424,6 +490,9 @@ impl Builder<'_> {
             Expr::BinaryOp(_, lhs, _) => self.expression_type(lhs),
             Expr::Field(base, field) => {
                 let ty = self.expression_type(base)?;
+                if let crate::ast::Type::Tuple(elements) = &ty {
+                    return field.parse::<usize>().ok().and_then(|index| elements.get(index)).cloned();
+                }
                 let resolved = self.graph.universe.get(ty.universe_key()?)?;
                 let field_type = &resolved.fields.iter().find(|(name, _)| name == field)?.1;
                 let args = match &ty { crate::ast::Type::Applied(_, args) | crate::ast::Type::Generic(_, args) => args.as_slice(), _ => &[] };
@@ -443,7 +512,7 @@ impl Builder<'_> {
                 crate::analysis::generic_specialization::unify_generic_binding(declared, &concrete, &params, &mut substitution);
             }
         }
-        let output = generic.output_type.as_ref()?.all_types().into_iter().next()?;
+        let output = output_value_type(generic.output_type.as_ref()?)?;
         Some(crate::typechecker::substitute_type(&output, &substitution))
     }
 
@@ -493,6 +562,24 @@ impl Builder<'_> {
             }
             _ => value,
         }
+    }
+
+    fn method_target(&self, receiver: &Expr, name: &str, supplied: usize) -> Option<String> {
+        let ty = self.expression_type(receiver)?;
+        let key = (ty.universe_key()?.to_string(), name.to_string());
+        if let Some(target) = self.graph.methods.get(&key) {
+            let target = target.as_ref()?;
+            return (self.graph.callables[target].params.len() == supplied + 1).then(|| target.clone());
+        }
+        self.graph.callables.contains_key(name).then(|| name.to_string())
+    }
+
+    fn method_call(&mut self, receiver: &Expr, name: &str, args: &[Expr]) -> Node {
+        let target = self.method_target(receiver, name, args.len());
+        let mut arguments = vec![receiver.clone()]; arguments.extend_from_slice(args);
+        if let Some(target) = target { return self.call(&target, &arguments); }
+        let values = arguments.iter().map(|arg| self.expression(arg)).collect::<Vec<_>>();
+        self.capture(&values); self.unsupported(); self.graph.unknown_value()
     }
 
     fn call(&mut self, name: &str, arguments: &[Expr]) -> Node {
