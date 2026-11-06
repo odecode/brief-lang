@@ -11974,3 +11974,27 @@ local. Native mixed-value execution and wasm32 nested execution are regression
 gates; final results are in the checkpoint record.
 
 Status: FIXED 2026-11-05; 3,501 library tests and native/wasm tuple regressions pass.
+
+## 2026-11-06 — mixed native/boxed integer operands (fixed locally)
+
+`enum Toggle { Value(Bool) }; defn agrees(value: Toggle, expected: Bool)
+-> Bool { match value { Value(flag) => flag == expected, } };` emitted an
+`icmp eq i8` whose second operand was the i64 boxed parameter. LLVM rejected
+it before linking. The same representation boundary applies to narrow scalar
+values and target-width literals. Binary dispatch now normalizes unequal
+physical integer widths, extending signed Int protocols with sext and other
+integer protocols with zext, retaining the wider register's actual type.
+Equal-width/noninteger dispatch is unchanged. Regression:
+`tests/fixtures/load/mixed_integer_operands.bv` and native O0/O3 AST/HIR gate.
+
+## FIXED 2026-11-06: Synchronous entropy buffer lifetime
+
+Linux x86-64 getrandom (318) writes its caller buffer synchronously and never retains it, including partial/error returns and dynamic flags. Missing configuration classified a local entropy buffer as externally retained. Add 318 to synchronous_borrowing; unknown syscalls stay conservative. Regression: dynamic flags remain borrowed while syscall 999999 remains an escape.
+
+## FIXED 2026-11-06: Trait-default ownership effects
+
+Ownership analysis omitted trait default bodies and concrete free-call member resolution. Calls through Self-specialized defaults were treated as unsupported even when every concrete callee only borrowed its input. Register defaults after ordinary definitions, specialize return shapes, and resolve concrete free calls with top-level precedence. Regressions cover chained and free defaults plus capturing concrete overrides.
+
+## FIXED 2026-11-06: Tuple field ownership provenance
+
+Tuple construction and destructuring merged unrelated fields. A scalar/string key inherited pointer contents from its paired value, making a synchronous send appear to publish the entire graph. Preserve index-labelled tuple fields through construction, let destructuring, and tuple patterns; raw memory loads remain conservative. Regressions exercise safe unselected fields and genuinely escaping selected/raw fields.
