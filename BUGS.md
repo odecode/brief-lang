@@ -10723,3 +10723,23 @@ interpreter-side for the 7/16-bit forms.
 for this body shape (the reactor has its own Let/Foreach arms; the divergence
 is in which environment the nested defn call sees). Pinned by the ignored
 test `ws_encode_growth_interpreter`.
+## 2026-10-22 — WASM codec imports dead native assembly through closed reflection (OPEN)
+
+**Symptom:** building the I02 browser codec fixture for wasm32 reaches the
+stdlib `Prefetch` assembly wrapper, which has no wasm32 lowering. The fixture
+does not call that wrapper. The failure also appears after bypassing the early
+unsupported-op check: emission includes native `stdout_flush` and its Linux
+`briev_syscall` call.
+
+**Root cause:** compile-time reflection set `DefnLiveness.keep_all` for every
+target. The JSON integer and finite-number checks use closed value inspections
+such as `.^^Bytes`; these inspect receiver metadata and cannot look up a
+callable. Keeping all imported definitions defeats target-specific dead-code
+elimination.
+
+**Fix:** closed `Size`, `Bytes`, `Alignment`, and `Type` inspections traverse
+their receiver dependencies without setting `keep_all`. Unknown reflection
+targets retain the existing conservative behavior. Regression tests cover all
+four closed targets, receiver-call reachability, and the fallback. The emitted
+call soundness net remains enabled.
+

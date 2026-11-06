@@ -39,9 +39,9 @@ use std::collections::{HashMap, HashSet};
 pub struct DefnLiveness {
     /// Names (defns AND txns share one namespace) that must be emitted.
     pub live: HashSet<String>,
-    /// Coarse reflection root: live code contains `.^^` (compile-time
-    /// reflection), which can reach any member by name. Keep all defns.
-    /// REFINEMENT (deferred): reflect only on the referenced names.
+    /// Unclassified compile-time reflection can reach members by name.
+    /// Closed Size/Bytes/Alignment/Type inspections root receiver calls only.
+    /// Other reflection retains the conservative all-definitions fallback.
     pub keep_all: bool,
 }
 
@@ -723,6 +723,14 @@ impl<'a> Builder<'a> {
                 for a in args {
                     self.walk_expr(a, queue);
                 }
+            }
+            Expr::Reflect(receiver, target, crate::ast::ReflectKind::CompileTime)
+                if matches!(target.as_str(), "Size" | "Bytes" | "Alignment" | "Type") => {
+                // 2026-10-22: these closed value inspections cannot resolve a
+                // callable by name. Pinning every imported definition emitted
+                // dead native asm on WASM. Preserve evaluated receiver effects;
+                // unknown reflection retains the conservative fallback below.
+                self.walk_expr(receiver, queue);
             }
             Expr::Reflect(_, _, kind) => {
                 // `.^^` compile-time reflection can reach members by name —
@@ -1460,11 +1468,11 @@ mod tests {
     }
 
     #[test]
-    fn reflection_pins_everything() {
+    fn unclassified_reflection_pins_everything() {
         let items = vec![
             txn("main_node", true, vec![Statement::Expression(Expr::Reflect(
                 Box::new(Expr::Identifier("x".into())),
-                "Size".into(),
+                "Members".into(),
                 crate::ast::ReflectKind::CompileTime,
             ))]),
             defn("maybe_reflected", vec![Statement::Term(None)]),
@@ -1472,6 +1480,23 @@ mod tests {
         let l = DefnLiveness::build(&items);
         assert!(l.keep_all);
         assert!(l.is_live("maybe_reflected"));
+    }
+
+    #[test]
+    fn closed_reflection_inspections_keep_only_receiver_dependencies() {
+        for target in ["Size", "Bytes", "Alignment", "Type"] {
+            let items = vec![
+                txn("main_node", true, vec![Statement::Expression(Expr::Reflect(
+                    Box::new(Expr::Call("receiver".into(), vec![], None)),
+                    target.into(), crate::ast::ReflectKind::CompileTime))]),
+                defn("receiver", vec![Statement::Term(Some(Expr::Decimal(7)))]),
+                defn("unrelated_target_wrapper", vec![Statement::Term(None)]),
+            ];
+            let liveness = DefnLiveness::build(&items);
+            assert!(!liveness.keep_all, "closed inspection {target} cannot call arbitrary members");
+            assert!(liveness.is_live("receiver"), "{target} still evaluates its receiver");
+            assert!(!liveness.is_live("unrelated_target_wrapper"));
+        }
     }
 
     #[test]
