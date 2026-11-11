@@ -80,3 +80,19 @@ Final release verification after the allocation fix remains to be recorded.
   pointer_alias_escape_survives_value_flow`; compilation completed and symbolic
   verification is still running. No proof-success claim yet.
 - Release/downstream gates and GitHub CI validation remain in progress.
+
+## Release and hosted CI results
+
+Final release checks passed on `e0631b3d`: build without warnings, effect-shape
+quick guard, accel non-hang, browser collection snapshot, contract census
+(zero announcements), quick determinism (three corpora), and all six CI parity
+corpora. PR #89's Default gates passed in 22m9s (run `42978379264`); Fuzz smoke
+passed in 7m18s (run `42978379281`).
+
+After those checks passed, merged upstream `358d7c78` as requested. The sole
+conflict was adjacent allocation-test additions: retained both the scalar-read
+and pointer-escape regressions here and upstream's txn/node helper-arena tests.
+Upstream's helper-arena implementation remains intact. Praetor comparison
+against that upstream allocation file has no new diagnostics. Post-merge
+validation passed: 3,601 library tests, a warning-free build, and all four
+native-arena checks.

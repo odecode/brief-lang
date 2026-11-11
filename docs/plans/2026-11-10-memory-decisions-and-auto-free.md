@@ -283,3 +283,19 @@ the corruption appears when a helper becomes stateful and returns an object.
 the stateful object-return ABI (or prove the correct sret/state ordering) with
 a focused regression, then re-enable the gate and keep the helper Arena tests.
 No kiosk pin bump until this is resolved.
+
+### 9.7 HIR emission does not consume the AST arena decision
+
+Further spike found the actual missing link: `needs_arena` correctly listed
+`helper`/`make`/`entry`, and HIR emission already consumes
+`ctx.defn_needs_state` — but `compute_defn_needs_state_with_arena` added
+arena names to the *leaf-consultation* set without seeding those names
+themselves. The helper therefore stayed stateless and `Alloc#` fell back to
+`@malloc`.
+
+Fixed by seeding `always_stateful` names directly into the fixpoint. Leaf
+scalar/void helpers now emit stateful with arena init/bump; callers receive
+`%state` through the existing fixpoint. Returning aggregate/Tensor helpers
+remain Malloc by the scalar-output gate, so the stateful object-return ABI is
+not exercised; it remains a prerequisite before widening the gate to
+aggregate-returning helpers.
